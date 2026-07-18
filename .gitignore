@@ -1,0 +1,4 @@
+/signet
+*.db
+*.db-wal
+*.db-shm
