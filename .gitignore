@@ -2,3 +2,9 @@
 *.db
 *.db-wal
 *.db-shm
+
+# root credential — never commit
+.env
+
+# one-shot local bring-up helper
+import-estate.sh

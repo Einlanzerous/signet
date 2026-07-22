@@ -60,7 +60,49 @@ func Parse(r io.Reader) ([]Pair, error) {
 			return nil, fmt.Errorf("line %d: not KEY=VALUE: %q", lineNo, line)
 		}
 		key := strings.TrimSpace(line[:eq])
-		value, err := unquote(strings.TrimSpace(line[eq+1:]))
+		raw := strings.TrimSpace(line[eq+1:])
+		// A quoted value whose closing quote isn't on this line (e.g. a
+		// multi-line PEM private key) continues onto following lines until the
+		// matching quote is found. Physical lines are rejoined with "\n".
+		if q := openingQuote(raw); q != 0 && !quoteClosed(raw, q) {
+			var sb strings.Builder
+			sb.WriteString(raw)
+			closed := false
+			for scanner.Scan() {
+				lineNo++
+				sb.WriteByte('\n')
+				sb.WriteString(strings.TrimSpace(scanner.Text()))
+				if quoteClosed(sb.String(), q) {
+					closed = true
+					break
+				}
+			}
+			if !closed {
+				return nil, fmt.Errorf("line %d (%s): unterminated quoted value", lineNo, key)
+			}
+			raw = sb.String()
+		} else if pemOpen(raw) {
+			// Unquoted PEM block (e.g. an RSA/service-account key written as raw
+			// wrapped lines). Self-delimiting: accumulate until the -----END----- line.
+			var sb strings.Builder
+			sb.WriteString(raw)
+			closed := false
+			for scanner.Scan() {
+				lineNo++
+				l := strings.TrimSpace(scanner.Text())
+				sb.WriteByte('\n')
+				sb.WriteString(l)
+				if strings.HasPrefix(l, "-----END") {
+					closed = true
+					break
+				}
+			}
+			if !closed {
+				return nil, fmt.Errorf("line %d (%s): unterminated PEM block", lineNo, key)
+			}
+			raw = sb.String()
+		}
+		value, err := unquote(raw)
 		if err != nil {
 			return nil, fmt.Errorf("line %d (%s): %w", lineNo, key, err)
 		}
@@ -99,6 +141,40 @@ func Render(pairs []Pair) string {
 		b.WriteByte('\n')
 	}
 	return b.String()
+}
+
+// openingQuote returns the leading quote byte if v starts with one, else 0.
+func openingQuote(v string) byte {
+	if len(v) > 0 && (v[0] == '"' || v[0] == '\'') {
+		return v[0]
+	}
+	return 0
+}
+
+// quoteClosed reports whether v is a complete q-quoted token: it opens with q
+// and ends with an unescaped q. Single quotes are literal (no escapes); for
+// double quotes the trailing quote must be preceded by an even number of
+// backslashes. Base64/PEM bodies never contain a bare quote, so accumulation
+// across lines terminates exactly at the real closing quote.
+func quoteClosed(v string, q byte) bool {
+	if len(v) < 2 || v[0] != q || v[len(v)-1] != q {
+		return false
+	}
+	if q == '\'' {
+		return true
+	}
+	bs := 0
+	for i := len(v) - 2; i >= 1 && v[i] == '\\'; i-- {
+		bs++
+	}
+	return bs%2 == 0
+}
+
+// pemOpen reports whether an unquoted value begins a multi-line PEM block whose
+// terminator is on a later line. The "-----BEGIN"/"-----END" markers make the
+// block self-delimiting, so accumulation is unambiguous without surrounding quotes.
+func pemOpen(v string) bool {
+	return strings.HasPrefix(v, "-----BEGIN") && !strings.Contains(v, "-----END")
 }
 
 // unquote strips a matching pair of surrounding quotes. Double-quoted values
