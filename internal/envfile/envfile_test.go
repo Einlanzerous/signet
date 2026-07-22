@@ -46,6 +46,78 @@ func TestParseRejectsGarbage(t *testing.T) {
 	}
 }
 
+func TestParseMultilineQuoted(t *testing.T) {
+	// A literal multi-line block (as hand-written .env files store PEM values)
+	// plus a trailing key, to prove accumulation stops at the closing quote.
+	// A CERTIFICATE marker with placeholder body — the parser keys off the
+	// -----BEGIN/-----END markers, not the label, so this exercises the real
+	// PEM path without embedding anything that looks like a private key.
+	in := `KEY="-----BEGIN CERTIFICATE-----
+body-line-one
+body-line-two
+-----END CERTIFICATE-----"
+AFTER=sentinel
+SINGLE='line one
+line two'`
+	pairs, err := Parse(strings.NewReader(in))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := Map(pairs)
+	wantPEM := "-----BEGIN CERTIFICATE-----\n" +
+		"body-line-one\n" +
+		"body-line-two\n" +
+		"-----END CERTIFICATE-----"
+	if m["KEY"] != wantPEM {
+		t.Fatalf("multiline PEM mismatch:\n got %q\nwant %q", m["KEY"], wantPEM)
+	}
+	if m["AFTER"] != "sentinel" {
+		t.Fatalf("key after multiline value not parsed: got %q", m["AFTER"])
+	}
+	if m["SINGLE"] != "line one\nline two" {
+		t.Fatalf("single-quoted multiline mismatch: got %q", m["SINGLE"])
+	}
+}
+
+func TestParseUnterminatedQuote(t *testing.T) {
+	if _, err := Parse(strings.NewReader("KEY=\"unclosed\nstill going\n")); err == nil {
+		t.Fatal("expected error for unterminated quoted value")
+	}
+}
+
+func TestParseUnquotedPEM(t *testing.T) {
+	// Raw unquoted PEM block (as some .env files store service-account keys),
+	// with a following key to prove accumulation stops at -----END-----.
+	// CERTIFICATE marker + placeholder body, per TestParseMultilineQuoted.
+	in := `PRIVATE_KEY=-----BEGIN CERTIFICATE-----
+body-line-one
+body-line-two
+-----END CERTIFICATE-----
+AFTER=sentinel`
+	pairs, err := Parse(strings.NewReader(in))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := Map(pairs)
+	wantPEM := "-----BEGIN CERTIFICATE-----\n" +
+		"body-line-one\n" +
+		"body-line-two\n" +
+		"-----END CERTIFICATE-----"
+	if m["PRIVATE_KEY"] != wantPEM {
+		t.Fatalf("unquoted PEM mismatch:\n got %q\nwant %q", m["PRIVATE_KEY"], wantPEM)
+	}
+	if m["AFTER"] != "sentinel" {
+		t.Fatalf("key after PEM not parsed: got %q", m["AFTER"])
+	}
+}
+
+func TestParseUnterminatedPEM(t *testing.T) {
+	in := "PRIVATE_KEY=-----BEGIN CERTIFICATE-----\nbody-line-one\n"
+	if _, err := Parse(strings.NewReader(in)); err == nil {
+		t.Fatal("expected error for unterminated PEM block")
+	}
+}
+
 func TestRenderParseRoundTrip(t *testing.T) {
 	pairs := []Pair{
 		{"ZED", "plain"},
