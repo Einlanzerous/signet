@@ -70,6 +70,8 @@ Bearer auth (`SIGNET_API_TOKEN`), listens on `SIGNET_ADDR`
 | `GET /v1/mirror/audit?limit=n` | newest audit entries + chain verification |
 | `POST /v1/commands/sync` | `{project, name}` — seal & push that secret's gh targets |
 | `POST /v1/commands/rotate` | `{project, name}` — new version for generated secrets (409 otherwise), then fan-out |
+| `POST /v1/commands/add-target` | `{project, name, repo, secret_name?}` — attach a gh-actions target (validated, deduped; run `sync` to push) |
+| `POST /v1/commands/set-expiry` | `{project, name, expires_at}` — set/clear expiry (`YYYY-MM-DD`, empty clears) |
 
 Commands are *issued to* the daemon; the caller never touches key material.
 `X-Signet-Actor: <name>` attributes API actions in the audit chain.

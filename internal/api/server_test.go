@@ -112,6 +112,95 @@ func TestMirrorNeverLeaksPlaintext(t *testing.T) {
 	}
 }
 
+func postCmd(t *testing.T, h http.Handler, path, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	req.Header.Set("X-Signet-Actor", "magos")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestAddTarget(t *testing.T) {
+	srv, st, _, _ := testServer(t)
+	sec, _ := st.CreateSecret("proj", "TOKEN", "", true, "")
+	h := srv.Handler()
+
+	// Happy path: default destination name = local name.
+	rec := postCmd(t, h, "/v1/commands/add-target", `{"project":"proj","name":"TOKEN","repo":"acme/widgets"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("add-target: %d — %s", rec.Code, rec.Body)
+	}
+	targets, _ := st.TargetsForSecret(sec.ID)
+	if len(targets) != 1 {
+		t.Fatalf("expected 1 target, got %d", len(targets))
+	}
+	cfg, _ := targets[0].GHConfig()
+	if cfg.Repo != "acme/widgets" || cfg.SecretName != "TOKEN" {
+		t.Fatalf("target config wrong: %+v", cfg)
+	}
+	entries, _ := st.ListAudit(10, sec.ID)
+	if len(entries) == 0 || entries[0].Actor != "api:magos" || entries[0].Action != "target.add" {
+		t.Fatalf("add-target audit wrong: %+v", entries)
+	}
+
+	// Duplicate (same repo + secret name) conflicts.
+	if rec := postCmd(t, h, "/v1/commands/add-target", `{"project":"proj","name":"TOKEN","repo":"acme/widgets"}`); rec.Code != http.StatusConflict {
+		t.Fatalf("duplicate should 409, got %d — %s", rec.Code, rec.Body)
+	}
+
+	// Bad repo slug.
+	if rec := postCmd(t, h, "/v1/commands/add-target", `{"project":"proj","name":"TOKEN","repo":"not-a-slug"}`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad repo should 400, got %d — %s", rec.Code, rec.Body)
+	}
+
+	// Reserved GITHUB_ secret name.
+	if rec := postCmd(t, h, "/v1/commands/add-target", `{"project":"proj","name":"TOKEN","repo":"acme/widgets","secret_name":"GITHUB_TOKEN"}`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("reserved name should 400, got %d — %s", rec.Code, rec.Body)
+	}
+
+	// Unknown secret.
+	if rec := postCmd(t, h, "/v1/commands/add-target", `{"project":"proj","name":"NOPE","repo":"acme/widgets"}`); rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown secret should 404, got %d — %s", rec.Code, rec.Body)
+	}
+}
+
+func TestSetExpiry(t *testing.T) {
+	srv, st, _, _ := testServer(t)
+	sec, _ := st.CreateSecret("proj", "TOKEN", "", true, "")
+	h := srv.Handler()
+
+	// Set an expiry.
+	rec := postCmd(t, h, "/v1/commands/set-expiry", `{"project":"proj","name":"TOKEN","expires_at":"2027-01-15"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("set-expiry: %d — %s", rec.Code, rec.Body)
+	}
+	got, _ := st.GetSecretByID(sec.ID)
+	if got.ExpiresAt != "2027-01-15T00:00:00Z" {
+		t.Fatalf("expiry not stored: %q", got.ExpiresAt)
+	}
+
+	// Clear it.
+	if rec := postCmd(t, h, "/v1/commands/set-expiry", `{"project":"proj","name":"TOKEN","expires_at":""}`); rec.Code != http.StatusOK {
+		t.Fatalf("clear expiry: %d — %s", rec.Code, rec.Body)
+	}
+	got, _ = st.GetSecretByID(sec.ID)
+	if got.ExpiresAt != "" {
+		t.Fatalf("expiry not cleared: %q", got.ExpiresAt)
+	}
+
+	// Malformed date.
+	if rec := postCmd(t, h, "/v1/commands/set-expiry", `{"project":"proj","name":"TOKEN","expires_at":"nope"}`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad date should 400, got %d — %s", rec.Code, rec.Body)
+	}
+
+	// Unknown secret.
+	if rec := postCmd(t, h, "/v1/commands/set-expiry", `{"project":"proj","name":"NOPE","expires_at":"2027-01-15"}`); rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown secret should 404, got %d — %s", rec.Code, rec.Body)
+	}
+}
+
 func TestRotateExternallyIssuedConflicts(t *testing.T) {
 	srv, st, key, _ := testServer(t)
 	sec, _ := st.CreateSecret("proj", "EXTERNAL_KEY", "", false, "")
