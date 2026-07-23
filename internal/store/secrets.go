@@ -85,6 +85,17 @@ func (s *Store) CreateSecret(project, name, scope string, generated bool, expire
 	return &sec, nil
 }
 
+// SetExpiry updates a secret's expiry (RFC3339, or empty to clear) and bumps
+// updated_at.
+func (s *Store) SetExpiry(secretID, expiresAt string) error {
+	if _, err := s.db.Exec(
+		`UPDATE secrets SET expires_at = NULLIF(?, ''), updated_at = ? WHERE id = ?`,
+		expiresAt, now(), secretID); err != nil {
+		return fmt.Errorf("set expiry: %w", err)
+	}
+	return nil
+}
+
 // ListSecrets returns every secret ordered by project then name.
 func (s *Store) ListSecrets() ([]Secret, error) {
 	rows, err := s.db.Query(`

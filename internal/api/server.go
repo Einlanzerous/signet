@@ -15,7 +15,9 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"regexp"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/Einlanzerous/signet/internal/store"
@@ -52,6 +54,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /v1/mirror/audit", s.auth(s.handleAudit))
 	mux.Handle("POST /v1/commands/sync", s.auth(s.handleCommandSync))
 	mux.Handle("POST /v1/commands/rotate", s.auth(s.handleCommandRotate))
+	mux.Handle("POST /v1/commands/add-target", s.auth(s.handleCommandAddTarget))
+	mux.Handle("POST /v1/commands/set-expiry", s.auth(s.handleCommandSetExpiry))
 	return mux
 }
 
@@ -436,6 +440,139 @@ func (s *Server) handleCommandRotate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// ---- add-target / set-expiry ------------------------------------------------
+
+// ghRepoRe matches a GitHub owner/name slug: two dot/dash/underscore/alnum
+// segments separated by a single slash.
+var ghRepoRe = regexp.MustCompile(`^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$`)
+
+// ghSecretRe matches a legal GitHub Actions secret name: alphanumerics and
+// underscores, not starting with a digit. GITHUB_-prefixed names are rejected
+// separately (GitHub reserves them).
+var ghSecretRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+func validGHSecretName(name string) bool {
+	return ghSecretRe.MatchString(name) && !strings.HasPrefix(strings.ToUpper(name), "GITHUB_")
+}
+
+type addTargetReq struct {
+	Project    string `json:"project"`
+	Name       string `json:"name"`
+	Repo       string `json:"repo"`
+	SecretName string `json:"secret_name"`
+}
+
+// handleCommandAddTarget attaches a gh-actions fan-out destination to a secret.
+// It validates the repo slug and destination Actions secret name, rejects a
+// duplicate (same repo + secret name), and audits the change. It does not push
+// — the caller issues a sync afterward.
+func (s *Server) handleCommandAddTarget(w http.ResponseWriter, r *http.Request) {
+	var req addTargetReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Project == "" || req.Name == "" || req.Repo == "" {
+		writeErr(w, http.StatusBadRequest, `body must be {"project": ..., "name": ..., "repo": "owner/name", "secret_name": ...(optional)}`)
+		return
+	}
+	if !ghRepoRe.MatchString(req.Repo) {
+		writeErr(w, http.StatusBadRequest, "repo %q must be of the form owner/name", req.Repo)
+		return
+	}
+	dest := req.SecretName
+	if dest == "" {
+		dest = req.Name
+	}
+	if !validGHSecretName(dest) {
+		writeErr(w, http.StatusBadRequest, "secret_name %q is not a valid GitHub Actions secret name (alphanumeric/underscore, not starting with a digit or GITHUB_)", dest)
+		return
+	}
+	sec, err := s.st.GetSecret(req.Project, req.Name)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	if sec == nil {
+		writeErr(w, http.StatusNotFound, "no secret %s/%s", req.Project, req.Name)
+		return
+	}
+	existing, err := s.st.TargetsForSecret(sec.ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	for _, t := range existing {
+		cfg, err := t.GHConfig()
+		if err != nil {
+			continue
+		}
+		if cfg.Repo == req.Repo && cfg.SecretName == dest {
+			writeErr(w, http.StatusConflict, "target already exists: %s → %s (Actions secret %s)", req.Repo, dest, dest)
+			return
+		}
+	}
+	t, err := s.st.AddGHTarget(sec.ID, req.Repo, dest)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	if _, err := s.st.AppendAudit(s.actor(r), "target.add", sec.ID, t.ID,
+		fmt.Sprintf("%s/%s → %s · Actions secret %s", req.Project, req.Name, req.Repo, dest)); err != nil {
+		writeErr(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"added":  true,
+		"target": TargetView{Kind: t.Kind, Repo: req.Repo, SecretName: dest, State: "never"},
+	})
+}
+
+type setExpiryReq struct {
+	Project   string `json:"project"`
+	Name      string `json:"name"`
+	ExpiresAt string `json:"expires_at"` // YYYY-MM-DD, or "" to clear
+}
+
+// handleCommandSetExpiry sets or clears a secret's expiry date. An empty
+// expires_at clears it; otherwise the value must be a YYYY-MM-DD date.
+func (s *Server) handleCommandSetExpiry(w http.ResponseWriter, r *http.Request) {
+	var req setExpiryReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Project == "" || req.Name == "" {
+		writeErr(w, http.StatusBadRequest, `body must be {"project": ..., "name": ..., "expires_at": "YYYY-MM-DD" (empty to clear)}`)
+		return
+	}
+	expiresAt := ""
+	if req.ExpiresAt != "" {
+		d, err := time.Parse("2006-01-02", req.ExpiresAt)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "expires_at must be YYYY-MM-DD: %v", err)
+			return
+		}
+		expiresAt = d.UTC().Format(time.RFC3339)
+	}
+	sec, err := s.st.GetSecret(req.Project, req.Name)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	if sec == nil {
+		writeErr(w, http.StatusNotFound, "no secret %s/%s", req.Project, req.Name)
+		return
+	}
+	if err := s.st.SetExpiry(sec.ID, expiresAt); err != nil {
+		writeErr(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	detail := req.Project + "/" + req.Name + ": cleared expiry"
+	if expiresAt != "" {
+		detail = fmt.Sprintf("%s/%s: expiry set to %s", req.Project, req.Name, req.ExpiresAt)
+	}
+	if _, err := s.st.AppendAudit(s.actor(r), "secret.set-expiry", sec.ID, "", detail); err != nil {
+		writeErr(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"project": req.Project, "name": req.Name, "expires_at": expiresAt,
+	})
 }
 
 // Serve runs the API server until ctx is cancelled.
