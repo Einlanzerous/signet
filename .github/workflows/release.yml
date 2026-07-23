@@ -1,0 +1,94 @@
+name: Release Please
+
+# Automated releases. Release Please watches conventional commits on main and
+# maintains a release PR (version bump + CHANGELOG). Merging it creates the tag +
+# GitHub Release; the build job then attaches a static linux/amd64 binary.
+#
+# Signet ships as a host binary via systemd (see the SERV deploy ticket), so
+# there is no ghcr image — the release artifact is the binary itself.
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      # Mint a short-lived installation token from our GitHub App so the
+      # release PR is created by the App identity rather than the default
+      # GITHUB_TOKEN. Events from GITHUB_TOKEN don't trigger other workflows
+      # (GitHub's anti-recursion safeguard), so the release PR's required `ci`
+      # checks would never run. An App-minted token is a real actor, so those
+      # checks fire. Requires repo (or org) secrets RELEASE_BOT_APP_ID +
+      # RELEASE_BOT_PRIVATE_KEY; the App needs Contents: write + Pull requests:
+      # write on this repo. Matches the switchyard / lyceum / purser setup.
+      - name: Mint GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          # Manifest/config-file mode. `simple` is the right release-type (a Go
+          # module with one root component, version tracked in the manifest and
+          # stamped into the binary at build time via -ldflags). It lives in
+          # release-please-config.json so we can also set `changelog-sections`
+          # to surface chore/refactor/polish work in the release notes. The
+          # action defaults to these filenames, but we name them explicitly.
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  # When release-please cuts a release, build the static binary and attach it to
+  # the GitHub Release as linux/amd64 + a sha256 checksum. (Switchyard pushes a
+  # ghcr image here; Signet ships a host binary, so the artifact is the binary.)
+  build:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build linux/amd64
+        env:
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+          VERSION: ${{ needs.release-please.outputs.version }}
+        run: |
+          asset="signet-${VERSION}-linux-amd64"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+            -ldflags "-s -w -X github.com/Einlanzerous/signet/internal/version.Version=${TAG}" \
+            -o "${asset}" ./cmd/signet
+          sha256sum "${asset}" > "${asset}.sha256"
+
+      - name: Attach artifacts to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+          VERSION: ${{ needs.release-please.outputs.version }}
+        run: |
+          gh release upload "${TAG}" \
+            "signet-${VERSION}-linux-amd64" \
+            "signet-${VERSION}-linux-amd64.sha256" \
+            --clobber
