@@ -54,7 +54,9 @@ out-of-band after our last push, or missing entirely, counts as drift.
 
 Set `SIGNET_GITHUB_TOKEN` to a fine-grained PAT with *Secrets: read/write* on
 the target repos. This is the vault's **root credential** — it cannot itself be
-blind, and its expiry should be tracked in the vault like anything else.
+blind, and its expiry should be tracked in the vault like anything else. For
+convenience, `SIGNET_PAT` is accepted as a fallback when `SIGNET_GITHUB_TOKEN`
+is unset, so a vault-managed `SIGNET_PAT` in `.env` can drive `sync` directly.
 
 ## HTTP API (Switchyard mirror contract)
 
@@ -82,7 +84,7 @@ Commands are *issued to* the daemon; the caller never touches key material.
 |---|---|---|
 | `SIGNET_DB` | `~/.local/share/signet/signet.db` | SQLite database |
 | `SIGNET_MASTER_KEY_FILE` | `~/.config/signet/master.key` | hex AES-256 key, 0400 |
-| `SIGNET_GITHUB_TOKEN` | *(empty — sync disabled)* | fine-grained PAT |
+| `SIGNET_GITHUB_TOKEN` | *(empty — sync disabled)* | fine-grained PAT (falls back to `SIGNET_PAT`) |
 | `SIGNET_API_TOKEN` | *(required for `serve`)* | mirror bearer token |
 | `SIGNET_ADDR` | `127.0.0.1:4010` | API listen address |
 
