@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.0](https://github.com/Einlanzerous/signet/compare/v1.0.0...v1.1.0) (2026-07-24)
+
+
+### Features
+
+* **config:** accept SIGNET_PAT as fallback for SIGNET_GITHUB_TOKEN (SGNT-5) ([c83a437](https://github.com/Einlanzerous/signet/commit/c83a437572346a90c0fc756db20e9adb5ed54ea3))
+* **config:** accept SIGNET_PAT as fallback for SIGNET_GITHUB_TOKEN (SGNT-5) ([3080a13](https://github.com/Einlanzerous/signet/commit/3080a136765f60ccecf04262b38024892603c17d))
+
 ## 1.0.0 (2026-07-23)
 
 
