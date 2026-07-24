@@ -15,7 +15,8 @@ type Config struct {
 	// MasterKeyFile holds the hex-encoded 32-byte AES key (SIGNET_MASTER_KEY_FILE).
 	MasterKeyFile string
 	// GitHubToken authenticates outbound GitHub Actions secret pushes
-	// (SIGNET_GITHUB_TOKEN). Empty disables gh-actions sync.
+	// (SIGNET_GITHUB_TOKEN, or SIGNET_PAT as a fallback). Empty disables
+	// gh-actions sync.
 	GitHubToken string
 	// APIToken is the bearer token required by the HTTP API (SIGNET_API_TOKEN).
 	APIToken string
@@ -32,7 +33,7 @@ func Load() Config {
 	return Config{
 		DBPath:        envOr("SIGNET_DB", filepath.Join(home, ".local", "share", "signet", "signet.db")),
 		MasterKeyFile: envOr("SIGNET_MASTER_KEY_FILE", filepath.Join(home, ".config", "signet", "master.key")),
-		GitHubToken:   os.Getenv("SIGNET_GITHUB_TOKEN"),
+		GitHubToken:   envOr("SIGNET_GITHUB_TOKEN", os.Getenv("SIGNET_PAT")),
 		APIToken:      os.Getenv("SIGNET_API_TOKEN"),
 		Addr:          envOr("SIGNET_ADDR", "127.0.0.1:4010"),
 	}
