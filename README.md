@@ -42,7 +42,13 @@ signet serve                                         # HTTP mirror for Switchyar
   minting. `rotate` only self-serves for `--generate` secrets; everything else
   409s with instructions.
 - Every mutation appends to a hash-chained, append-only audit log (SQLite
-  triggers block UPDATE/DELETE; `signet audit --verify` walks the chain).
+  triggers block UPDATE/DELETE; `signet audit --verify` walks the chain). Each
+  entry is typed — event kind, actor role, structured outcome — and those fields
+  are covered by the hash, so they are as tamper-evident as the text beside them.
+- Switchyard's own webhook deliveries and rule fires stay in Switchyard's
+  Postgres. Signet is a credential vault and control plane, not Switchyard's
+  automation log; the `webhook_delivery` / `rule_fire` kinds are for actions the
+  **daemon itself** performs.
 
 ## GitHub Actions sync
 
@@ -76,7 +82,45 @@ Bearer auth (`SIGNET_API_TOKEN`), listens on `SIGNET_ADDR`
 | `POST /v1/commands/set-expiry` | `{project, name, expires_at}` — set/clear expiry (`YYYY-MM-DD`, empty clears) |
 
 Commands are *issued to* the daemon; the caller never touches key material.
-`X-Signet-Actor: <name>` attributes API actions in the audit chain.
+`X-Signet-Actor: <name>` attributes API actions in the audit chain, and
+`X-Signet-Actor-Role: <role>` declares *what kind* of caller it is (see below).
+An unrecognized role is a 400 — signet will not guess one.
+
+### Audit entry schema
+
+Each entry carries the free-text `actor` / `action` / `details` it always has,
+plus typed fields consumers can render off directly. The typed fields are
+**absent** on entries written before this landed, so treat them as optional and
+fall back to the free text rather than inferring a value from it.
+
+| Field | |
+|---|---|
+| `event_kind` | `vault_init` · `secret_write` · `secret_reveal` · `rotation` · `sync_push` · `drift_reconcile` · `render` · `target_config` · `policy_change` · `watcher_event` · `healer_action` · `webhook_delivery` · `rule_fire` |
+| `actor_role` | `human` · `rule_engine` · `dispatcher` · `daemon` · `healer` |
+| `status` | `{outcome, http_status?, latency_ms?, retried_from?, retried_to?}` |
+| `hash_version` | which hashing scheme produced `hash` (see below) |
+
+`outcome` is one of `delivered` · `failed` · `rotated` · `created` · `updated` ·
+`unchanged` · `verified_healthy` · `auto_resolved` · `reverted` · `no_action`.
+`http_status` and `latency_ms` are recorded from the actual call, not assumed;
+they are omitted when there was no HTTP exchange to measure. `retried_from` /
+`retried_to` are reserved for retry/recovery transitions — signet does not retry
+pushes yet, so they are absent until it does.
+
+`GET /v1/mirror/summary` also reports `healer_actions_7d`, an outcome→count map
+over the last seven days. It is aggregated server-side because the audit
+endpoint paginates, so counting a window from one page would undercount. It is
+empty until the watcher/healer phase lands.
+
+### Chain versioning
+
+Adding fields to a hash-chained log would invalidate every existing entry if the
+hash formula simply changed, so entries record the scheme that produced them.
+`hash_version: 1` is the original `"|"`-joined layout; `2` covers the typed
+fields and length-prefixes each field so a value containing `|` cannot be
+re-split across field boundaries to forge a match. Verification dispatches per
+entry, so a vault written before the upgrade keeps verifying, and a v1 row that
+somehow carries typed fields is rejected rather than trusted.
 
 ## Configuration
 

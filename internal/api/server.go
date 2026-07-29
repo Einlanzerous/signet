@@ -80,6 +80,24 @@ func (s *Server) actor(r *http.Request) string {
 	return "api"
 }
 
+// actorRole resolves the normalized role recorded in the audit chain. Callers
+// declare it with X-Signet-Actor-Role; signet does not infer a role by parsing
+// the free-text actor string, because a wrong guess mislabels a real entry in a
+// tamper-evident log. An absent header means a person is acting through the
+// admin UI — automation is expected to name itself.
+func (s *Server) actorRole(w http.ResponseWriter, r *http.Request) (store.ActorRole, bool) {
+	raw := r.Header.Get("X-Signet-Actor-Role")
+	if raw == "" {
+		return store.RoleHuman, true
+	}
+	if role := store.ActorRole(raw); store.ValidActorRole(role) {
+		return role, true
+	}
+	writeErr(w, http.StatusBadRequest, "X-Signet-Actor-Role %q is not a recognized role (one of: %s)",
+		raw, strings.Join(store.ActorRoles(), ", "))
+	return "", false
+}
+
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
@@ -283,12 +301,26 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "verify audit: %v", err)
 		return
 	}
+	// Healer activity is aggregated here rather than derived client-side: the
+	// audit endpoint is paginated, so counting a 7-day window from a truncated
+	// page would undercount. Empty until the healer phase lands.
+	since := time.Now().UTC().AddDate(0, 0, -7).Format(time.RFC3339)
+	healer, err := s.st.CountAuditKindSince(store.KindHealerAction, since)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "count healer actions: %v", err)
+		return
+	}
+	healerCounts := map[string]int{}
+	for outcome, n := range healer {
+		healerCounts[string(outcome)] = n
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"secrets":        secretCount,
-		"projects":       len(views),
-		"target_states":  states,
-		"audit_entries":  auditCount,
-		"chain_verified": verified,
+		"secrets":           secretCount,
+		"projects":          len(views),
+		"target_states":     states,
+		"audit_entries":     auditCount,
+		"chain_verified":    verified,
+		"healer_actions_7d": healerCounts,
 	})
 }
 
@@ -384,13 +416,17 @@ func (s *Server) handleCommandSync(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	role, ok := s.actorRole(w, r)
+	if !ok {
+		return
+	}
 	if s.gh == nil {
 		writeErr(w, http.StatusServiceUnavailable, "gh-actions sync disabled: SIGNET_GITHUB_TOKEN not configured")
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
-	results, err := syncpkg.PushSecret(ctx, s.st, s.key, s.gh, sec, s.actor(r))
+	results, err := syncpkg.PushSecret(ctx, s.st, s.key, s.gh, sec, s.actor(r), role)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "%v", err)
 		return
@@ -400,6 +436,10 @@ func (s *Server) handleCommandSync(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCommandRotate(w http.ResponseWriter, r *http.Request) {
 	sec, ok := s.decodeCommand(w, r)
+	if !ok {
+		return
+	}
+	role, ok := s.actorRole(w, r)
 	if !ok {
 		return
 	}
@@ -423,8 +463,12 @@ func (s *Server) handleCommandRotate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
-	if _, err := s.st.AppendAudit(s.actor(r), "rotate", sec.ID, "",
-		fmt.Sprintf("rotated %s/%s → version %d #%s — fan-out queued", sec.Project, sec.Name, v.VersionNo, v.VHash)); err != nil {
+	if _, err := s.st.AppendAudit(store.AuditRecord{
+		Actor: s.actor(r), Action: "rotate", SecretID: sec.ID,
+		Details:   fmt.Sprintf("rotated %s/%s → version %d #%s — fan-out queued", sec.Project, sec.Name, v.VersionNo, v.VHash),
+		EventKind: store.KindRotation, ActorRole: role,
+		Status: &store.AuditStatus{Outcome: store.OutcomeRotated},
+	}); err != nil {
 		writeErr(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
@@ -433,7 +477,7 @@ func (s *Server) handleCommandRotate(w http.ResponseWriter, r *http.Request) {
 	if s.gh != nil {
 		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 		defer cancel()
-		if results, err := syncpkg.PushSecret(ctx, s.st, s.key, s.gh, sec, s.actor(r)); err == nil {
+		if results, err := syncpkg.PushSecret(ctx, s.st, s.key, s.gh, sec, s.actor(r), role); err == nil {
 			resp["fan_out"] = results
 		} else {
 			resp["fan_out_error"] = err.Error()
@@ -486,6 +530,10 @@ func (s *Server) handleCommandAddTarget(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusBadRequest, "secret_name %q is not a valid GitHub Actions secret name (alphanumeric/underscore, not starting with a digit or GITHUB_)", dest)
 		return
 	}
+	role, ok := s.actorRole(w, r)
+	if !ok {
+		return
+	}
 	sec, err := s.st.GetSecret(req.Project, req.Name)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "%v", err)
@@ -515,8 +563,12 @@ func (s *Server) handleCommandAddTarget(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
-	if _, err := s.st.AppendAudit(s.actor(r), "target.add", sec.ID, t.ID,
-		fmt.Sprintf("%s/%s → %s · Actions secret %s", req.Project, req.Name, req.Repo, dest)); err != nil {
+	if _, err := s.st.AppendAudit(store.AuditRecord{
+		Actor: s.actor(r), Action: "target.add", SecretID: sec.ID, TargetID: t.ID,
+		Details:   fmt.Sprintf("%s/%s → %s · Actions secret %s", req.Project, req.Name, req.Repo, dest),
+		EventKind: store.KindTargetConfig, ActorRole: role,
+		Status: &store.AuditStatus{Outcome: store.OutcomeCreated},
+	}); err != nil {
 		writeErr(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
@@ -538,6 +590,10 @@ func (s *Server) handleCommandSetExpiry(w http.ResponseWriter, r *http.Request) 
 	var req setExpiryReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Project == "" || req.Name == "" {
 		writeErr(w, http.StatusBadRequest, `body must be {"project": ..., "name": ..., "expires_at": "YYYY-MM-DD" (empty to clear)}`)
+		return
+	}
+	role, ok := s.actorRole(w, r)
+	if !ok {
 		return
 	}
 	expiresAt := ""
@@ -563,10 +619,18 @@ func (s *Server) handleCommandSetExpiry(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	detail := req.Project + "/" + req.Name + ": cleared expiry"
+	outcome := store.OutcomeUnchanged // no expiry before, none after
 	if expiresAt != "" {
 		detail = fmt.Sprintf("%s/%s: expiry set to %s", req.Project, req.Name, req.ExpiresAt)
+		outcome = store.OutcomeUpdated
+	} else if sec.ExpiresAt != "" {
+		outcome = store.OutcomeUpdated
 	}
-	if _, err := s.st.AppendAudit(s.actor(r), "secret.set-expiry", sec.ID, "", detail); err != nil {
+	if _, err := s.st.AppendAudit(store.AuditRecord{
+		Actor: s.actor(r), Action: "secret.set-expiry", SecretID: sec.ID, Details: detail,
+		EventKind: store.KindPolicyChange, ActorRole: role,
+		Status: &store.AuditStatus{Outcome: outcome},
+	}); err != nil {
 		writeErr(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
