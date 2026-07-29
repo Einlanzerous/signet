@@ -19,8 +19,9 @@ type ImportResult struct {
 
 // ImportEnv imports every pair of the env file at path into project's secrets,
 // creating a new version only when the value actually changed, and upserts a
-// file target covering the imported keys.
-func ImportEnv(st *store.Store, key []byte, project, scope, path, actor string) (ImportResult, error) {
+// file target covering the imported keys. role is the normalized identity
+// behind actor, recorded on each audit entry.
+func ImportEnv(st *store.Store, key []byte, project, scope, path, actor string, role store.ActorRole) (ImportResult, error) {
 	var res ImportResult
 	pairs, err := envfile.ParseFile(path)
 	if err != nil {
@@ -32,6 +33,7 @@ func ImportEnv(st *store.Store, key []byte, project, scope, path, actor string) 
 		if err != nil {
 			return res, err
 		}
+		outcome := store.OutcomeCreated
 		if sec == nil {
 			if sec, err = st.CreateSecret(project, p.Key, scope, false, ""); err != nil {
 				return res, err
@@ -53,6 +55,7 @@ func ImportEnv(st *store.Store, key []byte, project, scope, path, actor string) 
 				}
 			}
 			res.Updated++
+			outcome = store.OutcomeUpdated
 		}
 		nonce, ct, err := vault.Encrypt(key, []byte(p.Value))
 		if err != nil {
@@ -62,8 +65,12 @@ func ImportEnv(st *store.Store, key []byte, project, scope, path, actor string) 
 		if err != nil {
 			return res, err
 		}
-		if _, err := st.AppendAudit(actor, "secret.import", sec.ID, "",
-			fmt.Sprintf("imported %s/%s from %s · version %d #%s", project, p.Key, path, v.VersionNo, v.VHash)); err != nil {
+		if _, err := st.AppendAudit(store.AuditRecord{
+			Actor: actor, Action: "secret.import", SecretID: sec.ID,
+			Details:   fmt.Sprintf("imported %s/%s from %s · version %d #%s", project, p.Key, path, v.VersionNo, v.VHash),
+			EventKind: store.KindSecretWrite, ActorRole: role,
+			Status: &store.AuditStatus{Outcome: outcome},
+		}); err != nil {
 			return res, err
 		}
 	}

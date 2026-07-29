@@ -52,10 +52,19 @@ type SecretMeta struct {
 	UpdatedAt string `json:"updated_at"`
 }
 
-func (c *GHClient) do(ctx context.Context, method, path string, body []byte, out any) error {
+// CallStat reports the transport-level outcome of one GitHub API call, so the
+// audit ledger can record what actually happened on the wire (a real status
+// code and elapsed time) rather than an assumed one. HTTPStatus is 0 when the
+// request never produced a response.
+type CallStat struct {
+	HTTPStatus int
+	LatencyMS  int64
+}
+
+func (c *GHClient) do(ctx context.Context, method, path string, body []byte, out any) (CallStat, error) {
 	req, err := http.NewRequestWithContext(ctx, method, c.BaseURL+path, bytes.NewReader(body))
 	if err != nil {
-		return err
+		return CallStat{}, err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
@@ -65,33 +74,35 @@ func (c *GHClient) do(ctx context.Context, method, path string, body []byte, out
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	started := time.Now()
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return err
+		return CallStat{LatencyMS: time.Since(started).Milliseconds()}, err
 	}
 	defer resp.Body.Close()
+	stat := CallStat{HTTPStatus: resp.StatusCode, LatencyMS: time.Since(started).Milliseconds()}
 	if resp.StatusCode == http.StatusNotFound {
-		return fmt.Errorf("%s %s: %w", method, path, ErrNotFound)
+		return stat, fmt.Errorf("%s %s: %w", method, path, ErrNotFound)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("%s %s: %s: %s", method, path, resp.Status, strings.TrimSpace(string(msg)))
+		return stat, fmt.Errorf("%s %s: %s: %s", method, path, resp.Status, strings.TrimSpace(string(msg)))
 	}
 	if out != nil {
-		return json.NewDecoder(resp.Body).Decode(out)
+		return stat, json.NewDecoder(resp.Body).Decode(out)
 	}
-	return nil
+	return stat, nil
 }
 
 // RepoPublicKey fetches the sealing key for owner/name.
-func (c *GHClient) RepoPublicKey(ctx context.Context, repo string) (PublicKey, error) {
+func (c *GHClient) RepoPublicKey(ctx context.Context, repo string) (PublicKey, CallStat, error) {
 	var pk PublicKey
-	err := c.do(ctx, http.MethodGet, "/repos/"+repo+"/actions/secrets/public-key", nil, &pk)
-	return pk, err
+	stat, err := c.do(ctx, http.MethodGet, "/repos/"+repo+"/actions/secrets/public-key", nil, &pk)
+	return pk, stat, err
 }
 
 // PutSecret creates or updates an Actions repo secret with a sealed value.
-func (c *GHClient) PutSecret(ctx context.Context, repo, name, sealedB64, keyID string) error {
+func (c *GHClient) PutSecret(ctx context.Context, repo, name, sealedB64, keyID string) (CallStat, error) {
 	body, _ := json.Marshal(map[string]string{"encrypted_value": sealedB64, "key_id": keyID})
 	return c.do(ctx, http.MethodPut, "/repos/"+repo+"/actions/secrets/"+name, body, nil)
 }
@@ -99,7 +110,7 @@ func (c *GHClient) PutSecret(ctx context.Context, repo, name, sealedB64, keyID s
 // GetSecretMeta fetches an Actions secret's metadata (ErrNotFound if absent).
 func (c *GHClient) GetSecretMeta(ctx context.Context, repo, name string) (SecretMeta, error) {
 	var m SecretMeta
-	err := c.do(ctx, http.MethodGet, "/repos/"+repo+"/actions/secrets/"+name, nil, &m)
+	_, err := c.do(ctx, http.MethodGet, "/repos/"+repo+"/actions/secrets/"+name, nil, &m)
 	return m, err
 }
 

@@ -48,10 +48,18 @@ func TestSecretVersioning(t *testing.T) {
 	}
 }
 
+// testRecord is a minimal valid audit record for chain tests.
+func testRecord(details string) AuditRecord {
+	return AuditRecord{
+		Actor: "tester", Action: "action", Details: details,
+		EventKind: KindSecretWrite, ActorRole: RoleHuman,
+	}
+}
+
 func TestAuditChainVerify(t *testing.T) {
 	s := testStore(t)
 	for i := 0; i < 5; i++ {
-		if _, err := s.AppendAudit("tester", "action", "", "", "entry"); err != nil {
+		if _, err := s.AppendAudit(testRecord("entry")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -66,7 +74,7 @@ func TestAuditChainVerify(t *testing.T) {
 
 func TestAuditAppendOnlyTriggers(t *testing.T) {
 	s := testStore(t)
-	if _, err := s.AppendAudit("tester", "action", "", "", "entry"); err != nil {
+	if _, err := s.AppendAudit(testRecord("entry")); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.db.Exec(`UPDATE audit_log SET details = 'tampered' WHERE seq = 1`); err == nil {
@@ -80,7 +88,7 @@ func TestAuditAppendOnlyTriggers(t *testing.T) {
 func TestAuditTamperBreaksChain(t *testing.T) {
 	s := testStore(t)
 	for i := 0; i < 3; i++ {
-		if _, err := s.AppendAudit("tester", "action", "", "", "entry"); err != nil {
+		if _, err := s.AppendAudit(testRecord("entry")); err != nil {
 			t.Fatal(err)
 		}
 	}

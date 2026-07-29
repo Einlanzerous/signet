@@ -70,7 +70,7 @@ func TestMirrorNeverLeaksPlaintext(t *testing.T) {
 	if err := os.WriteFile(env, []byte("MY_SECRET="+sentinel+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ops.ImportEnv(st, key, "proj", "", env, "test"); err != nil {
+	if _, err := ops.ImportEnv(st, key, "proj", "", env, "test", store.RoleHuman); err != nil {
 		t.Fatal(err)
 	}
 
@@ -114,9 +114,17 @@ func TestMirrorNeverLeaksPlaintext(t *testing.T) {
 
 func postCmd(t *testing.T, h http.Handler, path, body string) *httptest.ResponseRecorder {
 	t.Helper()
+	return postCmdWithHeaders(t, h, path, body, map[string]string{"X-Signet-Actor": "magos"})
+}
+
+// postCmdWithHeaders issues an authenticated command with caller-set headers.
+func postCmdWithHeaders(t *testing.T, h http.Handler, path, body string, headers map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+testToken)
-	req.Header.Set("X-Signet-Actor", "magos")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return rec
@@ -253,5 +261,105 @@ func TestRotateGenerated(t *testing.T) {
 	entries, _ := st.ListAudit(10, sec.ID)
 	if len(entries) == 0 || entries[0].Actor != "api:magos" {
 		t.Fatalf("rotate audit actor wrong: %+v", entries)
+	}
+}
+
+// TestActorRoleHeader covers role negotiation at the API boundary: a declared
+// role is recorded verbatim, an absent one means a person acting through the
+// admin UI, and an unrecognized one is rejected rather than guessed at — a
+// mislabeled entry in a tamper-evident ledger is worse than no entry.
+func TestActorRoleHeader(t *testing.T) {
+	srv, st, _, dir := testServer(t)
+	h := srv.Handler()
+	env := filepath.Join(dir, ".env")
+	if err := os.WriteFile(env, []byte("MY_SECRET=v\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ops.ImportEnv(st, srv.key, "proj", "", env, "test", store.RoleHuman); err != nil {
+		t.Fatal(err)
+	}
+	const body = `{"project":"proj","name":"MY_SECRET","expires_at":"2027-01-01"}`
+
+	// An unknown role is a 400, and nothing is appended.
+	before, err := st.CountAudit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := postCmdWithHeaders(t, h, "/v1/commands/set-expiry", body, map[string]string{"X-Signet-Actor-Role": "wizard"})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("unknown role should 400: %d — %s", rec.Code, rec.Body)
+	}
+	if after, err := st.CountAudit(); err != nil || after != before {
+		t.Fatalf("rejected request must not append: before=%d after=%d err=%v", before, after, err)
+	}
+
+	// A declared role is recorded as given.
+	rec = postCmdWithHeaders(t, h, "/v1/commands/set-expiry", body,
+		map[string]string{"X-Signet-Actor": "switchyard", "X-Signet-Actor-Role": "rule_engine"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("declared role should 200: %d — %s", rec.Code, rec.Body)
+	}
+	entries, err := st.ListAudit(1, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entries[0].ActorRole != store.RoleRuleEngine {
+		t.Fatalf("declared role not recorded: %+v", entries[0])
+	}
+	if entries[0].EventKind != store.KindPolicyChange {
+		t.Fatalf("event kind wrong: %+v", entries[0])
+	}
+	if entries[0].Actor != "api:switchyard" {
+		t.Fatalf("free-text actor should survive alongside the role: %q", entries[0].Actor)
+	}
+
+	// No header: a person acting through the admin UI.
+	if rec := postCmdWithHeaders(t, h, "/v1/commands/set-expiry", body, nil); rec.Code != http.StatusOK {
+		t.Fatalf("absent role should 200: %d — %s", rec.Code, rec.Body)
+	}
+	entries, err = st.ListAudit(1, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entries[0].ActorRole != store.RoleHuman {
+		t.Fatalf("absent role should default to human: %+v", entries[0])
+	}
+
+	// The chain stays intact across all of it.
+	if ok, badSeq, _, err := st.VerifyAudit(); err != nil || !ok {
+		t.Fatalf("chain broken: ok=%v badSeq=%d err=%v", ok, badSeq, err)
+	}
+}
+
+// TestSummaryReportsHealerWindow checks the healer-actions aggregate the tile
+// reads. It is empty until the healer phase lands, and must not be inferred
+// from unrelated entries.
+func TestSummaryReportsHealerWindow(t *testing.T) {
+	srv, st, _, _ := testServer(t)
+	h := srv.Handler()
+
+	var summary struct {
+		HealerActions map[string]int `json:"healer_actions_7d"`
+	}
+	rec := get(t, h, "/v1/mirror/summary", testToken)
+	if err := json.Unmarshal(rec.Body.Bytes(), &summary); err != nil {
+		t.Fatal(err)
+	}
+	if len(summary.HealerActions) != 0 {
+		t.Fatalf("no healer yet, tile must report nothing: %+v", summary.HealerActions)
+	}
+
+	if _, err := st.AppendHealerAction("healer", store.ActionHealerRestart, "restarted postgres", store.OutcomeAutoResolved); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AppendHealerAction("healer", store.ActionHealerRollback, "rolled back caddy", store.OutcomeReverted); err != nil {
+		t.Fatal(err)
+	}
+	rec = get(t, h, "/v1/mirror/summary", testToken)
+	if err := json.Unmarshal(rec.Body.Bytes(), &summary); err != nil {
+		t.Fatal(err)
+	}
+	if summary.HealerActions["auto_resolved"] != 1 || summary.HealerActions["reverted"] != 1 {
+		t.Fatalf("healer window wrong: %+v", summary.HealerActions)
 	}
 }

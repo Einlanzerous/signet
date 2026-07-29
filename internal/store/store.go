@@ -128,6 +128,18 @@ CREATE INDEX idx_targets_secret  ON targets(secret_id);
 CREATE INDEX idx_targets_project ON targets(project);
 CREATE INDEX idx_audit_secret    ON audit_log(secret_id);
 `,
+	// 002 — structured audit ledger. All columns default to the empty/legacy
+	// value so entries written before this migration stay byte-identical: they
+	// keep verifying under hash version 1, and only new entries are hashed with
+	// the extended scheme.
+	`
+ALTER TABLE audit_log ADD COLUMN event_kind   TEXT    NOT NULL DEFAULT '';
+ALTER TABLE audit_log ADD COLUMN actor_role   TEXT    NOT NULL DEFAULT '';
+ALTER TABLE audit_log ADD COLUMN status       TEXT    NOT NULL DEFAULT '';
+ALTER TABLE audit_log ADD COLUMN hash_version INTEGER NOT NULL DEFAULT 1;
+
+CREATE INDEX idx_audit_kind_ts ON audit_log(event_kind, ts);
+`,
 }
 
 func (s *Store) migrate() error {

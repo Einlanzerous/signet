@@ -23,7 +23,7 @@ func TestImportIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, err := ImportEnv(st, key, "proj", "", env, "test")
+	res, err := ImportEnv(st, key, "proj", "", env, "test", store.RoleHuman)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,7 +32,7 @@ func TestImportIdempotent(t *testing.T) {
 	}
 
 	// Re-import unchanged: no new versions.
-	res, err = ImportEnv(st, key, "proj", "", env, "test")
+	res, err = ImportEnv(st, key, "proj", "", env, "test", store.RoleHuman)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,7 +49,7 @@ func TestImportIdempotent(t *testing.T) {
 	if err := os.WriteFile(env, []byte("A=1\nB=changed\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	res, err = ImportEnv(st, key, "proj", "", env, "test")
+	res, err = ImportEnv(st, key, "proj", "", env, "test", store.RoleHuman)
 	if err != nil {
 		t.Fatal(err)
 	}

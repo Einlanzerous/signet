@@ -152,7 +152,11 @@ func runInit() error {
 		return err
 	}
 	defer st.Close()
-	if _, err := st.AppendAudit(cliActor(), "vault.init", "", "", "master key + database created"); err != nil {
+	if _, err := st.AppendAudit(store.AuditRecord{
+		Actor: cliActor(), Action: "vault.init", Details: "master key + database created",
+		EventKind: store.KindVaultInit, ActorRole: store.RoleHuman,
+		Status: &store.AuditStatus{Outcome: store.OutcomeCreated},
+	}); err != nil {
 		return err
 	}
 	fmt.Printf("initialized vault\n  key: %s (0400)\n  db:  %s\n", cfg.MasterKeyFile, cfg.DBPath)
@@ -180,7 +184,7 @@ func runImport(args []string) error {
 	}
 	defer a.close()
 
-	res, err := ops.ImportEnv(a.st, a.key, *project, *scope, path, cliActor())
+	res, err := ops.ImportEnv(a.st, a.key, *project, *scope, path, cliActor(), store.RoleHuman)
 	if err != nil {
 		return err
 	}
@@ -240,12 +244,12 @@ func runSet(args []string) error {
 	if err != nil {
 		return err
 	}
-	action := "secret.update"
+	action, outcome := "secret.update", store.OutcomeUpdated
 	if sec == nil {
 		if sec, err = a.st.CreateSecret(*project, *name, *scope, *generate, expiresAt); err != nil {
 			return err
 		}
-		action = "secret.create"
+		action, outcome = "secret.create", store.OutcomeCreated
 	}
 	nonce, ct, err := vault.Encrypt(a.key, []byte(value))
 	if err != nil {
@@ -255,8 +259,12 @@ func runSet(args []string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := a.st.AppendAudit(cliActor(), action, sec.ID, "",
-		fmt.Sprintf("%s/%s · version %d #%s", *project, *name, v.VersionNo, v.VHash)); err != nil {
+	if _, err := a.st.AppendAudit(store.AuditRecord{
+		Actor: cliActor(), Action: action, SecretID: sec.ID,
+		Details:   fmt.Sprintf("%s/%s · version %d #%s", *project, *name, v.VersionNo, v.VHash),
+		EventKind: store.KindSecretWrite, ActorRole: store.RoleHuman,
+		Status: &store.AuditStatus{Outcome: outcome},
+	}); err != nil {
 		return err
 	}
 	fmt.Printf("%s/%s → version %d #%s\n", *project, *name, v.VersionNo, v.VHash)
@@ -296,8 +304,11 @@ func runReveal(args []string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := a.st.AppendAudit(cliActor(), "secret.reveal", sec.ID, "",
-		fmt.Sprintf("revealed %s/%s version %d #%s to stdout", *project, *name, cur.VersionNo, cur.VHash)); err != nil {
+	if _, err := a.st.AppendAudit(store.AuditRecord{
+		Actor: cliActor(), Action: "secret.reveal", SecretID: sec.ID,
+		Details:   fmt.Sprintf("revealed %s/%s version %d #%s to stdout", *project, *name, cur.VersionNo, cur.VHash),
+		EventKind: store.KindSecretReveal, ActorRole: store.RoleHuman,
+	}); err != nil {
 		return err
 	}
 	fmt.Println(string(plain))
@@ -354,8 +365,12 @@ func runRender(args []string) error {
 			return err
 		}
 		_ = a.st.UpdateTargetPush(t.ID, "in sync", "", "", time.Now().UTC().Format(time.RFC3339))
-		if _, err := a.st.AppendAudit(cliActor(), "render", "", t.ID,
-			fmt.Sprintf("rendered %d keys → %s (mode %s)", len(pairs), cfg.Path, cfg.Mode)); err != nil {
+		if _, err := a.st.AppendAudit(store.AuditRecord{
+			Actor: cliActor(), Action: "render", TargetID: t.ID,
+			Details:   fmt.Sprintf("rendered %d keys → %s (mode %s)", len(pairs), cfg.Path, cfg.Mode),
+			EventKind: store.KindRender, ActorRole: store.RoleHuman,
+			Status: &store.AuditStatus{Outcome: store.OutcomeDelivered},
+		}); err != nil {
 			return err
 		}
 		fmt.Printf("rendered %s (%d keys)\n", cfg.Path, len(pairs))
@@ -477,8 +492,12 @@ func runTarget(args []string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := a.st.AppendAudit(cliActor(), "target.add", sec.ID, t.ID,
-		fmt.Sprintf("%s/%s → %s · Actions secret %s", project, name, *ghRepo, dest)); err != nil {
+	if _, err := a.st.AppendAudit(store.AuditRecord{
+		Actor: cliActor(), Action: "target.add", SecretID: sec.ID, TargetID: t.ID,
+		Details:   fmt.Sprintf("%s/%s → %s · Actions secret %s", project, name, *ghRepo, dest),
+		EventKind: store.KindTargetConfig, ActorRole: store.RoleHuman,
+		Status: &store.AuditStatus{Outcome: store.OutcomeCreated},
+	}); err != nil {
 		return err
 	}
 	fmt.Printf("target added: %s/%s → %s (Actions secret %s)\n", project, name, *ghRepo, dest)
@@ -536,7 +555,7 @@ func runSync(args []string) error {
 	defer cancel()
 	pushed, failed := 0, 0
 	for i := range toSync {
-		results, err := syncpkg.PushSecret(ctx, a.st, a.key, gh, &toSync[i], cliActor())
+		results, err := syncpkg.PushSecret(ctx, a.st, a.key, gh, &toSync[i], cliActor(), store.RoleHuman)
 		if err != nil {
 			return err
 		}

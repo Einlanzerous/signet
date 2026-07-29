@@ -72,16 +72,23 @@ func TestGHClientPushAndDrift(t *testing.T) {
 	c.BaseURL = srv.URL
 	ctx := context.Background()
 
-	pk, err := c.RepoPublicKey(ctx, "o/r")
+	pk, pkStat, err := c.RepoPublicKey(ctx, "o/r")
 	if err != nil {
 		t.Fatal(err)
+	}
+	if pkStat.HTTPStatus != http.StatusOK {
+		t.Fatalf("public-key call status: %d", pkStat.HTTPStatus)
 	}
 	sealed, err := Seal(pk.Key, []byte("v"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.PutSecret(ctx, "o/r", "MY_SECRET", sealed, pk.KeyID); err != nil {
+	putStat, err := c.PutSecret(ctx, "o/r", "MY_SECRET", sealed, pk.KeyID)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if putStat.HTTPStatus != http.StatusNoContent {
+		t.Fatalf("PUT status not reported: %+v", putStat)
 	}
 	if gotPut.KeyID != "key1" || gotPut.EncryptedValue == "" {
 		t.Fatalf("PUT body wrong: %+v", gotPut)
