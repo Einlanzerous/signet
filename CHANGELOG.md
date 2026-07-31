@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.2.0](https://github.com/Einlanzerous/signet/compare/v1.1.0...v1.2.0) (2026-07-31)
+
+
+### Features
+
+* **audit:** structured ledger — typed event kinds, actor roles, status (SGNT-13) ([ac1e6a5](https://github.com/Einlanzerous/signet/commit/ac1e6a56a638fab104e1b1b3a3a598935a2b69cb))
+
+
+### Bug Fixes
+
+* **audit:** close chain-fork race, role forgery, and status encoding gaps ([39b2ec0](https://github.com/Einlanzerous/signet/commit/39b2ec08b2219a16ed7f4bbff5d81c188213f11f))
+
 ## [1.1.0](https://github.com/Einlanzerous/signet/compare/v1.0.0...v1.1.0) (2026-07-24)
 
 
