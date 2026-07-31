@@ -92,3 +92,31 @@ jobs:
             "signet-${VERSION}-linux-amd64" \
             "signet-${VERSION}-linux-amd64.sha256" \
             --clobber
+
+      # Tell construct-server a release is ready to deploy (SGNT-12 → SERV-62).
+      # Mint a short-lived token scoped to construct-server rather than keep a
+      # PAT alive: the release bot App is already installed there with
+      # Contents: write, which is what repository_dispatch needs. Same approach
+      # as switchyard's release.yml, which moved off CONSTRUCT_DISPATCH_TOKEN
+      # after that PAT kept expiring and 401'ing releases.
+      - name: Mint construct-server dispatch token
+        id: dispatch-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          owner: Einlanzerous
+          repositories: construct-server
+
+      # Ordering is load-bearing: this sits *after* the upload because the
+      # receiver's first act is `gh release download`. Dispatching earlier would
+      # race the deploy against a release that has no binary attached yet.
+      - name: Notify construct-server
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ steps.dispatch-token.outputs.token }}
+          repository: Einlanzerous/construct-server
+          event-type: signet-released
+          # tag_name, not version: the receiver validates ^v[0-9]+\.[0-9]+\.[0-9]+$
+          # and downloads by tag, so it needs the leading v. `version` is bare.
+          client-payload: '{"tag": "${{ needs.release-please.outputs.tag_name }}"}'
