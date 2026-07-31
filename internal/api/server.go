@@ -85,16 +85,23 @@ func (s *Server) actor(r *http.Request) string {
 // the free-text actor string, because a wrong guess mislabels a real entry in a
 // tamper-evident log. An absent header means a person is acting through the
 // admin UI — automation is expected to name itself.
+//
+// A caller may not claim daemon or healer: those assert that signet acted on
+// its own, which no external caller can truthfully say.
+//
+// Command handlers resolve the role before doing anything else, so a bad header
+// fails the same way on every route instead of behind whichever validation that
+// particular command happens to run first.
 func (s *Server) actorRole(w http.ResponseWriter, r *http.Request) (store.ActorRole, bool) {
 	raw := r.Header.Get("X-Signet-Actor-Role")
 	if raw == "" {
 		return store.RoleHuman, true
 	}
-	if role := store.ActorRole(raw); store.ValidActorRole(role) {
+	if role := store.ActorRole(raw); store.DeclarableActorRole(role) {
 		return role, true
 	}
-	writeErr(w, http.StatusBadRequest, "X-Signet-Actor-Role %q is not a recognized role (one of: %s)",
-		raw, strings.Join(store.ActorRoles(), ", "))
+	writeErr(w, http.StatusBadRequest, "X-Signet-Actor-Role %q cannot be declared by an API caller (one of: %s)",
+		raw, strings.Join(store.DeclarableActorRoles(), ", "))
 	return "", false
 }
 
@@ -310,17 +317,13 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "count healer actions: %v", err)
 		return
 	}
-	healerCounts := map[string]int{}
-	for outcome, n := range healer {
-		healerCounts[string(outcome)] = n
-	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"secrets":           secretCount,
 		"projects":          len(views),
 		"target_states":     states,
 		"audit_entries":     auditCount,
 		"chain_verified":    verified,
-		"healer_actions_7d": healerCounts,
+		"healer_actions_7d": healer,
 	})
 }
 
@@ -412,11 +415,11 @@ func (s *Server) decodeCommand(w http.ResponseWriter, r *http.Request) (*store.S
 }
 
 func (s *Server) handleCommandSync(w http.ResponseWriter, r *http.Request) {
-	sec, ok := s.decodeCommand(w, r)
+	role, ok := s.actorRole(w, r)
 	if !ok {
 		return
 	}
-	role, ok := s.actorRole(w, r)
+	sec, ok := s.decodeCommand(w, r)
 	if !ok {
 		return
 	}
@@ -435,11 +438,11 @@ func (s *Server) handleCommandSync(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCommandRotate(w http.ResponseWriter, r *http.Request) {
-	sec, ok := s.decodeCommand(w, r)
+	role, ok := s.actorRole(w, r)
 	if !ok {
 		return
 	}
-	role, ok := s.actorRole(w, r)
+	sec, ok := s.decodeCommand(w, r)
 	if !ok {
 		return
 	}
@@ -513,6 +516,10 @@ type addTargetReq struct {
 // duplicate (same repo + secret name), and audits the change. It does not push
 // — the caller issues a sync afterward.
 func (s *Server) handleCommandAddTarget(w http.ResponseWriter, r *http.Request) {
+	role, ok := s.actorRole(w, r)
+	if !ok {
+		return
+	}
 	var req addTargetReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Project == "" || req.Name == "" || req.Repo == "" {
 		writeErr(w, http.StatusBadRequest, `body must be {"project": ..., "name": ..., "repo": "owner/name", "secret_name": ...(optional)}`)
@@ -528,10 +535,6 @@ func (s *Server) handleCommandAddTarget(w http.ResponseWriter, r *http.Request) 
 	}
 	if !validGHSecretName(dest) {
 		writeErr(w, http.StatusBadRequest, "secret_name %q is not a valid GitHub Actions secret name (alphanumeric/underscore, not starting with a digit or GITHUB_)", dest)
-		return
-	}
-	role, ok := s.actorRole(w, r)
-	if !ok {
 		return
 	}
 	sec, err := s.st.GetSecret(req.Project, req.Name)
@@ -587,13 +590,13 @@ type setExpiryReq struct {
 // handleCommandSetExpiry sets or clears a secret's expiry date. An empty
 // expires_at clears it; otherwise the value must be a YYYY-MM-DD date.
 func (s *Server) handleCommandSetExpiry(w http.ResponseWriter, r *http.Request) {
+	role, ok := s.actorRole(w, r)
+	if !ok {
+		return
+	}
 	var req setExpiryReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Project == "" || req.Name == "" {
 		writeErr(w, http.StatusBadRequest, `body must be {"project": ..., "name": ..., "expires_at": "YYYY-MM-DD" (empty to clear)}`)
-		return
-	}
-	role, ok := s.actorRole(w, r)
-	if !ok {
 		return
 	}
 	expiresAt := ""
@@ -619,12 +622,14 @@ func (s *Server) handleCommandSetExpiry(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	detail := req.Project + "/" + req.Name + ": cleared expiry"
-	outcome := store.OutcomeUnchanged // no expiry before, none after
 	if expiresAt != "" {
 		detail = fmt.Sprintf("%s/%s: expiry set to %s", req.Project, req.Name, req.ExpiresAt)
-		outcome = store.OutcomeUpdated
-	} else if sec.ExpiresAt != "" {
-		outcome = store.OutcomeUpdated
+	}
+	// The old value is in hand, so report what actually changed: re-sending the
+	// expiry a secret already has is a no-op, not an update.
+	outcome := store.OutcomeUpdated
+	if expiresAt == sec.ExpiresAt {
+		outcome = store.OutcomeUnchanged
 	}
 	if _, err := s.st.AppendAudit(store.AuditRecord{
 		Actor: s.actor(r), Action: "secret.set-expiry", SecretID: sec.ID, Details: detail,

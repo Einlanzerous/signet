@@ -308,6 +308,7 @@ func runReveal(args []string) error {
 		Actor: cliActor(), Action: "secret.reveal", SecretID: sec.ID,
 		Details:   fmt.Sprintf("revealed %s/%s version %d #%s to stdout", *project, *name, cur.VersionNo, cur.VHash),
 		EventKind: store.KindSecretReveal, ActorRole: store.RoleHuman,
+		Status: &store.AuditStatus{Outcome: store.OutcomeDelivered},
 	}); err != nil {
 		return err
 	}
@@ -696,6 +697,29 @@ func contains(xs []string, s string) bool {
 
 // ---- audit ------------------------------------------------------------------
 
+func dashIfEmpty(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+// auditOutcome renders an entry's structured outcome, annotated with the
+// transport detail when one was measured: "delivered 204 · 84ms".
+func auditOutcome(e store.AuditEntry) string {
+	if e.Status == nil {
+		return "-"
+	}
+	out := string(e.Status.Outcome)
+	if e.Status.HTTPStatus != nil {
+		out += fmt.Sprintf(" %d", *e.Status.HTTPStatus)
+	}
+	if e.Status.LatencyMS != nil {
+		out += fmt.Sprintf(" · %dms", *e.Status.LatencyMS)
+	}
+	return out
+}
+
 func runAudit(args []string) error {
 	fs := flag.NewFlagSet("audit", flag.ExitOnError)
 	ref := fs.String("secret", "", "filter to one secret (project/NAME)")
@@ -741,13 +765,17 @@ func runAudit(args []string) error {
 		return err
 	}
 	w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "SEQ\tTS\tACTOR\tACTION\tDETAILS\tHASH")
+	fmt.Fprintln(w, "SEQ\tTS\tACTOR\tROLE\tACTION\tKIND\tOUTCOME\tDETAILS\tHASH")
 	for _, e := range entries {
 		details := e.Details
-		if len(details) > 80 {
-			details = details[:77] + "…"
+		if len(details) > 60 {
+			details = details[:57] + "…"
 		}
-		fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s…\n", e.Seq, e.TS, e.Actor, e.Action, details, e.Hash[:6])
+		// Entries predating the structured ledger carry none of these; show a
+		// dash rather than an empty column so absent reads as absent.
+		fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s…\n",
+			e.Seq, e.TS, e.Actor, dashIfEmpty(string(e.ActorRole)), e.Action,
+			dashIfEmpty(string(e.EventKind)), auditOutcome(e), details, e.Hash[:6])
 	}
 	return w.Flush()
 }

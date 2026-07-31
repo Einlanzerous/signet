@@ -280,6 +280,23 @@ func TestActorRoleHeader(t *testing.T) {
 	}
 	const body = `{"project":"proj","name":"MY_SECRET","expires_at":"2027-01-01"}`
 
+	// Internal roles cannot be claimed from outside: those entries would be
+	// hash-covered and indistinguishable from ones signet wrote itself.
+	for _, forged := range []string{"daemon", "healer"} {
+		before, err := st.CountAudit()
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec := postCmdWithHeaders(t, h, "/v1/commands/set-expiry", body,
+			map[string]string{"X-Signet-Actor-Role": forged})
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("role %q must not be declarable: %d — %s", forged, rec.Code, rec.Body)
+		}
+		if after, err := st.CountAudit(); err != nil || after != before {
+			t.Fatalf("forged %q must not append: before=%d after=%d err=%v", forged, before, after, err)
+		}
+	}
+
 	// An unknown role is a 400, and nothing is appended.
 	before, err := st.CountAudit()
 	if err != nil {
@@ -331,6 +348,55 @@ func TestActorRoleHeader(t *testing.T) {
 	}
 }
 
+// TestBadRoleFailsUniformly: role resolution runs before a handler's own
+// validation, so a caller gets the same answer for a bad role whichever command
+// it hit — not a 404 here and a 400 there depending on check ordering.
+func TestBadRoleFailsUniformly(t *testing.T) {
+	srv, _, _, _ := testServer(t)
+	h := srv.Handler()
+	// Every body below is *also* invalid (no such secret), so a handler that
+	// validated first would answer 404 instead.
+	for _, c := range []struct{ path, body string }{
+		{"/v1/commands/sync", `{"project":"nope","name":"NOPE"}`},
+		{"/v1/commands/rotate", `{"project":"nope","name":"NOPE"}`},
+		{"/v1/commands/add-target", `{"project":"nope","name":"NOPE","repo":"o/r"}`},
+		{"/v1/commands/set-expiry", `{"project":"nope","name":"NOPE"}`},
+	} {
+		rec := postCmdWithHeaders(t, h, c.path, c.body, map[string]string{"X-Signet-Actor-Role": "healer"})
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("%s: want 400 for an undeclarable role, got %d — %s", c.path, rec.Code, rec.Body)
+		}
+	}
+}
+
+// TestSetExpiryNoOpOutcome: re-sending the expiry a secret already has is not
+// an update, and the ledger should not claim it was.
+func TestSetExpiryNoOpOutcome(t *testing.T) {
+	srv, st, _, _ := testServer(t)
+	h := srv.Handler()
+	if _, err := st.CreateSecret("proj", "TOKEN", "", true, ""); err != nil {
+		t.Fatal(err)
+	}
+	const body = `{"project":"proj","name":"TOKEN","expires_at":"2027-01-01"}`
+
+	if rec := postCmd(t, h, "/v1/commands/set-expiry", body); rec.Code != http.StatusOK {
+		t.Fatalf("first set: %d — %s", rec.Code, rec.Body)
+	}
+	entries, _ := st.ListAudit(1, "")
+	if entries[0].Status.Outcome != store.OutcomeUpdated {
+		t.Fatalf("first set should be an update: %+v", entries[0].Status)
+	}
+
+	// Same value again: nothing changed.
+	if rec := postCmd(t, h, "/v1/commands/set-expiry", body); rec.Code != http.StatusOK {
+		t.Fatalf("repeat set: %d — %s", rec.Code, rec.Body)
+	}
+	entries, _ = st.ListAudit(1, "")
+	if entries[0].Status.Outcome != store.OutcomeUnchanged {
+		t.Fatalf("repeat set should be unchanged, got %q", entries[0].Status.Outcome)
+	}
+}
+
 // TestSummaryReportsHealerWindow checks the healer-actions aggregate the tile
 // reads. It is empty until the healer phase lands, and must not be inferred
 // from unrelated entries.
@@ -361,5 +427,23 @@ func TestSummaryReportsHealerWindow(t *testing.T) {
 	}
 	if summary.HealerActions["auto_resolved"] != 1 || summary.HealerActions["reverted"] != 1 {
 		t.Fatalf("healer window wrong: %+v", summary.HealerActions)
+	}
+
+	// An entry with no status must not produce a blank JSON member name.
+	if _, err := st.AppendAudit(store.AuditRecord{
+		Actor: "healer", Action: store.ActionHealerRecreate, Details: "no status recorded",
+		EventKind: store.KindHealerAction, ActorRole: store.RoleHealer,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rec = get(t, h, "/v1/mirror/summary", testToken)
+	if strings.Contains(rec.Body.String(), `"":`) {
+		t.Fatalf("summary must not emit a blank key: %s", rec.Body)
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &summary); err != nil {
+		t.Fatal(err)
+	}
+	if summary.HealerActions[string(store.OutcomeUnspecified)] != 1 {
+		t.Fatalf("statusless entry should land in the named bucket: %+v", summary.HealerActions)
 	}
 }
