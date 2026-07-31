@@ -54,11 +54,16 @@ type SecretMeta struct {
 
 // CallStat reports the transport-level outcome of one GitHub API call, so the
 // audit ledger can record what actually happened on the wire (a real status
-// code and elapsed time) rather than an assumed one. HTTPStatus is 0 when the
-// request never produced a response.
+// code and elapsed time) rather than an assumed one.
+//
+// HTTPStatus is 0 when the request never produced a response. Measured says
+// whether a request was issued and timed at all, which LatencyMS alone cannot:
+// a call that completed in under a millisecond and a call that never happened
+// both leave LatencyMS at 0.
 type CallStat struct {
 	HTTPStatus int
 	LatencyMS  int64
+	Measured   bool
 }
 
 func (c *GHClient) do(ctx context.Context, method, path string, body []byte, out any) (CallStat, error) {
@@ -77,10 +82,10 @@ func (c *GHClient) do(ctx context.Context, method, path string, body []byte, out
 	started := time.Now()
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return CallStat{LatencyMS: time.Since(started).Milliseconds()}, err
+		return CallStat{LatencyMS: time.Since(started).Milliseconds(), Measured: true}, err
 	}
 	defer resp.Body.Close()
-	stat := CallStat{HTTPStatus: resp.StatusCode, LatencyMS: time.Since(started).Milliseconds()}
+	stat := CallStat{HTTPStatus: resp.StatusCode, LatencyMS: time.Since(started).Milliseconds(), Measured: true}
 	if resp.StatusCode == http.StatusNotFound {
 		return stat, fmt.Errorf("%s %s: %w", method, path, ErrNotFound)
 	}

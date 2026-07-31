@@ -19,8 +19,9 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// Store wraps the SQLite handle. The mutex serializes audit-chain appends so
-// the hash chain is built under a strict total order.
+// Store wraps the SQLite handle. The mutex serializes audit-chain appends
+// within this process; the chain's total order across processes comes from the
+// immediate-locked transaction each append runs in.
 type Store struct {
 	db *sql.DB
 	mu sync.Mutex
@@ -31,7 +32,12 @@ func Open(path string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("open store: %w", err)
 	}
-	dsn := "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
+	// _txlock=immediate takes the write lock at BEGIN rather than at first
+	// write. The audit chain reads its head and appends the next link in one
+	// transaction; with a deferred lock two processes sharing the vault (the
+	// daemon and a CLI invocation) can both read the same head and fork the
+	// chain irreparably, since the append-only triggers forbid repair.
+	dsn := "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_txlock=immediate"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open store: %w", err)

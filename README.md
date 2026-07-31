@@ -84,7 +84,10 @@ Bearer auth (`SIGNET_API_TOKEN`), listens on `SIGNET_ADDR`
 Commands are *issued to* the daemon; the caller never touches key material.
 `X-Signet-Actor: <name>` attributes API actions in the audit chain, and
 `X-Signet-Actor-Role: <role>` declares *what kind* of caller it is (see below).
-An unrecognized role is a 400 — signet will not guess one.
+An unrecognized role is a 400 — signet will not guess one. Callers may declare
+`human`, `rule_engine`, or `dispatcher`; `daemon` and `healer` are refused,
+because they assert that signet acted on its own and no external caller can
+truthfully say that.
 
 ### Audit entry schema
 
@@ -102,14 +105,17 @@ fall back to the free text rather than inferring a value from it.
 
 `outcome` is one of `delivered` · `failed` · `rotated` · `created` · `updated` ·
 `unchanged` · `verified_healthy` · `auto_resolved` · `reverted` · `no_action`.
-`http_status` and `latency_ms` are recorded from the actual call, not assumed;
-they are omitted when there was no HTTP exchange to measure. `retried_from` /
-`retried_to` are reserved for retry/recovery transitions — signet does not retry
-pushes yet, so they are absent until it does.
+`http_status` and `latency_ms` are recorded from the actual call, not assumed.
+A numeric field is **present iff it was measured** — a push that completed in
+under a millisecond reports `"latency_ms": 0`, which is distinct from the field
+being absent because no call was made. `retried_from` / `retried_to` are
+reserved for retry/recovery transitions; signet does not retry pushes yet, so
+they are absent until it does.
 
 `GET /v1/mirror/summary` also reports `healer_actions_7d`, an outcome→count map
 over the last seven days. It is aggregated server-side because the audit
-endpoint paginates, so counting a window from one page would undercount. It is
+endpoint paginates, so counting a window from one page would undercount.
+Entries carrying no readable outcome are counted under `unspecified`. The map is
 empty until the watcher/healer phase lands.
 
 ### Chain versioning

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -303,7 +304,7 @@ func TestAuditStatusRoundTrip(t *testing.T) {
 	s := testStore(t)
 	if _, err := s.AppendAudit(AuditRecord{
 		Actor: "api:switchyard", Action: "sync.push", EventKind: KindSyncPush, ActorRole: RoleDispatcher,
-		Status: &AuditStatus{Outcome: OutcomeDelivered, HTTPStatus: 204, LatencyMS: 84},
+		Status: &AuditStatus{Outcome: OutcomeDelivered, HTTPStatus: Measured(204), LatencyMS: Measured[int64](84)},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -312,17 +313,182 @@ func TestAuditStatusRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := entries[0].Status
-	if got == nil || got.Outcome != OutcomeDelivered || got.HTTPStatus != 204 || got.LatencyMS != 84 {
+	if got == nil || got.Outcome != OutcomeDelivered {
 		t.Fatalf("status round-trip wrong: %+v", got)
 	}
-	if got.RetriedFrom != 0 || got.RetriedTo != 0 {
-		t.Fatalf("unset retry fields should stay zero: %+v", got)
+	if got.HTTPStatus == nil || *got.HTTPStatus != 204 {
+		t.Fatalf("http_status round-trip wrong: %v", got.HTTPStatus)
+	}
+	if got.LatencyMS == nil || *got.LatencyMS != 84 {
+		t.Fatalf("latency_ms round-trip wrong: %v", got.LatencyMS)
+	}
+	if got.RetriedFrom != nil || got.RetriedTo != nil {
+		t.Fatalf("unmeasured retry fields should be nil: %+v", got)
 	}
 	blob, err := json.Marshal(got)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(blob), "retried_from") {
-		t.Fatalf("unset retry fields must be omitted, got %s", blob)
+		t.Fatalf("unmeasured retry fields must be omitted, got %s", blob)
+	}
+}
+
+// TestMeasuredZeroSurvives is the distinction the struct doc claims to keep: a
+// push that completed in under a millisecond measures 0 ms, and that must not
+// come back looking like it was never measured.
+func TestMeasuredZeroSurvives(t *testing.T) {
+	s := testStore(t)
+	if _, err := s.AppendAudit(AuditRecord{
+		Actor: "api:switchyard", Action: "sync.push", EventKind: KindSyncPush, ActorRole: RoleDispatcher,
+		Status: &AuditStatus{Outcome: OutcomeDelivered, LatencyMS: Measured[int64](0)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := s.ListAudit(1, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := entries[0].Status
+	if got.LatencyMS == nil {
+		t.Fatal("a measured 0 ms must survive as measured, not vanish")
+	}
+	if *got.LatencyMS != 0 {
+		t.Fatalf("latency should be 0, got %d", *got.LatencyMS)
+	}
+	blob, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(blob), `"latency_ms":0`) {
+		t.Fatalf("measured zero must serialize, got %s", blob)
+	}
+	// And an unmeasured one still stays out of the payload entirely.
+	if strings.Contains(string(blob), "http_status") {
+		t.Fatalf("unmeasured http_status must be omitted, got %s", blob)
+	}
+}
+
+// TestConcurrentAppendKeepsChainIntact guards the cross-process fork: the vault
+// is reachable from CLI runs happening beside the daemon, and two writers that
+// read the same chain head would both link to it, splitting the chain in a way
+// the append-only triggers make unrepairable.
+func TestConcurrentAppendKeepsChainIntact(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "concurrent.db")
+	a, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := Open(path) // a second handle stands in for a second process
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	const appends = 40
+	var wg sync.WaitGroup
+	errs := make(chan error, appends)
+	for i := 0; i < appends; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			st := a
+			if i%2 == 1 {
+				st = b
+			}
+			if _, err := st.AppendAudit(testRecord("concurrent")); err != nil {
+				errs <- err
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("append failed under contention: %v", err)
+	}
+
+	ok, badSeq, total, err := a.VerifyAudit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatalf("concurrent appends forked the chain at seq %d", badSeq)
+	}
+	if total != appends {
+		t.Fatalf("want %d entries, got %d", appends, total)
+	}
+}
+
+// TestMalformedStatusDegradesRow: a corrupt status blob must not take the whole
+// ledger view offline, and the chain check must still report the corruption.
+func TestMalformedStatusDegradesRow(t *testing.T) {
+	s := testStore(t)
+	for i := 0; i < 3; i++ {
+		if _, err := s.AppendAudit(AuditRecord{
+			Actor: "healer", Action: ActionHealerRestart, EventKind: KindHealerAction,
+			ActorRole: RoleHealer, Status: &AuditStatus{Outcome: OutcomeAutoResolved},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.db.Exec(`DROP TRIGGER audit_log_no_update`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE audit_log SET status = 'not json{' WHERE seq = 2`); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := s.ListAudit(50, "")
+	if err != nil {
+		t.Fatalf("one bad row must not fail the whole read: %v", err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("want 3 entries, got %d", len(entries))
+	}
+	for _, e := range entries {
+		if e.Seq == 2 && e.Status != nil {
+			t.Fatalf("corrupt status should degrade to none, got %+v", e.Status)
+		}
+		if e.Seq != 2 && e.Status == nil {
+			t.Fatalf("seq %d lost its status", e.Seq)
+		}
+	}
+	// The corruption is still reported, via the signal that owns integrity.
+	if ok, badSeq, _, err := s.VerifyAudit(); err != nil || ok || badSeq != 2 {
+		t.Fatalf("tampered status must break the chain: ok=%v badSeq=%d err=%v", ok, badSeq, err)
+	}
+	// Aggregation tolerates it too, filing it under the named bucket.
+	counts, err := s.CountAuditKindSince(KindHealerAction, "2000-01-01T00:00:00Z")
+	if err != nil {
+		t.Fatalf("aggregation must survive a bad blob: %v", err)
+	}
+	if counts[OutcomeAutoResolved] != 2 || counts[OutcomeUnspecified] != 1 {
+		t.Fatalf("counts wrong: %+v", counts)
+	}
+}
+
+// TestAggregationGroupsByOutcomeNotBlob: entries differing only in a numeric
+// status field are the same outcome, and must not fragment into separate rows.
+func TestAggregationGroupsByOutcomeNotBlob(t *testing.T) {
+	s := testStore(t)
+	for i := 0; i < 5; i++ {
+		if _, err := s.AppendAudit(AuditRecord{
+			Actor: "healer", Action: ActionHealerRestart, EventKind: KindHealerAction,
+			ActorRole: RoleHealer,
+			Status: &AuditStatus{
+				Outcome:   OutcomeAutoResolved,
+				LatencyMS: Measured[int64](int64(i) * 17), // each entry a different blob
+			},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	counts, err := s.CountAuditKindSince(KindHealerAction, "2000-01-01T00:00:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(counts) != 1 || counts[OutcomeAutoResolved] != 5 {
+		t.Fatalf("differing latencies must not split the outcome: %+v", counts)
 	}
 }

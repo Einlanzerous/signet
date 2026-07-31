@@ -86,23 +86,32 @@ var validRoles = map[ActorRole]bool{
 	RoleDaemon: true, RoleHealer: true,
 }
 
-// ValidActorRole reports whether role is one signet recognizes. Callers that
-// accept a role from outside (the API's role header) must check it here rather
-// than passing an arbitrary string into the chain.
-func ValidActorRole(role ActorRole) bool { return validRoles[role] }
+// declarableRoles are the roles an API caller may claim for itself.
+//
+// RoleDaemon and RoleHealer are deliberately excluded: they mean "signet did
+// this on its own initiative", and only code inside the daemon can honestly
+// assert that. Letting a token holder declare them would let any caller write
+// entries indistinguishable from signet's own — and those entries are covered
+// by the chain hash, so the forgery would be permanent and look authentic.
+var declarableRoles = map[ActorRole]bool{
+	RoleHuman: true, RoleRuleEngine: true, RoleDispatcher: true,
+}
 
-// ActorRoles lists the recognized roles, sorted, for error messages and docs.
-func ActorRoles() []string {
-	out := make([]string, 0, len(validRoles))
-	for r := range validRoles {
+// DeclarableActorRole reports whether role may be claimed by an API caller.
+// Callers that take a role from outside (the API's role header) must check it
+// here rather than passing an arbitrary string into the chain.
+func DeclarableActorRole(role ActorRole) bool { return declarableRoles[role] }
+
+// DeclarableActorRoles lists the claimable roles, sorted, for error messages
+// and docs.
+func DeclarableActorRoles() []string {
+	out := make([]string, 0, len(declarableRoles))
+	for r := range declarableRoles {
 		out = append(out, string(r))
 	}
 	sort.Strings(out)
 	return out
 }
-
-// ValidEventKind reports whether kind is one signet recognizes.
-func ValidEventKind(kind EventKind) bool { return validKinds[kind] }
 
 // Outcome is the typed result carried by AuditStatus.
 type Outcome string
@@ -151,16 +160,25 @@ const (
 )
 
 // AuditStatus is the structured outcome of an entry, present only where the
-// event actually has one. Zero-valued numeric fields are omitted rather than
-// reported as 0, so a consumer can distinguish "no latency recorded" from
-// "0 ms".
+// event actually has one.
+//
+// The numeric fields are pointers so that absent and zero stay distinct: a
+// sub-millisecond push genuinely measures 0 ms, and with a value type plus
+// omitempty that measurement would be indistinguishable from never having been
+// taken. nil means "not measured"; a pointer to 0 means "measured, and it was
+// zero".
 type AuditStatus struct {
 	Outcome     Outcome `json:"outcome"`
-	HTTPStatus  int     `json:"http_status,omitempty"`
-	LatencyMS   int64   `json:"latency_ms,omitempty"`
-	RetriedFrom int     `json:"retried_from,omitempty"`
-	RetriedTo   int     `json:"retried_to,omitempty"`
+	HTTPStatus  *int    `json:"http_status,omitempty"`
+	LatencyMS   *int64  `json:"latency_ms,omitempty"`
+	RetriedFrom *int    `json:"retried_from,omitempty"`
+	RetriedTo   *int    `json:"retried_to,omitempty"`
 }
+
+// Measured marks a numeric status field as actually observed. Use it rather
+// than taking the address of a literal, so the intent — this number was
+// measured, even if it is zero — stays visible at the call site.
+func Measured[T int | int64](v T) *T { return &v }
 
 // AuditEntry is one row of the append-only, hash-chained audit log.
 //
@@ -250,12 +268,20 @@ func chainHashV2(fields ...string) string {
 // hashFor recomputes an entry's hash under the scheme it was written with.
 // statusJSON is the stored encoding, hashed byte-for-byte so an entry stays
 // verifiable even if the AuditStatus struct later gains fields.
+//
+// Unknown versions return "", which never equals a stored hash and so reads as
+// broken. Matching on the known versions rather than defaulting to the newest
+// keeps a future scheme from being silently hashed as v2.
 func hashFor(version int, e *AuditEntry, statusJSON string) string {
-	if version == hashV1 {
+	switch version {
+	case hashV1:
 		return chainHashV1(e.PrevHash, e.TS, e.Actor, e.Action, e.SecretID, e.TargetID, e.Details)
+	case hashV2:
+		return chainHashV2(e.PrevHash, e.TS, e.Actor, e.Action, e.SecretID, e.TargetID,
+			e.Details, string(e.EventKind), string(e.ActorRole), statusJSON)
+	default:
+		return ""
 	}
-	return chainHashV2(e.PrevHash, e.TS, e.Actor, e.Action, e.SecretID, e.TargetID,
-		e.Details, string(e.EventKind), string(e.ActorRole), statusJSON)
 }
 
 // encodeStatus renders a status for storage and hashing. Marshalling a struct
@@ -297,8 +323,14 @@ func scanEntry(rows *sql.Rows) (AuditEntry, string, error) {
 	return e, statusJSON, err
 }
 
-// AppendAudit appends an entry to the chain. Appends are serialized so the
-// prev-hash linkage is always built under a total order.
+// AppendAudit appends an entry to the chain.
+//
+// Reading the chain head and writing the entry that links to it happen in one
+// immediate-locked transaction. A mutex alone would not do: it orders appends
+// within this process, but the vault is also reachable from CLI invocations
+// running beside the daemon, and two processes that read the same head both
+// write entries claiming the same prev_hash — a fork the append-only triggers
+// make unrepairable.
 func (s *Store) AppendAudit(rec AuditRecord) (*AuditEntry, error) {
 	if err := rec.validate(); err != nil {
 		return nil, err
@@ -311,8 +343,14 @@ func (s *Store) AppendAudit(rec AuditRecord) (*AuditEntry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("append audit: begin: %w", err)
+	}
+	defer tx.Rollback()
+
 	prev := genesisHash
-	err = s.db.QueryRow(`SELECT hash FROM audit_log ORDER BY seq DESC LIMIT 1`).Scan(&prev)
+	err = tx.QueryRow(`SELECT hash FROM audit_log ORDER BY seq DESC LIMIT 1`).Scan(&prev)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("append audit: read chain head: %w", err)
 	}
@@ -323,7 +361,7 @@ func (s *Store) AppendAudit(rec AuditRecord) (*AuditEntry, error) {
 		PrevHash: prev, HashVersion: hashCurrent,
 	}
 	e.Hash = hashFor(hashCurrent, &e, statusJSON)
-	res, err := s.db.Exec(`
+	res, err := tx.Exec(`
         INSERT INTO audit_log (ts, actor, action, secret_id, target_id, details,
                                event_kind, actor_role, status, prev_hash, hash, hash_version)
         VALUES (?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?)`,
@@ -333,6 +371,9 @@ func (s *Store) AppendAudit(rec AuditRecord) (*AuditEntry, error) {
 		return nil, fmt.Errorf("append audit: %w", err)
 	}
 	e.Seq, _ = res.LastInsertId()
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("append audit: commit: %w", err)
+	}
 	return &e, nil
 }
 
@@ -383,8 +424,13 @@ func (s *Store) ListAudit(limit int, secretID string) ([]AuditEntry, error) {
 		if err != nil {
 			return nil, fmt.Errorf("list audit: %w", err)
 		}
-		if e.Status, err = decodeStatus(statusJSON); err != nil {
-			return nil, fmt.Errorf("list audit: seq %d: %w", e.Seq, err)
+		// A status that will not decode degrades that one row to no status
+		// rather than failing the read. Refusing to serve the ledger is the
+		// worst response to a corrupt row in it — and the corruption is still
+		// reported, because the hash covers the stored blob, so VerifyAudit
+		// breaks the chain at exactly this entry.
+		if st, err := decodeStatus(statusJSON); err == nil {
+			e.Status = st
 		}
 		out = append(out, e)
 	}
@@ -398,35 +444,41 @@ func (s *Store) CountAudit() (int, error) {
 	return n, err
 }
 
+// OutcomeUnspecified is the bucket CountAuditKindSince files entries under when
+// they carry no status, or one whose outcome cannot be read. It is a real key
+// rather than the empty string so it survives being marshalled into a JSON
+// object without producing a blank member name.
+const OutcomeUnspecified Outcome = "unspecified"
+
 // CountAuditKindSince returns how many entries of kind were appended at or
-// after since (an RFC3339 timestamp), grouped by outcome. Entries without a
-// status are counted under the empty-string key. It backs "N in the last 7
-// days, X auto-resolved, Y reverted" style reporting without pulling the whole
-// chain across the wire.
+// after since (an RFC3339 timestamp), grouped by outcome. It backs "N in the
+// last 7 days, X auto-resolved, Y reverted" style reporting without pulling the
+// whole chain across the wire.
+//
+// Grouping happens on the extracted outcome, not the stored blob: two entries
+// that differ only in latency are the same outcome, and grouping on the raw
+// JSON would split them into separate rows.
 func (s *Store) CountAuditKindSince(kind EventKind, since string) (map[Outcome]int, error) {
 	rows, err := s.db.Query(`
-        SELECT status, COUNT(*) FROM audit_log
-        WHERE event_kind = ? AND ts >= ? GROUP BY status`, string(kind), since)
+        SELECT COALESCE(
+                 CASE WHEN json_valid(status) THEN json_extract(status, '$.outcome') END,
+                 ?) AS outcome,
+               COUNT(*)
+        FROM audit_log
+        WHERE event_kind = ? AND ts >= ?
+        GROUP BY outcome`, string(OutcomeUnspecified), string(kind), since)
 	if err != nil {
 		return nil, fmt.Errorf("count audit kind: %w", err)
 	}
 	defer rows.Close()
 	out := map[Outcome]int{}
 	for rows.Next() {
-		var statusJSON string
+		var outcome string
 		var n int
-		if err := rows.Scan(&statusJSON, &n); err != nil {
+		if err := rows.Scan(&outcome, &n); err != nil {
 			return nil, fmt.Errorf("count audit kind: %w", err)
 		}
-		st, err := decodeStatus(statusJSON)
-		if err != nil {
-			return nil, err
-		}
-		if st == nil {
-			out[""] += n
-			continue
-		}
-		out[st.Outcome] += n
+		out[Outcome(outcome)] += n
 	}
 	return out, rows.Err()
 }

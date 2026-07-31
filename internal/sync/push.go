@@ -3,6 +3,7 @@ package sync
 import (
 	"context"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/Einlanzerous/signet/internal/store"
@@ -17,6 +18,21 @@ type PushResult struct {
 	State    string `json:"state"` // in sync | error
 	Note     string `json:"note,omitempty"`
 	Err      string `json:"error,omitempty"`
+	// AuditErr reports a push that happened but could not be written to the
+	// ledger. It is surfaced rather than swallowed: an unrecorded mutation of a
+	// live destination is precisely what this vault must never do quietly.
+	AuditErr string `json:"audit_error,omitempty"`
+}
+
+// recordPush appends the ledger entry for one push attempt. A failure here does
+// not undo the push — the destination has already changed — so it is reported
+// on the result and logged instead of being discarded.
+func recordPush(st *store.Store, res *PushResult, rec store.AuditRecord) {
+	if _, err := st.AppendAudit(rec); err != nil {
+		res.AuditErr = err.Error()
+		log.Printf("audit append failed for %s %s: %v — destination changed but the ledger has no entry",
+			rec.Action, res.Repo, err)
+	}
 }
 
 // PushSecret seals the secret's current version and pushes it to every
@@ -60,13 +76,21 @@ func PushSecret(ctx context.Context, st *store.Store, key []byte, gh *GHClient, 
 		}
 
 		stat, err := pushOne(ctx, gh, cfg, plaintext)
-		status := &store.AuditStatus{HTTPStatus: stat.HTTPStatus, LatencyMS: stat.LatencyMS}
+		// Only record numbers that were actually observed: a request that never
+		// got a response has no status, and an unattempted call has no latency.
+		status := &store.AuditStatus{}
+		if stat.HTTPStatus != 0 {
+			status.HTTPStatus = store.Measured(stat.HTTPStatus)
+		}
+		if stat.Measured {
+			status.LatencyMS = store.Measured(stat.LatencyMS)
+		}
 		if err != nil {
 			res.State = "error"
 			res.Err = err.Error()
 			status.Outcome = store.OutcomeFailed
 			_ = st.UpdateTargetPush(t.ID, "error", err.Error(), "", "")
-			_, _ = st.AppendAudit(store.AuditRecord{
+			recordPush(st, &res, store.AuditRecord{
 				Actor: actor, Action: "sync.push.failed", SecretID: sec.ID, TargetID: t.ID,
 				Details:   fmt.Sprintf("%s → %s/%s: %s", sec.Name, cfg.Repo, cfg.SecretName, err),
 				EventKind: kind, ActorRole: role, Status: status,
@@ -80,7 +104,7 @@ func PushSecret(ctx context.Context, st *store.Store, key []byte, gh *GHClient, 
 			if res.Note != "" {
 				detail += " (" + res.Note + ")"
 			}
-			_, _ = st.AppendAudit(store.AuditRecord{
+			recordPush(st, &res, store.AuditRecord{
 				Actor: actor, Action: "sync.push", SecretID: sec.ID, TargetID: t.ID,
 				Details: detail, EventKind: kind, ActorRole: role, Status: status,
 			})
