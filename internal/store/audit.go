@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"sort"
 	"strconv"
 	"strings"
@@ -429,8 +430,14 @@ func (s *Store) ListAudit(limit int, secretID string) ([]AuditEntry, error) {
 		// worst response to a corrupt row in it — and the corruption is still
 		// reported, because the hash covers the stored blob, so VerifyAudit
 		// breaks the chain at exactly this entry.
+		//
+		// It is logged because the degraded row is otherwise indistinguishable
+		// from one that legitimately carries no status: the same absent-versus-
+		// present confusion the pointer-typed status fields exist to avoid.
 		if st, err := decodeStatus(statusJSON); err == nil {
 			e.Status = st
+		} else {
+			log.Printf("audit seq %d: status will not decode, serving the row without one: %v", e.Seq, err)
 		}
 		out = append(out, e)
 	}
@@ -465,6 +472,9 @@ func (s *Store) CountAuditKindSince(kind EventKind, since string) (map[Outcome]i
                  ?) AS outcome,
                COUNT(*)
         FROM audit_log
+        -- ts compares lexicographically, which holds only because every
+        -- timestamp here is RFC3339 in UTC (see now()) and callers build the
+        -- bound the same way.
         WHERE event_kind = ? AND ts >= ?
         GROUP BY outcome`, string(OutcomeUnspecified), string(kind), since)
 	if err != nil {
