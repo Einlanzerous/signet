@@ -33,10 +33,19 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("open store: %w", err)
 	}
 	// _txlock=immediate takes the write lock at BEGIN rather than at first
-	// write. The audit chain reads its head and appends the next link in one
-	// transaction; with a deferred lock two processes sharing the vault (the
-	// daemon and a CLI invocation) can both read the same head and fork the
-	// chain irreparably, since the append-only triggers forbid repair.
+	// write. Do not remove it as redundant next to AppendAudit's explicit
+	// transaction — the two are both load-bearing, and neither works alone.
+	//
+	// Without the transaction, two processes read the same chain head and fork
+	// the chain. Without this parameter, the transaction is deferred: it starts
+	// SHARED and upgrades to RESERVED at the first write, and two writers
+	// holding SHARED deadlock on that upgrade. busy_timeout cannot rescue it,
+	// because neither side can make progress by waiting. Stripping either half
+	// makes TestConcurrentAppendKeepsChainIntact fail — as a fork, or as
+	// SQLITE_BUSY.
+	//
+	// The driver applies the mode only to write transactions (modernc.org/sqlite
+	// tx.go: "begin "+beginMode when !opts.ReadOnly), so reads are unaffected.
 	dsn := "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_txlock=immediate"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
