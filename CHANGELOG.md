@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.3.0](https://github.com/Einlanzerous/signet/compare/v1.2.0...v1.3.0) (2026-08-01)
+
+
+### Features
+
+* **release:** dispatch to construct-server on release (SGNT-12) ([8cf201d](https://github.com/Einlanzerous/signet/commit/8cf201da1ce62aea4d8e45d302be794c081a67d9))
+* **target:** add target list and target rm (SGNT-11) ([4d1d42b](https://github.com/Einlanzerous/signet/commit/4d1d42b6c6b8f3ccd60a467c2ff26bd2a93f19c0))
+
+
+### Bug Fixes
+
+* **store:** make mutation and audit append atomic (SGNT-14) ([#12](https://github.com/Einlanzerous/signet/issues/12)) ([e66319e](https://github.com/Einlanzerous/signet/commit/e66319e90998fd1f5bcc55bdeeaa9703f79e92ec))
+
 ## [1.2.0](https://github.com/Einlanzerous/signet/compare/v1.1.0...v1.2.0) (2026-07-31)
 
 
