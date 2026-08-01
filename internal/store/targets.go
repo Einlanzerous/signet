@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -75,11 +76,7 @@ func (t *Target) GHState(cur *Version) string {
 const targetCols = `id, kind, COALESCE(secret_id, ''), COALESCE(project, ''), config,
     COALESCE(last_pushed_version_id, ''), COALESCE(last_pushed_at, ''), last_state, COALESCE(last_error, ''), created_at`
 
-func (s *Store) queryTargets(where string, args ...any) ([]Target, error) {
-	rows, err := s.db.Query(`SELECT `+targetCols+` FROM targets `+where, args...)
-	if err != nil {
-		return nil, fmt.Errorf("query targets: %w", err)
-	}
+func scanTargets(rows *sql.Rows) ([]Target, error) {
 	defer rows.Close()
 	var out []Target
 	for rows.Next() {
@@ -91,6 +88,28 @@ func (s *Store) queryTargets(where string, args ...any) ([]Target, error) {
 		out = append(out, t)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) queryTargets(where string, args ...any) ([]Target, error) {
+	ctx, cancel := pooled()
+	defer cancel()
+	rows, err := s.db.QueryContext(ctx, `SELECT `+targetCols+` FROM targets `+where, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query targets: %w", err)
+	}
+	return scanTargets(rows)
+}
+
+// queryTargets reads through the mutation's transaction, so a check made here
+// and the write that depends on it cannot be separated by another writer. The
+// Store variant reads a snapshot from before the transaction and would reopen
+// exactly that gap.
+func (m *Mutation) queryTargets(where string, args ...any) ([]Target, error) {
+	rows, err := m.tx.Query(`SELECT `+targetCols+` FROM targets `+where, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query targets: %w", err)
+	}
+	return scanTargets(rows)
 }
 
 // ListTargets returns all targets.
@@ -110,29 +129,41 @@ func (s *Store) FileTargetsForProject(project string) ([]Target, error) {
 
 // UpsertFileTarget creates a project file target for path, or merges keys into
 // an existing target for the same path. Keys are kept sorted and deduplicated.
-func (s *Store) UpsertFileTarget(project, path string, keys []string, mode string) (*Target, error) {
-	existing, err := s.FileTargetsForProject(project)
+// The returned Outcome distinguishes the two, so the caller's audit entry can
+// say which happened.
+//
+// The read that decides between them and the write that acts on it share this
+// transaction. Split apart — as they were when this hung off Store — two
+// imports of the same path could both find nothing and both insert, leaving a
+// project with two targets for one file and no constraint to catch it.
+func (m *Mutation) UpsertFileTarget(project, path string, keys []string, mode string) (*Target, Outcome, error) {
+	existing, err := m.queryTargets(`WHERE kind = 'file' AND project = ? ORDER BY created_at, id`, project)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	for i := range existing {
 		cfg, err := existing[i].FileConfig()
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		if cfg.Path != path {
 			continue
 		}
+		before := existing[i].Config
 		cfg.Keys = mergeKeys(cfg.Keys, keys)
 		if mode != "" {
 			cfg.Mode = mode
 		}
 		raw, _ := json.Marshal(cfg)
-		if _, err := s.db.Exec(`UPDATE targets SET config = ? WHERE id = ?`, string(raw), existing[i].ID); err != nil {
-			return nil, fmt.Errorf("upsert file target: %w", err)
+		if _, err := m.tx.Exec(`UPDATE targets SET config = ? WHERE id = ?`, string(raw), existing[i].ID); err != nil {
+			return nil, "", fmt.Errorf("upsert file target: %w", err)
 		}
 		existing[i].Config = string(raw)
-		return &existing[i], nil
+		outcome := OutcomeUpdated
+		if string(raw) == before {
+			outcome = OutcomeUnchanged
+		}
+		return &existing[i], outcome, nil
 	}
 	if mode == "" {
 		mode = "0600"
@@ -140,20 +171,20 @@ func (s *Store) UpsertFileTarget(project, path string, keys []string, mode strin
 	cfg := FileConfig{Path: path, Keys: mergeKeys(nil, keys), Mode: mode}
 	raw, _ := json.Marshal(cfg)
 	t := Target{ID: newID(), Kind: "file", Project: project, Config: string(raw), LastState: "never", CreatedAt: now()}
-	if _, err := s.db.Exec(`
+	if _, err := m.tx.Exec(`
         INSERT INTO targets (id, kind, project, config, last_state, created_at)
         VALUES (?, 'file', ?, ?, 'never', ?)`, t.ID, project, t.Config, t.CreatedAt); err != nil {
-		return nil, fmt.Errorf("upsert file target: %w", err)
+		return nil, "", fmt.Errorf("upsert file target: %w", err)
 	}
-	return &t, nil
+	return &t, OutcomeCreated, nil
 }
 
 // AddGHTarget attaches a GitHub Actions repo-secret destination to a secret.
-func (s *Store) AddGHTarget(secretID, repo, secretName string) (*Target, error) {
+func (m *Mutation) AddGHTarget(secretID, repo, secretName string) (*Target, error) {
 	cfg := GHConfig{Repo: repo, SecretName: secretName}
 	raw, _ := json.Marshal(cfg)
 	t := Target{ID: newID(), Kind: "gh-actions", SecretID: secretID, Config: string(raw), LastState: "never", CreatedAt: now()}
-	if _, err := s.db.Exec(`
+	if _, err := m.tx.Exec(`
         INSERT INTO targets (id, kind, secret_id, config, last_state, created_at)
         VALUES (?, 'gh-actions', ?, ?, 'never', ?)`, t.ID, secretID, t.Config, t.CreatedAt); err != nil {
 		return nil, fmt.Errorf("add gh target: %w", err)
@@ -170,6 +201,22 @@ func (s *Store) FindGHTarget(secretID, repo, secretName string) (*Target, error)
 	if err != nil {
 		return nil, err
 	}
+	return findGHTarget(targets, repo, secretName)
+}
+
+// FindGHTarget is the tx-scoped lookup. A caller enforcing the uniqueness of
+// (repo, secretName) must use this rather than the Store variant: checking
+// outside the transaction that then inserts leaves a window where another
+// writer creates the destination the check just found missing.
+func (m *Mutation) FindGHTarget(secretID, repo, secretName string) (*Target, error) {
+	targets, err := m.queryTargets(`WHERE secret_id = ? ORDER BY created_at, id`, secretID)
+	if err != nil {
+		return nil, err
+	}
+	return findGHTarget(targets, repo, secretName)
+}
+
+func findGHTarget(targets []Target, repo, secretName string) (*Target, error) {
 	for i := range targets {
 		if targets[i].Kind != "gh-actions" {
 			continue
@@ -212,8 +259,8 @@ func (s *Store) FindFileTarget(project, path string) (*Target, error) {
 // exactly as it is; signet simply stops maintaining it. Audit entries that
 // reference this target keep their target_id, because the chain is append-only
 // and history is not rewritten when a target goes away.
-func (s *Store) RemoveTarget(id string) error {
-	res, err := s.db.Exec(`DELETE FROM targets WHERE id = ?`, id)
+func (m *Mutation) RemoveTarget(id string) error {
+	res, err := m.tx.Exec(`DELETE FROM targets WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("remove target: %w", err)
 	}
@@ -228,8 +275,16 @@ func (s *Store) RemoveTarget(id string) error {
 }
 
 // UpdateTargetPush records the outcome of a push attempt.
+//
+// It stays on Store rather than Mutation because the thing it describes has
+// already happened out on the network: the destination holds the new value
+// whether or not this row or its ledger entry lands, so there is nothing here
+// to roll back. Its audit entry is appended separately and a failure to write
+// it is surfaced, not swallowed — see sync.recordPush.
 func (s *Store) UpdateTargetPush(id, state, lastErr, versionID, pushedAt string) error {
-	_, err := s.db.Exec(`
+	ctx, cancel := pooled()
+	defer cancel()
+	_, err := s.db.ExecContext(ctx, `
         UPDATE targets
         SET last_state = ?, last_error = NULLIF(?, ''),
             last_pushed_version_id = COALESCE(NULLIF(?, ''), last_pushed_version_id),

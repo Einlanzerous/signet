@@ -36,7 +36,9 @@ func now() string { return time.Now().UTC().Format(time.RFC3339) }
 
 // GetSecret returns the secret for (project, name), or nil if absent.
 func (s *Store) GetSecret(project, name string) (*Secret, error) {
-	row := s.db.QueryRow(`
+	ctx, cancel := pooled()
+	defer cancel()
+	row := s.db.QueryRowContext(ctx, `
         SELECT id, project, name, scope, status, generated, COALESCE(expires_at, ''), created_at, updated_at
         FROM secrets WHERE project = ? AND name = ?`, project, name)
 	return scanSecret(row)
@@ -44,7 +46,9 @@ func (s *Store) GetSecret(project, name string) (*Secret, error) {
 
 // GetSecretByID returns the secret with the given id, or nil if absent.
 func (s *Store) GetSecretByID(id string) (*Secret, error) {
-	row := s.db.QueryRow(`
+	ctx, cancel := pooled()
+	defer cancel()
+	row := s.db.QueryRowContext(ctx, `
         SELECT id, project, name, scope, status, generated, COALESCE(expires_at, ''), created_at, updated_at
         FROM secrets WHERE id = ?`, id)
 	return scanSecret(row)
@@ -65,7 +69,7 @@ func scanSecret(row *sql.Row) (*Secret, error) {
 }
 
 // CreateSecret inserts a new secret row.
-func (s *Store) CreateSecret(project, name, scope string, generated bool, expiresAt string) (*Secret, error) {
+func (m *Mutation) CreateSecret(project, name, scope string, generated bool, expiresAt string) (*Secret, error) {
 	sec := Secret{
 		ID: newID(), Project: project, Name: name, Scope: scope,
 		Status: "active", Generated: generated, ExpiresAt: expiresAt,
@@ -75,7 +79,7 @@ func (s *Store) CreateSecret(project, name, scope string, generated bool, expire
 	if generated {
 		gen = 1
 	}
-	_, err := s.db.Exec(`
+	_, err := m.tx.Exec(`
         INSERT INTO secrets (id, project, name, scope, status, generated, expires_at, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?)`,
 		sec.ID, sec.Project, sec.Name, sec.Scope, sec.Status, gen, sec.ExpiresAt, sec.CreatedAt, sec.UpdatedAt)
@@ -87,8 +91,8 @@ func (s *Store) CreateSecret(project, name, scope string, generated bool, expire
 
 // SetExpiry updates a secret's expiry (RFC3339, or empty to clear) and bumps
 // updated_at.
-func (s *Store) SetExpiry(secretID, expiresAt string) error {
-	if _, err := s.db.Exec(
+func (m *Mutation) SetExpiry(secretID, expiresAt string) error {
+	if _, err := m.tx.Exec(
 		`UPDATE secrets SET expires_at = NULLIF(?, ''), updated_at = ? WHERE id = ?`,
 		expiresAt, now(), secretID); err != nil {
 		return fmt.Errorf("set expiry: %w", err)
@@ -98,7 +102,9 @@ func (s *Store) SetExpiry(secretID, expiresAt string) error {
 
 // ListSecrets returns every secret ordered by project then name.
 func (s *Store) ListSecrets() ([]Secret, error) {
-	rows, err := s.db.Query(`
+	ctx, cancel := pooled()
+	defer cancel()
+	rows, err := s.db.QueryContext(ctx, `
         SELECT id, project, name, scope, status, generated, COALESCE(expires_at, ''), created_at, updated_at
         FROM secrets ORDER BY project, name`)
 	if err != nil {
@@ -118,10 +124,12 @@ func (s *Store) ListSecrets() ([]Secret, error) {
 	return out, rows.Err()
 }
 
-// AddVersion appends a new encrypted version for a secret and bumps updated_at.
-func (s *Store) AddVersion(secretID string, nonce, ciphertext []byte, vhash, createdBy string) (*Version, error) {
+// AddVersion appends a new encrypted version for a secret and bumps
+// updated_at. The next version number is read inside the same transaction that
+// writes it, so two writers cannot both claim it.
+func (m *Mutation) AddVersion(secretID string, nonce, ciphertext []byte, vhash, createdBy string) (*Version, error) {
 	var next int
-	if err := s.db.QueryRow(`SELECT COALESCE(MAX(version_no), 0) + 1 FROM secret_versions WHERE secret_id = ?`, secretID).Scan(&next); err != nil {
+	if err := m.tx.QueryRow(`SELECT COALESCE(MAX(version_no), 0) + 1 FROM secret_versions WHERE secret_id = ?`, secretID).Scan(&next); err != nil {
 		return nil, fmt.Errorf("add version: %w", err)
 	}
 	v := Version{
@@ -129,13 +137,13 @@ func (s *Store) AddVersion(secretID string, nonce, ciphertext []byte, vhash, cre
 		Nonce: nonce, Ciphertext: ciphertext, VHash: vhash,
 		CreatedBy: createdBy, CreatedAt: now(),
 	}
-	if _, err := s.db.Exec(`
+	if _, err := m.tx.Exec(`
         INSERT INTO secret_versions (id, secret_id, version_no, nonce, ciphertext, vhash, created_by, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		v.ID, v.SecretID, v.VersionNo, v.Nonce, v.Ciphertext, v.VHash, v.CreatedBy, v.CreatedAt); err != nil {
 		return nil, fmt.Errorf("add version: %w", err)
 	}
-	if _, err := s.db.Exec(`UPDATE secrets SET updated_at = ? WHERE id = ?`, now(), secretID); err != nil {
+	if _, err := m.tx.Exec(`UPDATE secrets SET updated_at = ? WHERE id = ?`, now(), secretID); err != nil {
 		return nil, fmt.Errorf("add version: %w", err)
 	}
 	return &v, nil
@@ -143,7 +151,9 @@ func (s *Store) AddVersion(secretID string, nonce, ciphertext []byte, vhash, cre
 
 // CurrentVersion returns the newest version of a secret, or nil if none exist.
 func (s *Store) CurrentVersion(secretID string) (*Version, error) {
-	row := s.db.QueryRow(`
+	ctx, cancel := pooled()
+	defer cancel()
+	row := s.db.QueryRowContext(ctx, `
         SELECT id, secret_id, version_no, nonce, ciphertext, vhash, created_by, created_at
         FROM secret_versions WHERE secret_id = ? ORDER BY version_no DESC LIMIT 1`, secretID)
 	var v Version

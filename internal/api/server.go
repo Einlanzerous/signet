@@ -448,17 +448,19 @@ func (s *Server) handleCommandRotate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
-	v, err := s.st.AddVersion(sec.ID, nonce, ct, vault.VersionHash(nonce, ct), s.actor(r))
+	v, _, err := store.MutateValue(s.st, func(m *store.Mutation) (*store.Version, store.AuditRecord, error) {
+		ver, err := m.AddVersion(sec.ID, nonce, ct, vault.VersionHash(nonce, ct), s.actor(r))
+		if err != nil {
+			return nil, store.AuditRecord{}, err
+		}
+		return ver, store.AuditRecord{
+			Actor: s.actor(r), Action: "rotate", SecretID: sec.ID,
+			Details:   fmt.Sprintf("rotated %s/%s → version %d #%s — fan-out queued", sec.Project, sec.Name, ver.VersionNo, ver.VHash),
+			EventKind: store.KindRotation, ActorRole: role,
+			Status: &store.AuditStatus{Outcome: store.OutcomeRotated},
+		}, nil
+	})
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "%v", err)
-		return
-	}
-	if _, err := s.st.AppendAudit(store.AuditRecord{
-		Actor: s.actor(r), Action: "rotate", SecretID: sec.ID,
-		Details:   fmt.Sprintf("rotated %s/%s → version %d #%s — fan-out queued", sec.Project, sec.Name, v.VersionNo, v.VHash),
-		EventKind: store.KindRotation, ActorRole: role,
-		Status: &store.AuditStatus{Outcome: store.OutcomeRotated},
-	}); err != nil {
 		writeErr(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
@@ -490,6 +492,11 @@ var ghSecretRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 func validGHSecretName(name string) bool {
 	return ghSecretRe.MatchString(name) && !strings.HasPrefix(strings.ToUpper(name), "GITHUB_")
 }
+
+// errTargetExists carries "this destination is already attached" out of the
+// transaction that discovered it, so the handler can answer 409 rather than
+// letting a conflict read as an internal error.
+var errTargetExists = errors.New("target already exists")
 
 type addTargetReq struct {
 	Project    string `json:"project"`
@@ -533,32 +540,34 @@ func (s *Server) handleCommandAddTarget(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusNotFound, "no secret %s/%s", req.Project, req.Name)
 		return
 	}
-	existing, err := s.st.TargetsForSecret(sec.ID)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "%v", err)
-		return
-	}
-	for _, t := range existing {
-		cfg, err := t.GHConfig()
+	// The duplicate check runs inside the transaction that inserts. Outside it,
+	// (repo, secret_name) uniqueness is only advisory: two callers adding the
+	// same destination both read no match and both insert, and nothing in the
+	// schema catches it afterwards.
+	t, _, err := store.MutateValue(s.st, func(m *store.Mutation) (*store.Target, store.AuditRecord, error) {
+		dup, err := m.FindGHTarget(sec.ID, req.Repo, dest)
 		if err != nil {
-			continue
+			return nil, store.AuditRecord{}, err
 		}
-		if cfg.Repo == req.Repo && cfg.SecretName == dest {
-			writeErr(w, http.StatusConflict, "target already exists: %s → %s (Actions secret %s)", req.Repo, dest, dest)
-			return
+		if dup != nil {
+			return nil, store.AuditRecord{}, errTargetExists
 		}
-	}
-	t, err := s.st.AddGHTarget(sec.ID, req.Repo, dest)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "%v", err)
+		created, err := m.AddGHTarget(sec.ID, req.Repo, dest)
+		if err != nil {
+			return nil, store.AuditRecord{}, err
+		}
+		return created, store.AuditRecord{
+			Actor: s.actor(r), Action: "target.add", SecretID: sec.ID, TargetID: created.ID,
+			Details:   fmt.Sprintf("%s/%s → %s · Actions secret %s", req.Project, req.Name, req.Repo, dest),
+			EventKind: store.KindTargetConfig, ActorRole: role,
+			Status: &store.AuditStatus{Outcome: store.OutcomeCreated},
+		}, nil
+	})
+	if errors.Is(err, errTargetExists) {
+		writeErr(w, http.StatusConflict, "target already exists: %s → %s (Actions secret %s)", req.Repo, dest, dest)
 		return
 	}
-	if _, err := s.st.AppendAudit(store.AuditRecord{
-		Actor: s.actor(r), Action: "target.add", SecretID: sec.ID, TargetID: t.ID,
-		Details:   fmt.Sprintf("%s/%s → %s · Actions secret %s", req.Project, req.Name, req.Repo, dest),
-		EventKind: store.KindTargetConfig, ActorRole: role,
-		Status: &store.AuditStatus{Outcome: store.OutcomeCreated},
-	}); err != nil {
+	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
@@ -615,15 +624,16 @@ func (s *Server) handleCommandRemoveTarget(w http.ResponseWriter, r *http.Reques
 		writeErr(w, http.StatusNotFound, "no target %s/%s → %s (Actions secret %s)", req.Project, req.Name, req.Repo, dest)
 		return
 	}
-	if err := s.st.RemoveTarget(t.ID); err != nil {
-		writeErr(w, http.StatusInternalServerError, "%v", err)
-		return
-	}
-	if _, err := s.st.AppendAudit(store.AuditRecord{
-		Actor: s.actor(r), Action: "target.rm", SecretID: sec.ID, TargetID: t.ID,
-		Details:   fmt.Sprintf("%s/%s → %s · Actions secret %s detached", req.Project, req.Name, req.Repo, dest),
-		EventKind: store.KindTargetConfig, ActorRole: role,
-		Status: &store.AuditStatus{Outcome: store.OutcomeRemoved},
+	if _, err := s.st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
+		if err := m.RemoveTarget(t.ID); err != nil {
+			return store.AuditRecord{}, err
+		}
+		return store.AuditRecord{
+			Actor: s.actor(r), Action: "target.rm", SecretID: sec.ID, TargetID: t.ID,
+			Details:   fmt.Sprintf("%s/%s → %s · Actions secret %s detached", req.Project, req.Name, req.Repo, dest),
+			EventKind: store.KindTargetConfig, ActorRole: role,
+			Status: &store.AuditStatus{Outcome: store.OutcomeRemoved},
+		}, nil
 	}); err != nil {
 		writeErr(w, http.StatusInternalServerError, "%v", err)
 		return
@@ -670,10 +680,6 @@ func (s *Server) handleCommandSetExpiry(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusNotFound, "no secret %s/%s", req.Project, req.Name)
 		return
 	}
-	if err := s.st.SetExpiry(sec.ID, expiresAt); err != nil {
-		writeErr(w, http.StatusInternalServerError, "%v", err)
-		return
-	}
 	detail := req.Project + "/" + req.Name + ": cleared expiry"
 	if expiresAt != "" {
 		detail = fmt.Sprintf("%s/%s: expiry set to %s", req.Project, req.Name, req.ExpiresAt)
@@ -684,10 +690,15 @@ func (s *Server) handleCommandSetExpiry(w http.ResponseWriter, r *http.Request) 
 	if expiresAt == sec.ExpiresAt {
 		outcome = store.OutcomeUnchanged
 	}
-	if _, err := s.st.AppendAudit(store.AuditRecord{
-		Actor: s.actor(r), Action: "secret.set-expiry", SecretID: sec.ID, Details: detail,
-		EventKind: store.KindPolicyChange, ActorRole: role,
-		Status: &store.AuditStatus{Outcome: outcome},
+	if _, err := s.st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
+		if err := m.SetExpiry(sec.ID, expiresAt); err != nil {
+			return store.AuditRecord{}, err
+		}
+		return store.AuditRecord{
+			Actor: s.actor(r), Action: "secret.set-expiry", SecretID: sec.ID, Details: detail,
+			EventKind: store.KindPolicyChange, ActorRole: role,
+			Status: &store.AuditStatus{Outcome: outcome},
+		}, nil
 	}); err != nil {
 		writeErr(w, http.StatusInternalServerError, "%v", err)
 		return

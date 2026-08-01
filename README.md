@@ -55,6 +55,8 @@ append-only, so history is not rewritten when a target goes away.
   triggers block UPDATE/DELETE; `signet audit --verify` walks the chain). Each
   entry is typed — event kind, actor role, structured outcome — and those fields
   are covered by the hash, so they are as tamper-evident as the text beside them.
+  The change and its entry share one transaction: a write the ledger cannot
+  record does not happen at all.
 - Switchyard's own webhook deliveries and rule fires stay in Switchyard's
   Postgres. Signet is a credential vault and control plane, not Switchyard's
   automation log; the `webhook_delivery` / `rule_fire` kinds are for actions the

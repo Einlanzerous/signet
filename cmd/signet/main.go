@@ -246,27 +246,35 @@ func runSet(args []string) error {
 	if err != nil {
 		return err
 	}
-	action, outcome := "secret.update", store.OutcomeUpdated
-	if sec == nil {
-		if sec, err = a.st.CreateSecret(*project, *name, *scope, *generate, expiresAt); err != nil {
-			return err
-		}
-		action, outcome = "secret.create", store.OutcomeCreated
-	}
 	nonce, ct, err := vault.Encrypt(a.key, []byte(value))
 	if err != nil {
 		return err
 	}
-	v, err := a.st.AddVersion(sec.ID, nonce, ct, vault.VersionHash(nonce, ct), cliActor())
+	// Creating the secret, writing the version and recording it are one
+	// transaction: a half-created secret with no version, or a value that landed
+	// with nothing in the ledger to say so, are both worse than the write simply
+	// failing.
+	v, _, err := store.MutateValue(a.st, func(m *store.Mutation) (*store.Version, store.AuditRecord, error) {
+		target, action, outcome := sec, "secret.update", store.OutcomeUpdated
+		if target == nil {
+			created, err := m.CreateSecret(*project, *name, *scope, *generate, expiresAt)
+			if err != nil {
+				return nil, store.AuditRecord{}, err
+			}
+			target, action, outcome = created, "secret.create", store.OutcomeCreated
+		}
+		ver, err := m.AddVersion(target.ID, nonce, ct, vault.VersionHash(nonce, ct), cliActor())
+		if err != nil {
+			return nil, store.AuditRecord{}, err
+		}
+		return ver, store.AuditRecord{
+			Actor: cliActor(), Action: action, SecretID: target.ID,
+			Details:   fmt.Sprintf("%s/%s · version %d #%s", *project, *name, ver.VersionNo, ver.VHash),
+			EventKind: store.KindSecretWrite, ActorRole: store.RoleHuman,
+			Status: &store.AuditStatus{Outcome: outcome},
+		}, nil
+	})
 	if err != nil {
-		return err
-	}
-	if _, err := a.st.AppendAudit(store.AuditRecord{
-		Actor: cliActor(), Action: action, SecretID: sec.ID,
-		Details:   fmt.Sprintf("%s/%s · version %d #%s", *project, *name, v.VersionNo, v.VHash),
-		EventKind: store.KindSecretWrite, ActorRole: store.RoleHuman,
-		Status: &store.AuditStatus{Outcome: outcome},
-	}); err != nil {
 		return err
 	}
 	fmt.Printf("%s/%s → version %d #%s\n", *project, *name, v.VersionNo, v.VHash)
@@ -367,7 +375,12 @@ func runRender(args []string) error {
 		if err := atomicWrite(cfg.Path, envfile.Render(pairs), cfg.Mode); err != nil {
 			return err
 		}
-		_ = a.st.UpdateTargetPush(t.ID, "in sync", "", "", time.Now().UTC().Format(time.RFC3339))
+		// The file is already written, so a failure here cannot be undone — but
+		// it leaves the target's recorded state describing the render before
+		// this one, which is worth saying out loud rather than dropping.
+		if err := a.st.UpdateTargetPush(t.ID, "in sync", "", "", time.Now().UTC().Format(time.RFC3339)); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: rendered %s but could not record its state: %v\n", cfg.Path, err)
+		}
 		if _, err := a.st.AppendAudit(store.AuditRecord{
 			Actor: cliActor(), Action: "render", TargetID: t.ID,
 			Details:   fmt.Sprintf("rendered %d keys → %s (mode %s)", len(pairs), cfg.Path, cfg.Mode),
@@ -510,15 +523,28 @@ func runTargetAdd(args []string) error {
 	if dest == "" {
 		dest = name
 	}
-	t, err := a.st.AddGHTarget(sec.ID, *ghRepo, dest)
-	if err != nil {
-		return err
-	}
-	if _, err := a.st.AppendAudit(store.AuditRecord{
-		Actor: cliActor(), Action: "target.add", SecretID: sec.ID, TargetID: t.ID,
-		Details:   fmt.Sprintf("%s/%s → %s · Actions secret %s", project, name, *ghRepo, dest),
-		EventKind: store.KindTargetConfig, ActorRole: store.RoleHuman,
-		Status: &store.AuditStatus{Outcome: store.OutcomeCreated},
+	if _, err := a.st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
+		// Checked inside the transaction that inserts, so the destination
+		// cannot appear between the check and the write. The API refuses the
+		// same duplicate; without this the CLI would quietly attach a second
+		// target pushing the same value to the same place.
+		dup, err := m.FindGHTarget(sec.ID, *ghRepo, dest)
+		if err != nil {
+			return store.AuditRecord{}, err
+		}
+		if dup != nil {
+			return store.AuditRecord{}, fmt.Errorf("target already exists: %s/%s → %s (Actions secret %s)", project, name, *ghRepo, dest)
+		}
+		t, err := m.AddGHTarget(sec.ID, *ghRepo, dest)
+		if err != nil {
+			return store.AuditRecord{}, err
+		}
+		return store.AuditRecord{
+			Actor: cliActor(), Action: "target.add", SecretID: sec.ID, TargetID: t.ID,
+			Details:   fmt.Sprintf("%s/%s → %s · Actions secret %s", project, name, *ghRepo, dest),
+			EventKind: store.KindTargetConfig, ActorRole: store.RoleHuman,
+			Status: &store.AuditStatus{Outcome: store.OutcomeCreated},
+		}, nil
 	}); err != nil {
 		return err
 	}
@@ -719,14 +745,16 @@ func runTargetRm(args []string) error {
 		if err != nil {
 			return err
 		}
-		if err := a.st.RemoveTarget(t.ID); err != nil {
-			return err
-		}
-		if _, err := a.st.AppendAudit(store.AuditRecord{
-			Actor: cliActor(), Action: "target.rm", TargetID: t.ID,
-			Details:   fmt.Sprintf("%s → %s (%d keys) detached", *project, cfg.Path, len(cfg.Keys)),
-			EventKind: store.KindTargetConfig, ActorRole: store.RoleHuman,
-			Status: &store.AuditStatus{Outcome: store.OutcomeRemoved},
+		if _, err := a.st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
+			if err := m.RemoveTarget(t.ID); err != nil {
+				return store.AuditRecord{}, err
+			}
+			return store.AuditRecord{
+				Actor: cliActor(), Action: "target.rm", TargetID: t.ID,
+				Details:   fmt.Sprintf("%s → %s (%d keys) detached", *project, cfg.Path, len(cfg.Keys)),
+				EventKind: store.KindTargetConfig, ActorRole: store.RoleHuman,
+				Status: &store.AuditStatus{Outcome: store.OutcomeRemoved},
+			}, nil
 		}); err != nil {
 			return err
 		}
@@ -758,14 +786,16 @@ func runTargetRm(args []string) error {
 		return fmt.Errorf("no target %s/%s → %s (Actions secret %s) — `signet target list --secret %s` shows what is attached",
 			p, n, *ghRepo, dest, *ref)
 	}
-	if err := a.st.RemoveTarget(t.ID); err != nil {
-		return err
-	}
-	if _, err := a.st.AppendAudit(store.AuditRecord{
-		Actor: cliActor(), Action: "target.rm", SecretID: sec.ID, TargetID: t.ID,
-		Details:   fmt.Sprintf("%s/%s → %s · Actions secret %s detached", p, n, *ghRepo, dest),
-		EventKind: store.KindTargetConfig, ActorRole: store.RoleHuman,
-		Status: &store.AuditStatus{Outcome: store.OutcomeRemoved},
+	if _, err := a.st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
+		if err := m.RemoveTarget(t.ID); err != nil {
+			return store.AuditRecord{}, err
+		}
+		return store.AuditRecord{
+			Actor: cliActor(), Action: "target.rm", SecretID: sec.ID, TargetID: t.ID,
+			Details:   fmt.Sprintf("%s/%s → %s · Actions secret %s detached", p, n, *ghRepo, dest),
+			EventKind: store.KindTargetConfig, ActorRole: store.RoleHuman,
+			Status: &store.AuditStatus{Outcome: store.OutcomeRemoved},
+		}, nil
 	}); err != nil {
 		return err
 	}

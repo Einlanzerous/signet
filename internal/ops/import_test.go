@@ -75,4 +75,34 @@ func TestImportIdempotent(t *testing.T) {
 	if len(cfg.Keys) != 2 {
 		t.Fatalf("file target keys: %v", cfg.Keys)
 	}
+
+	// Registering the file target is audited like any other target change, and
+	// says which of the three imports actually altered it. `target rm` records
+	// the detach; an unrecorded attach would leave the ledger showing removals
+	// of targets it never saw arrive.
+	entries, err := st.ListAudit(100, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var outcomes []store.Outcome
+	for i := len(entries) - 1; i >= 0; i-- { // oldest first
+		if entries[i].EventKind == store.KindTargetConfig {
+			if entries[i].TargetID != targets[0].ID {
+				t.Fatalf("target entry names the wrong target: %+v", entries[i])
+			}
+			outcomes = append(outcomes, entries[i].Status.Outcome)
+		}
+	}
+	want := []store.Outcome{store.OutcomeCreated, store.OutcomeUnchanged, store.OutcomeUnchanged}
+	if len(outcomes) != len(want) {
+		t.Fatalf("want %d file-target entries, got %d (%v)", len(want), len(outcomes), outcomes)
+	}
+	for i := range want {
+		if outcomes[i] != want[i] {
+			t.Fatalf("file-target outcomes %v, want %v", outcomes, want)
+		}
+	}
+	if ok, badSeq, _, err := st.VerifyAudit(); err != nil || !ok {
+		t.Fatalf("chain broken after imports: ok=%v badSeq=%d err=%v", ok, badSeq, err)
+	}
 }
