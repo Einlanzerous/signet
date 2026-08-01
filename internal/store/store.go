@@ -8,6 +8,7 @@
 package store
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
@@ -15,9 +16,32 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
+
+// dbTimeout bounds how long a Store method will wait for a connection from the
+// pool. Every query here is a local SQLite read or write measured in
+// milliseconds, so this is far above any legitimate call — it exists to put a
+// ceiling on one specific failure.
+//
+// The pool holds a single connection (see Open) and Mutate holds it for the
+// duration of its transaction. A Store method called from inside a Mutate
+// closure therefore waits for a connection that its own transaction is holding:
+// a wait nothing can end, because the transaction cannot progress until the
+// closure returns. Unbounded, that is a process wedged forever with no error;
+// bounded, it is a context deadline naming the query that could not get a
+// connection. Mutation's tx-scoped methods are the way to write from inside a
+// closure, and reads belong before the Mutate call.
+const dbTimeout = 15 * time.Second
+
+// pooled returns the context every Store-level database call runs under. The
+// caller must cancel it after the rows are consumed, not before — a cancelled
+// context invalidates rows that have not been scanned yet.
+func pooled() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), dbTimeout)
+}
 
 // Store wraps the SQLite handle. The mutex serializes writes within this
 // process; the chain's total order across processes comes from the
@@ -72,10 +96,10 @@ func (s *Store) Close() error { return s.db.Close() }
 //
 // It deliberately does not carry the *Store. The pool is capped at one
 // connection (see Open), so calling back into a Store method while this
-// transaction is open would block waiting for the connection this transaction
-// is already holding — a deadlock rather than an error. Reads a mutation
-// depends on belong before the Mutate call, or on this type as tx-scoped
-// methods of their own.
+// transaction is open waits for the connection this transaction is already
+// holding — see dbTimeout, which is what stops that being permanent. Reads a
+// mutation depends on belong before the Mutate call, or on this type as
+// tx-scoped methods of their own.
 type Mutation struct {
 	tx *sql.Tx
 }
@@ -87,8 +111,9 @@ type Mutation struct {
 //
 // fn returns the record instead of receiving one because the record usually
 // cannot be written until the change has happened — it names the version number
-// or the id the change produced. Anything else the caller needs from inside is
-// captured by the closure.
+// or the id the change produced. When the caller also needs something the
+// change produced, use MutateValue rather than assigning to a captured
+// variable.
 //
 // Reading the chain head and writing the entry that links to it happen in this
 // same immediate-locked transaction. A mutex alone would not do: it orders
@@ -97,27 +122,52 @@ type Mutation struct {
 // head both write entries claiming the same prev_hash — a fork the append-only
 // triggers make unrepairable.
 func (s *Store) Mutate(fn func(*Mutation) (AuditRecord, error)) (*AuditEntry, error) {
+	_, e, err := MutateValue(s, func(m *Mutation) (struct{}, AuditRecord, error) {
+		rec, err := fn(m)
+		return struct{}{}, rec, err
+	})
+	return e, err
+}
+
+// MutateValue is Mutate for a change that produces something the caller needs
+// afterwards — the version that was written, the target that was attached.
+//
+// It exists so those values do not have to escape through a variable the
+// closure assigns. Such a variable is written before the commit and survives a
+// rollback, leaving the caller holding the id of a version or target that does
+// not exist. Returning the value instead means it is only ever handed back on
+// the path where the change and its ledger entry both landed.
+//
+// It carries Mutate's guarantees unchanged — same transaction, same chain lock;
+// see there for why both are needed. It is a function rather than a method
+// because Go does not allow methods to introduce type parameters.
+func MutateValue[T any](s *Store, fn func(*Mutation) (T, AuditRecord, error)) (T, *AuditEntry, error) {
+	var zero T
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	tx, err := s.db.Begin()
+	ctx, cancel := pooled()
+	defer cancel()
+
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, fmt.Errorf("mutate: begin: %w", err)
+		return zero, nil, fmt.Errorf("mutate: begin: %w", err)
 	}
 	defer tx.Rollback()
 
-	rec, err := fn(&Mutation{tx: tx})
+	v, rec, err := fn(&Mutation{tx: tx})
 	if err != nil {
-		return nil, err
+		return zero, nil, err
 	}
 	e, err := appendAuditTx(tx, rec)
 	if err != nil {
-		return nil, err
+		return zero, nil, err
 	}
 	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("mutate: commit: %w", err)
+		return zero, nil, fmt.Errorf("mutate: commit: %w", err)
 	}
-	return e, nil
+	return v, e, nil
 }
 
 // newID returns a random 128-bit hex identifier.

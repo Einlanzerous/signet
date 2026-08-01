@@ -36,7 +36,9 @@ func now() string { return time.Now().UTC().Format(time.RFC3339) }
 
 // GetSecret returns the secret for (project, name), or nil if absent.
 func (s *Store) GetSecret(project, name string) (*Secret, error) {
-	row := s.db.QueryRow(`
+	ctx, cancel := pooled()
+	defer cancel()
+	row := s.db.QueryRowContext(ctx, `
         SELECT id, project, name, scope, status, generated, COALESCE(expires_at, ''), created_at, updated_at
         FROM secrets WHERE project = ? AND name = ?`, project, name)
 	return scanSecret(row)
@@ -44,7 +46,9 @@ func (s *Store) GetSecret(project, name string) (*Secret, error) {
 
 // GetSecretByID returns the secret with the given id, or nil if absent.
 func (s *Store) GetSecretByID(id string) (*Secret, error) {
-	row := s.db.QueryRow(`
+	ctx, cancel := pooled()
+	defer cancel()
+	row := s.db.QueryRowContext(ctx, `
         SELECT id, project, name, scope, status, generated, COALESCE(expires_at, ''), created_at, updated_at
         FROM secrets WHERE id = ?`, id)
 	return scanSecret(row)
@@ -98,7 +102,9 @@ func (m *Mutation) SetExpiry(secretID, expiresAt string) error {
 
 // ListSecrets returns every secret ordered by project then name.
 func (s *Store) ListSecrets() ([]Secret, error) {
-	rows, err := s.db.Query(`
+	ctx, cancel := pooled()
+	defer cancel()
+	rows, err := s.db.QueryContext(ctx, `
         SELECT id, project, name, scope, status, generated, COALESCE(expires_at, ''), created_at, updated_at
         FROM secrets ORDER BY project, name`)
 	if err != nil {
@@ -145,7 +151,9 @@ func (m *Mutation) AddVersion(secretID string, nonce, ciphertext []byte, vhash, 
 
 // CurrentVersion returns the newest version of a secret, or nil if none exist.
 func (s *Store) CurrentVersion(secretID string) (*Version, error) {
-	row := s.db.QueryRow(`
+	ctx, cancel := pooled()
+	defer cancel()
+	row := s.db.QueryRowContext(ctx, `
         SELECT id, secret_id, version_no, nonce, ciphertext, vhash, created_by, created_at
         FROM secret_versions WHERE secret_id = ? ORDER BY version_no DESC LIMIT 1`, secretID)
 	var v Version

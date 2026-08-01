@@ -448,20 +448,19 @@ func (s *Server) handleCommandRotate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
-	var v *store.Version
-	if _, err := s.st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
+	v, _, err := store.MutateValue(s.st, func(m *store.Mutation) (*store.Version, store.AuditRecord, error) {
 		ver, err := m.AddVersion(sec.ID, nonce, ct, vault.VersionHash(nonce, ct), s.actor(r))
 		if err != nil {
-			return store.AuditRecord{}, err
+			return nil, store.AuditRecord{}, err
 		}
-		v = ver
-		return store.AuditRecord{
+		return ver, store.AuditRecord{
 			Actor: s.actor(r), Action: "rotate", SecretID: sec.ID,
-			Details:   fmt.Sprintf("rotated %s/%s → version %d #%s — fan-out queued", sec.Project, sec.Name, v.VersionNo, v.VHash),
+			Details:   fmt.Sprintf("rotated %s/%s → version %d #%s — fan-out queued", sec.Project, sec.Name, ver.VersionNo, ver.VHash),
 			EventKind: store.KindRotation, ActorRole: role,
 			Status: &store.AuditStatus{Outcome: store.OutcomeRotated},
 		}, nil
-	}); err != nil {
+	})
+	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
@@ -493,6 +492,11 @@ var ghSecretRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 func validGHSecretName(name string) bool {
 	return ghSecretRe.MatchString(name) && !strings.HasPrefix(strings.ToUpper(name), "GITHUB_")
 }
+
+// errTargetExists carries "this destination is already attached" out of the
+// transaction that discovered it, so the handler can answer 409 rather than
+// letting a conflict read as an internal error.
+var errTargetExists = errors.New("target already exists")
 
 type addTargetReq struct {
 	Project    string `json:"project"`
@@ -536,35 +540,34 @@ func (s *Server) handleCommandAddTarget(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusNotFound, "no secret %s/%s", req.Project, req.Name)
 		return
 	}
-	existing, err := s.st.TargetsForSecret(sec.ID)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "%v", err)
-		return
-	}
-	for _, t := range existing {
-		cfg, err := t.GHConfig()
+	// The duplicate check runs inside the transaction that inserts. Outside it,
+	// (repo, secret_name) uniqueness is only advisory: two callers adding the
+	// same destination both read no match and both insert, and nothing in the
+	// schema catches it afterwards.
+	t, _, err := store.MutateValue(s.st, func(m *store.Mutation) (*store.Target, store.AuditRecord, error) {
+		dup, err := m.FindGHTarget(sec.ID, req.Repo, dest)
 		if err != nil {
-			continue
+			return nil, store.AuditRecord{}, err
 		}
-		if cfg.Repo == req.Repo && cfg.SecretName == dest {
-			writeErr(w, http.StatusConflict, "target already exists: %s → %s (Actions secret %s)", req.Repo, dest, dest)
-			return
+		if dup != nil {
+			return nil, store.AuditRecord{}, errTargetExists
 		}
-	}
-	var t *store.Target
-	if _, err := s.st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
 		created, err := m.AddGHTarget(sec.ID, req.Repo, dest)
 		if err != nil {
-			return store.AuditRecord{}, err
+			return nil, store.AuditRecord{}, err
 		}
-		t = created
-		return store.AuditRecord{
-			Actor: s.actor(r), Action: "target.add", SecretID: sec.ID, TargetID: t.ID,
+		return created, store.AuditRecord{
+			Actor: s.actor(r), Action: "target.add", SecretID: sec.ID, TargetID: created.ID,
 			Details:   fmt.Sprintf("%s/%s → %s · Actions secret %s", req.Project, req.Name, req.Repo, dest),
 			EventKind: store.KindTargetConfig, ActorRole: role,
 			Status: &store.AuditStatus{Outcome: store.OutcomeCreated},
 		}, nil
-	}); err != nil {
+	})
+	if errors.Is(err, errTargetExists) {
+		writeErr(w, http.StatusConflict, "target already exists: %s → %s (Actions secret %s)", req.Repo, dest, dest)
+		return
+	}
+	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "%v", err)
 		return
 	}

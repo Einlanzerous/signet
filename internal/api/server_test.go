@@ -38,10 +38,13 @@ func testServer(t *testing.T) (*Server, *store.Store, []byte, string) {
 // chain, older than anything the test goes on to do, so newest-first reads are
 // unaffected.
 
-func fixtureRecord(action string) store.AuditRecord {
+// The kind is a parameter rather than a constant because these entries go into
+// the same chain the tests then read back: a seeded target typed as a secret
+// write would be a fixture asserting something false about the ledger.
+func fixtureRecord(action string, kind store.EventKind) store.AuditRecord {
 	return store.AuditRecord{
 		Actor: "test", Action: action,
-		EventKind: store.KindSecretWrite, ActorRole: store.RoleHuman,
+		EventKind: kind, ActorRole: store.RoleHuman,
 	}
 }
 
@@ -54,7 +57,7 @@ func seedSecret(t *testing.T, st *store.Store, project, name string, generated b
 			return store.AuditRecord{}, err
 		}
 		sec = created
-		return fixtureRecord("secret.create"), nil
+		return fixtureRecord("secret.create", store.KindSecretWrite), nil
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +77,7 @@ func seedVersion(t *testing.T, st *store.Store, secretID string, key []byte, val
 			return store.AuditRecord{}, err
 		}
 		v = added
-		return fixtureRecord("secret.set"), nil
+		return fixtureRecord("secret.set", store.KindSecretWrite), nil
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +93,7 @@ func seedGHTarget(t *testing.T, st *store.Store, secretID, repo, secretName stri
 			return store.AuditRecord{}, err
 		}
 		tgt = added
-		return fixtureRecord("target.add"), nil
+		return fixtureRecord("target.add", store.KindTargetConfig), nil
 	}); err != nil {
 		t.Fatal(err)
 	}

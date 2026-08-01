@@ -22,12 +22,25 @@ type PushResult struct {
 	// ledger. It is surfaced rather than swallowed: an unrecorded mutation of a
 	// live destination is precisely what this vault must never do quietly.
 	AuditErr string `json:"audit_error,omitempty"`
+	// StateErr reports a push that happened but whose outcome could not be
+	// written to the target row, so its recorded sync state is now stale.
+	StateErr string `json:"state_error,omitempty"`
 }
 
-// recordPush appends the ledger entry for one push attempt. A failure here does
-// not undo the push — the destination has already changed — so it is reported
-// on the result and logged instead of being discarded.
-func recordPush(st *store.Store, res *PushResult, rec store.AuditRecord) {
+// recordPush writes the push's outcome to the target row and appends its ledger
+// entry. Neither failure undoes the push — the destination has already changed —
+// so both are reported on the result and logged instead of being discarded.
+//
+// A dropped state write is not cosmetic: last_pushed_version_id is what GHState
+// compares against to decide whether a destination has drifted, so a silent
+// failure here leaves the target reading "in sync" against a version it no
+// longer holds, and nothing later corrects it.
+func recordPush(st *store.Store, res *PushResult, rec store.AuditRecord, state, lastErr, versionID, pushedAt string) {
+	if err := st.UpdateTargetPush(res.TargetID, state, lastErr, versionID, pushedAt); err != nil {
+		res.StateErr = err.Error()
+		log.Printf("target state write failed for %s: %v — the push happened but %s still reads as its previous state",
+			res.Repo, err, res.TargetID)
+	}
 	if _, err := st.AppendAudit(rec); err != nil {
 		res.AuditErr = err.Error()
 		log.Printf("audit append failed for %s %s: %v — destination changed but the ledger has no entry",
@@ -89,17 +102,14 @@ func PushSecret(ctx context.Context, st *store.Store, key []byte, gh *GHClient, 
 			res.State = "error"
 			res.Err = err.Error()
 			status.Outcome = store.OutcomeFailed
-			_ = st.UpdateTargetPush(t.ID, "error", err.Error(), "", "")
 			recordPush(st, &res, store.AuditRecord{
 				Actor: actor, Action: "sync.push.failed", SecretID: sec.ID, TargetID: t.ID,
 				Details:   fmt.Sprintf("%s → %s/%s: %s", sec.Name, cfg.Repo, cfg.SecretName, err),
 				EventKind: kind, ActorRole: role, Status: status,
-			})
+			}, "error", err.Error(), "", "")
 		} else {
 			res.State = "in sync"
 			status.Outcome = store.OutcomeDelivered
-			pushedAt := nowRFC3339()
-			_ = st.UpdateTargetPush(t.ID, "in sync", "", cur.ID, pushedAt)
 			detail := fmt.Sprintf("sealed & pushed %s → %s · Actions secret %s · version #%s", sec.Name, cfg.Repo, cfg.SecretName, cur.VHash)
 			if res.Note != "" {
 				detail += " (" + res.Note + ")"
@@ -107,7 +117,7 @@ func PushSecret(ctx context.Context, st *store.Store, key []byte, gh *GHClient, 
 			recordPush(st, &res, store.AuditRecord{
 				Actor: actor, Action: "sync.push", SecretID: sec.ID, TargetID: t.ID,
 				Details: detail, EventKind: kind, ActorRole: role, Status: status,
-			})
+			}, "in sync", "", cur.ID, nowRFC3339())
 		}
 		results = append(results, res)
 	}

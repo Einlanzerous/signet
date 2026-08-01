@@ -335,6 +335,15 @@ func scanEntry(rows *sql.Rows) (AuditEntry, string, error) {
 // Anything that does change vault state must go through Mutate instead, so the
 // change and the entry describing it stand or fall together.
 func (s *Store) AppendAudit(rec AuditRecord) (*AuditEntry, error) {
+	// Validated before Mutate, not only inside it. Mutate takes the vault-wide
+	// write lock and an immediate-locked transaction before the record it is
+	// handed can be seen, and a record that was never appendable should not
+	// stall every other writer on its way to being rejected. Inside a mutation
+	// the check cannot come first — the record does not exist yet — but here it
+	// can.
+	if err := rec.validate(); err != nil {
+		return nil, err
+	}
 	return s.Mutate(func(*Mutation) (AuditRecord, error) { return rec, nil })
 }
 
@@ -410,7 +419,9 @@ func (s *Store) ListAudit(limit int, secretID string) ([]AuditEntry, error) {
 		args = append(args, secretID)
 	}
 	args = append(args, limit)
-	rows, err := s.db.Query(`SELECT `+auditColumns+`
+	ctx, cancel := pooled()
+	defer cancel()
+	rows, err := s.db.QueryContext(ctx, `SELECT `+auditColumns+`
         FROM audit_log `+where+` ORDER BY seq DESC LIMIT ?`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list audit: %w", err)
@@ -444,7 +455,9 @@ func (s *Store) ListAudit(limit int, secretID string) ([]AuditEntry, error) {
 // CountAudit returns the number of chain entries.
 func (s *Store) CountAudit() (int, error) {
 	var n int
-	err := s.db.QueryRow(`SELECT COUNT(*) FROM audit_log`).Scan(&n)
+	ctx, cancel := pooled()
+	defer cancel()
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM audit_log`).Scan(&n)
 	return n, err
 }
 
@@ -463,7 +476,9 @@ const OutcomeUnspecified Outcome = "unspecified"
 // that differ only in latency are the same outcome, and grouping on the raw
 // JSON would split them into separate rows.
 func (s *Store) CountAuditKindSince(kind EventKind, since string) (map[Outcome]int, error) {
-	rows, err := s.db.Query(`
+	ctx, cancel := pooled()
+	defer cancel()
+	rows, err := s.db.QueryContext(ctx, `
         SELECT COALESCE(
                  CASE WHEN json_valid(status) THEN json_extract(status, '$.outcome') END,
                  ?) AS outcome,
@@ -494,7 +509,9 @@ func (s *Store) CountAuditKindSince(kind EventKind, since string) (map[Outcome]i
 // checking prev-hash linkage. It returns (true, 0, total) when intact, or
 // (false, seq, total) identifying the first broken entry.
 func (s *Store) VerifyAudit() (bool, int64, int, error) {
-	rows, err := s.db.Query(`SELECT ` + auditColumns + ` FROM audit_log ORDER BY seq ASC`)
+	ctx, cancel := pooled()
+	defer cancel()
+	rows, err := s.db.QueryContext(ctx, `SELECT `+auditColumns+` FROM audit_log ORDER BY seq ASC`)
 	if err != nil {
 		return false, 0, 0, fmt.Errorf("verify audit: %w", err)
 	}

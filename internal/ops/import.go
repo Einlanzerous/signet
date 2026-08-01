@@ -61,19 +61,20 @@ func ImportEnv(st *store.Store, key []byte, project, scope, path, actor string, 
 		// processed keep their entries — the import is per-key, and a failure
 		// partway through leaves a ledger that says exactly how far it got.
 		if _, err := st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
+			target := sec
 			if create {
 				created, err := m.CreateSecret(project, p.Key, scope, false, "")
 				if err != nil {
 					return store.AuditRecord{}, err
 				}
-				sec = created
+				target = created
 			}
-			v, err := m.AddVersion(sec.ID, nonce, ct, vault.VersionHash(nonce, ct), actor)
+			v, err := m.AddVersion(target.ID, nonce, ct, vault.VersionHash(nonce, ct), actor)
 			if err != nil {
 				return store.AuditRecord{}, err
 			}
 			return store.AuditRecord{
-				Actor: actor, Action: "secret.import", SecretID: sec.ID,
+				Actor: actor, Action: "secret.import", SecretID: target.ID,
 				Details:   fmt.Sprintf("imported %s/%s from %s · version %d #%s", project, p.Key, path, v.VersionNo, v.VHash),
 				EventKind: store.KindSecretWrite, ActorRole: role,
 				Status: &store.AuditStatus{Outcome: outcome},
@@ -87,7 +88,22 @@ func ImportEnv(st *store.Store, key []byte, project, scope, path, actor string, 
 			res.Updated++
 		}
 	}
-	if _, err := st.UpsertFileTarget(project, path, res.Keys, "0600"); err != nil {
+	// Registering the file target is a change to where this project's secrets
+	// are delivered, so it is recorded like any other — `target rm` audits the
+	// reverse, and an unaudited create against an audited remove would leave the
+	// ledger showing detaches of targets it never saw attached.
+	if _, err := st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
+		t, outcome, err := m.UpsertFileTarget(project, path, res.Keys, "0600")
+		if err != nil {
+			return store.AuditRecord{}, err
+		}
+		return store.AuditRecord{
+			Actor: actor, Action: "target.file", TargetID: t.ID,
+			Details:   fmt.Sprintf("%s → %s (%d keys)", project, path, len(res.Keys)),
+			EventKind: store.KindTargetConfig, ActorRole: role,
+			Status: &store.AuditStatus{Outcome: outcome},
+		}, nil
+	}); err != nil {
 		return res, err
 	}
 	return res, nil

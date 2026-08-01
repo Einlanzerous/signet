@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -67,6 +68,23 @@ func mustAddGHTarget(t *testing.T, s *Store, secretID, repo, secretName string) 
 		t.Fatal(err)
 	}
 	return tgt
+}
+
+func mustUpsertFileTarget(t *testing.T, s *Store, project, path string, keys []string, mode string) (*Target, Outcome) {
+	t.Helper()
+	var tgt *Target
+	var outcome Outcome
+	if _, err := s.Mutate(func(m *Mutation) (AuditRecord, error) {
+		added, o, err := m.UpsertFileTarget(project, path, keys, mode)
+		if err != nil {
+			return AuditRecord{}, err
+		}
+		tgt, outcome = added, o
+		return testRecord("file target " + path), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return tgt, outcome
 }
 
 // removeTarget returns the error rather than failing, because "removing
@@ -171,13 +189,14 @@ func TestAuditTamperBreaksChain(t *testing.T) {
 
 func TestFileTargetUpsertMergesKeys(t *testing.T) {
 	s := testStore(t)
-	t1, err := s.UpsertFileTarget("proj", "/tmp/x/.env", []string{"B", "A"}, "0600")
-	if err != nil {
-		t.Fatal(err)
+	t1, o1 := mustUpsertFileTarget(t, s, "proj", "/tmp/x/.env", []string{"B", "A"}, "0600")
+	t2, o2 := mustUpsertFileTarget(t, s, "proj", "/tmp/x/.env", []string{"C", "A"}, "")
+	if o1 != OutcomeCreated || o2 != OutcomeUpdated {
+		t.Fatalf("outcomes should distinguish create from merge: %q then %q", o1, o2)
 	}
-	t2, err := s.UpsertFileTarget("proj", "/tmp/x/.env", []string{"C", "A"}, "")
-	if err != nil {
-		t.Fatal(err)
+	// Re-upserting keys it already has changes nothing, and must say so.
+	if _, o3 := mustUpsertFileTarget(t, s, "proj", "/tmp/x/.env", []string{"A"}, ""); o3 != OutcomeUnchanged {
+		t.Fatalf("no-op upsert should be unchanged, got %q", o3)
 	}
 	if t1.ID != t2.ID {
 		t.Fatal("same path should upsert, not duplicate")
@@ -229,10 +248,7 @@ func TestFindAndRemoveTargets(t *testing.T) {
 	// A second destination for the same secret: (repo, secret_name) is the
 	// identifying pair, so a different name on the same repo is its own target.
 	mustAddGHTarget(t, s, sec.ID, "owner/repo", "OTHER_NAME")
-	file, err := s.UpsertFileTarget("proj", "/tmp/x/.env", []string{"KEY"}, "0600")
-	if err != nil {
-		t.Fatal(err)
-	}
+	file, _ := mustUpsertFileTarget(t, s, "proj", "/tmp/x/.env", []string{"KEY"}, "0600")
 
 	found, err := s.FindGHTarget(sec.ID, "owner/repo", "KEY")
 	if err != nil || found == nil || found.ID != gh.ID {
@@ -492,6 +508,151 @@ func TestFailedMutationLeavesChainIntact(t *testing.T) {
 	}
 	if cur.VersionNo != 1 || cur.VHash != "bbb" {
 		t.Fatalf("rolled-back version left a hole in the numbering: %+v", cur)
+	}
+}
+
+// TestMutateValueWithholdsValueOnRollback: the point of returning the value
+// instead of assigning a captured variable is that a rolled-back change hands
+// back nothing. A caller that got the target back would be holding an id no row
+// has.
+func TestMutateValueWithholdsValueOnRollback(t *testing.T) {
+	s := testStore(t)
+	sec := mustCreateSecret(t, s, "proj", "KEY", "", true)
+	tgt, _, err := MutateValue(s, func(m *Mutation) (*Target, AuditRecord, error) {
+		added, err := m.AddGHTarget(sec.ID, "owner/repo", "KEY")
+		if err != nil {
+			return nil, AuditRecord{}, err
+		}
+		return added, unrecordable, nil
+	})
+	if err == nil {
+		t.Fatal("an unrecordable mutation should fail")
+	}
+	if tgt != nil {
+		t.Fatalf("rolled-back mutation handed back a target that does not exist: %+v", tgt)
+	}
+}
+
+// TestConcurrentFileTargetUpsertStaysSingle: the upsert decides between merge
+// and insert by reading first. Run that read outside the transaction that acts
+// on it and two importers of the same path both find nothing and both insert —
+// there is no UNIQUE constraint to catch the second.
+func TestConcurrentFileTargetUpsertStaysSingle(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "upsert.db")
+	a, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	const writers = 10
+	var wg sync.WaitGroup
+	errs := make(chan error, writers)
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			st := a
+			if i%2 == 1 {
+				st = b
+			}
+			_, err := st.Mutate(func(m *Mutation) (AuditRecord, error) {
+				if _, _, err := m.UpsertFileTarget("proj", "/tmp/x/.env", []string{fmt.Sprintf("K%d", i)}, "0600"); err != nil {
+					return AuditRecord{}, err
+				}
+				return testRecord("upsert"), nil
+			})
+			if err != nil {
+				errs <- err
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("upsert failed under contention: %v", err)
+	}
+
+	targets, err := a.FileTargetsForProject("proj")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 1 {
+		t.Fatalf("concurrent upserts of one path created %d targets, want 1", len(targets))
+	}
+	cfg, err := targets[0].FileConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Keys) != writers {
+		t.Fatalf("merge lost keys: %d of %d survived (%v)", len(cfg.Keys), writers, cfg.Keys)
+	}
+}
+
+// TestConcurrentGHTargetAddStaysUnique: (repo, secret_name) uniqueness is
+// enforced by a check, not a constraint, so the check has to run in the
+// transaction that inserts. This is the shape both add-target call sites use.
+func TestConcurrentGHTargetAddStaysUnique(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "addtarget.db")
+	a, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	sec := mustCreateSecret(t, a, "proj", "KEY", "", true)
+
+	const writers = 10
+	var wg sync.WaitGroup
+	added := make(chan struct{}, writers)
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			st := a
+			if i%2 == 1 {
+				st = b
+			}
+			_, err := st.Mutate(func(m *Mutation) (AuditRecord, error) {
+				dup, err := m.FindGHTarget(sec.ID, "owner/repo", "KEY")
+				if err != nil {
+					return AuditRecord{}, err
+				}
+				if dup != nil {
+					return AuditRecord{}, errors.New("already exists")
+				}
+				if _, err := m.AddGHTarget(sec.ID, "owner/repo", "KEY"); err != nil {
+					return AuditRecord{}, err
+				}
+				return testRecord("target add"), nil
+			})
+			if err == nil {
+				added <- struct{}{}
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(added)
+
+	if n := len(added); n != 1 {
+		t.Fatalf("%d writers believed they created the target, want 1", n)
+	}
+	targets, err := a.TargetsForSecret(sec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 1 {
+		t.Fatalf("concurrent add-target created %d targets, want 1", len(targets))
 	}
 }
 
