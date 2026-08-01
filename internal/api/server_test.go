@@ -33,6 +33,70 @@ func testServer(t *testing.T) (*Server, *store.Store, []byte, string) {
 	return srv, st, key, dir
 }
 
+// Store mutators live on store.Mutation, so fixtures are seeded through Mutate
+// — the same audited path the handlers take. Each seed leaves one entry in the
+// chain, older than anything the test goes on to do, so newest-first reads are
+// unaffected.
+
+func fixtureRecord(action string) store.AuditRecord {
+	return store.AuditRecord{
+		Actor: "test", Action: action,
+		EventKind: store.KindSecretWrite, ActorRole: store.RoleHuman,
+	}
+}
+
+func seedSecret(t *testing.T, st *store.Store, project, name string, generated bool) *store.Secret {
+	t.Helper()
+	var sec *store.Secret
+	if _, err := st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
+		created, err := m.CreateSecret(project, name, "", generated, "")
+		if err != nil {
+			return store.AuditRecord{}, err
+		}
+		sec = created
+		return fixtureRecord("secret.create"), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return sec
+}
+
+func seedVersion(t *testing.T, st *store.Store, secretID string, key []byte, value string) *store.Version {
+	t.Helper()
+	nonce, ct, err := vault.Encrypt(key, []byte(value))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v *store.Version
+	if _, err := st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
+		added, err := m.AddVersion(secretID, nonce, ct, vault.VersionHash(nonce, ct), "test")
+		if err != nil {
+			return store.AuditRecord{}, err
+		}
+		v = added
+		return fixtureRecord("secret.set"), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return v
+}
+
+func seedGHTarget(t *testing.T, st *store.Store, secretID, repo, secretName string) *store.Target {
+	t.Helper()
+	var tgt *store.Target
+	if _, err := st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
+		added, err := m.AddGHTarget(secretID, repo, secretName)
+		if err != nil {
+			return store.AuditRecord{}, err
+		}
+		tgt = added
+		return fixtureRecord("target.add"), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return tgt
+}
+
 func get(t *testing.T, h http.Handler, path, token string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, path, nil)
@@ -132,7 +196,7 @@ func postCmdWithHeaders(t *testing.T, h http.Handler, path, body string, headers
 
 func TestAddTarget(t *testing.T) {
 	srv, st, _, _ := testServer(t)
-	sec, _ := st.CreateSecret("proj", "TOKEN", "", true, "")
+	sec := seedSecret(t, st, "proj", "TOKEN", true)
 	h := srv.Handler()
 
 	// Happy path: default destination name = local name.
@@ -176,7 +240,7 @@ func TestAddTarget(t *testing.T) {
 
 func TestSetExpiry(t *testing.T) {
 	srv, st, _, _ := testServer(t)
-	sec, _ := st.CreateSecret("proj", "TOKEN", "", true, "")
+	sec := seedSecret(t, st, "proj", "TOKEN", true)
 	h := srv.Handler()
 
 	// Set an expiry.
@@ -211,11 +275,8 @@ func TestSetExpiry(t *testing.T) {
 
 func TestRotateExternallyIssuedConflicts(t *testing.T) {
 	srv, st, key, _ := testServer(t)
-	sec, _ := st.CreateSecret("proj", "EXTERNAL_KEY", "", false, "")
-	nonce, ct, _ := vault.Encrypt(key, []byte("issued-elsewhere"))
-	if _, err := st.AddVersion(sec.ID, nonce, ct, vault.VersionHash(nonce, ct), "test"); err != nil {
-		t.Fatal(err)
-	}
+	sec := seedSecret(t, st, "proj", "EXTERNAL_KEY", false)
+	seedVersion(t, st, sec.ID, key, "issued-elsewhere")
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/commands/rotate",
 		strings.NewReader(`{"project":"proj","name":"EXTERNAL_KEY"}`))
@@ -229,13 +290,9 @@ func TestRotateExternallyIssuedConflicts(t *testing.T) {
 
 func TestRotateGenerated(t *testing.T) {
 	srv, st, key, _ := testServer(t)
-	sec, _ := st.CreateSecret("proj", "GEN_TOKEN", "", true, "")
+	sec := seedSecret(t, st, "proj", "GEN_TOKEN", true)
 	val, _ := vault.RandomToken(32)
-	nonce, ct, _ := vault.Encrypt(key, []byte(val))
-	v1, err := st.AddVersion(sec.ID, nonce, ct, vault.VersionHash(nonce, ct), "test")
-	if err != nil {
-		t.Fatal(err)
-	}
+	v1 := seedVersion(t, st, sec.ID, key, val)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/commands/rotate",
 		strings.NewReader(`{"project":"proj","name":"GEN_TOKEN"}`))
@@ -374,9 +431,7 @@ func TestBadRoleFailsUniformly(t *testing.T) {
 func TestSetExpiryNoOpOutcome(t *testing.T) {
 	srv, st, _, _ := testServer(t)
 	h := srv.Handler()
-	if _, err := st.CreateSecret("proj", "TOKEN", "", true, ""); err != nil {
-		t.Fatal(err)
-	}
+	seedSecret(t, st, "proj", "TOKEN", true)
 	const body = `{"project":"proj","name":"TOKEN","expires_at":"2027-01-01"}`
 
 	if rec := postCmd(t, h, "/v1/commands/set-expiry", body); rec.Code != http.StatusOK {
@@ -453,10 +508,8 @@ func TestSummaryReportsHealerWindow(t *testing.T) {
 // alone, and 404s rather than silently succeeding on something that is not there.
 func TestRemoveTargetCommand(t *testing.T) {
 	srv, st, _, _ := testServer(t)
-	sec, _ := st.CreateSecret("proj", "TOKEN", "", true, "")
-	if _, err := st.AddGHTarget(sec.ID, "owner/repo", "TOKEN"); err != nil {
-		t.Fatal(err)
-	}
+	sec := seedSecret(t, st, "proj", "TOKEN", true)
+	seedGHTarget(t, st, sec.ID, "owner/repo", "TOKEN")
 	h := srv.Handler()
 	const body = `{"project":"proj","name":"TOKEN","repo":"owner/repo"}`
 

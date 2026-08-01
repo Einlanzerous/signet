@@ -110,6 +110,12 @@ func (s *Store) FileTargetsForProject(project string) ([]Target, error) {
 
 // UpsertFileTarget creates a project file target for path, or merges keys into
 // an existing target for the same path. Keys are kept sorted and deduplicated.
+//
+// It stays on Store rather than Mutation because its one caller — import —
+// registers the file target after every secret it imported has already landed
+// with its own entry, so a failure here fails the import without leaving an
+// unrecorded change to a credential. Give it an audit entry and it belongs on
+// Mutation, appended in the same transaction.
 func (s *Store) UpsertFileTarget(project, path string, keys []string, mode string) (*Target, error) {
 	existing, err := s.FileTargetsForProject(project)
 	if err != nil {
@@ -149,11 +155,11 @@ func (s *Store) UpsertFileTarget(project, path string, keys []string, mode strin
 }
 
 // AddGHTarget attaches a GitHub Actions repo-secret destination to a secret.
-func (s *Store) AddGHTarget(secretID, repo, secretName string) (*Target, error) {
+func (m *Mutation) AddGHTarget(secretID, repo, secretName string) (*Target, error) {
 	cfg := GHConfig{Repo: repo, SecretName: secretName}
 	raw, _ := json.Marshal(cfg)
 	t := Target{ID: newID(), Kind: "gh-actions", SecretID: secretID, Config: string(raw), LastState: "never", CreatedAt: now()}
-	if _, err := s.db.Exec(`
+	if _, err := m.tx.Exec(`
         INSERT INTO targets (id, kind, secret_id, config, last_state, created_at)
         VALUES (?, 'gh-actions', ?, ?, 'never', ?)`, t.ID, secretID, t.Config, t.CreatedAt); err != nil {
 		return nil, fmt.Errorf("add gh target: %w", err)
@@ -212,8 +218,8 @@ func (s *Store) FindFileTarget(project, path string) (*Target, error) {
 // exactly as it is; signet simply stops maintaining it. Audit entries that
 // reference this target keep their target_id, because the chain is append-only
 // and history is not rewritten when a target goes away.
-func (s *Store) RemoveTarget(id string) error {
-	res, err := s.db.Exec(`DELETE FROM targets WHERE id = ?`, id)
+func (m *Mutation) RemoveTarget(id string) error {
+	res, err := m.tx.Exec(`DELETE FROM targets WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("remove target: %w", err)
 	}
@@ -228,6 +234,12 @@ func (s *Store) RemoveTarget(id string) error {
 }
 
 // UpdateTargetPush records the outcome of a push attempt.
+//
+// It stays on Store rather than Mutation because the thing it describes has
+// already happened out on the network: the destination holds the new value
+// whether or not this row or its ledger entry lands, so there is nothing here
+// to roll back. Its audit entry is appended separately and a failure to write
+// it is surfaced, not swallowed — see sync.recordPush.
 func (s *Store) UpdateTargetPush(id, state, lastErr, versionID, pushedAt string) error {
 	_, err := s.db.Exec(`
         UPDATE targets

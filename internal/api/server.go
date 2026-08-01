@@ -448,16 +448,19 @@ func (s *Server) handleCommandRotate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
-	v, err := s.st.AddVersion(sec.ID, nonce, ct, vault.VersionHash(nonce, ct), s.actor(r))
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "%v", err)
-		return
-	}
-	if _, err := s.st.AppendAudit(store.AuditRecord{
-		Actor: s.actor(r), Action: "rotate", SecretID: sec.ID,
-		Details:   fmt.Sprintf("rotated %s/%s → version %d #%s — fan-out queued", sec.Project, sec.Name, v.VersionNo, v.VHash),
-		EventKind: store.KindRotation, ActorRole: role,
-		Status: &store.AuditStatus{Outcome: store.OutcomeRotated},
+	var v *store.Version
+	if _, err := s.st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
+		ver, err := m.AddVersion(sec.ID, nonce, ct, vault.VersionHash(nonce, ct), s.actor(r))
+		if err != nil {
+			return store.AuditRecord{}, err
+		}
+		v = ver
+		return store.AuditRecord{
+			Actor: s.actor(r), Action: "rotate", SecretID: sec.ID,
+			Details:   fmt.Sprintf("rotated %s/%s → version %d #%s — fan-out queued", sec.Project, sec.Name, v.VersionNo, v.VHash),
+			EventKind: store.KindRotation, ActorRole: role,
+			Status: &store.AuditStatus{Outcome: store.OutcomeRotated},
+		}, nil
 	}); err != nil {
 		writeErr(w, http.StatusInternalServerError, "%v", err)
 		return
@@ -548,16 +551,19 @@ func (s *Server) handleCommandAddTarget(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 	}
-	t, err := s.st.AddGHTarget(sec.ID, req.Repo, dest)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "%v", err)
-		return
-	}
-	if _, err := s.st.AppendAudit(store.AuditRecord{
-		Actor: s.actor(r), Action: "target.add", SecretID: sec.ID, TargetID: t.ID,
-		Details:   fmt.Sprintf("%s/%s → %s · Actions secret %s", req.Project, req.Name, req.Repo, dest),
-		EventKind: store.KindTargetConfig, ActorRole: role,
-		Status: &store.AuditStatus{Outcome: store.OutcomeCreated},
+	var t *store.Target
+	if _, err := s.st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
+		created, err := m.AddGHTarget(sec.ID, req.Repo, dest)
+		if err != nil {
+			return store.AuditRecord{}, err
+		}
+		t = created
+		return store.AuditRecord{
+			Actor: s.actor(r), Action: "target.add", SecretID: sec.ID, TargetID: t.ID,
+			Details:   fmt.Sprintf("%s/%s → %s · Actions secret %s", req.Project, req.Name, req.Repo, dest),
+			EventKind: store.KindTargetConfig, ActorRole: role,
+			Status: &store.AuditStatus{Outcome: store.OutcomeCreated},
+		}, nil
 	}); err != nil {
 		writeErr(w, http.StatusInternalServerError, "%v", err)
 		return
@@ -615,15 +621,16 @@ func (s *Server) handleCommandRemoveTarget(w http.ResponseWriter, r *http.Reques
 		writeErr(w, http.StatusNotFound, "no target %s/%s → %s (Actions secret %s)", req.Project, req.Name, req.Repo, dest)
 		return
 	}
-	if err := s.st.RemoveTarget(t.ID); err != nil {
-		writeErr(w, http.StatusInternalServerError, "%v", err)
-		return
-	}
-	if _, err := s.st.AppendAudit(store.AuditRecord{
-		Actor: s.actor(r), Action: "target.rm", SecretID: sec.ID, TargetID: t.ID,
-		Details:   fmt.Sprintf("%s/%s → %s · Actions secret %s detached", req.Project, req.Name, req.Repo, dest),
-		EventKind: store.KindTargetConfig, ActorRole: role,
-		Status: &store.AuditStatus{Outcome: store.OutcomeRemoved},
+	if _, err := s.st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
+		if err := m.RemoveTarget(t.ID); err != nil {
+			return store.AuditRecord{}, err
+		}
+		return store.AuditRecord{
+			Actor: s.actor(r), Action: "target.rm", SecretID: sec.ID, TargetID: t.ID,
+			Details:   fmt.Sprintf("%s/%s → %s · Actions secret %s detached", req.Project, req.Name, req.Repo, dest),
+			EventKind: store.KindTargetConfig, ActorRole: role,
+			Status: &store.AuditStatus{Outcome: store.OutcomeRemoved},
+		}, nil
 	}); err != nil {
 		writeErr(w, http.StatusInternalServerError, "%v", err)
 		return
@@ -670,10 +677,6 @@ func (s *Server) handleCommandSetExpiry(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusNotFound, "no secret %s/%s", req.Project, req.Name)
 		return
 	}
-	if err := s.st.SetExpiry(sec.ID, expiresAt); err != nil {
-		writeErr(w, http.StatusInternalServerError, "%v", err)
-		return
-	}
 	detail := req.Project + "/" + req.Name + ": cleared expiry"
 	if expiresAt != "" {
 		detail = fmt.Sprintf("%s/%s: expiry set to %s", req.Project, req.Name, req.ExpiresAt)
@@ -684,10 +687,15 @@ func (s *Server) handleCommandSetExpiry(w http.ResponseWriter, r *http.Request) 
 	if expiresAt == sec.ExpiresAt {
 		outcome = store.OutcomeUnchanged
 	}
-	if _, err := s.st.AppendAudit(store.AuditRecord{
-		Actor: s.actor(r), Action: "secret.set-expiry", SecretID: sec.ID, Details: detail,
-		EventKind: store.KindPolicyChange, ActorRole: role,
-		Status: &store.AuditStatus{Outcome: outcome},
+	if _, err := s.st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
+		if err := m.SetExpiry(sec.ID, expiresAt); err != nil {
+			return store.AuditRecord{}, err
+		}
+		return store.AuditRecord{
+			Actor: s.actor(r), Action: "secret.set-expiry", SecretID: sec.ID, Details: detail,
+			EventKind: store.KindPolicyChange, ActorRole: role,
+			Status: &store.AuditStatus{Outcome: outcome},
+		}, nil
 	}); err != nil {
 		writeErr(w, http.StatusInternalServerError, "%v", err)
 		return

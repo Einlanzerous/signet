@@ -19,9 +19,9 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// Store wraps the SQLite handle. The mutex serializes audit-chain appends
-// within this process; the chain's total order across processes comes from the
-// immediate-locked transaction each append runs in.
+// Store wraps the SQLite handle. The mutex serializes writes within this
+// process; the chain's total order across processes comes from the
+// immediate-locked transaction each write runs in.
 type Store struct {
 	db *sql.DB
 	mu sync.Mutex
@@ -33,7 +33,7 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("open store: %w", err)
 	}
 	// _txlock=immediate takes the write lock at BEGIN rather than at first
-	// write. Do not remove it as redundant next to AppendAudit's explicit
+	// write. Do not remove it as redundant next to Mutate's explicit
 	// transaction — the two are both load-bearing, and neither works alone.
 	//
 	// Without the transaction, two processes read the same chain head and fork
@@ -64,6 +64,61 @@ func Open(path string) (*Store, error) {
 
 // Close closes the underlying database.
 func (s *Store) Close() error { return s.db.Close() }
+
+// Mutation is a set of changes in flight inside one transaction. Its methods
+// are the write half of the vault — new versions, targets, policy — and they
+// hang off this type rather than off Store so that none of them can be reached
+// without the audit entry Mutate demands.
+//
+// It deliberately does not carry the *Store. The pool is capped at one
+// connection (see Open), so calling back into a Store method while this
+// transaction is open would block waiting for the connection this transaction
+// is already holding — a deadlock rather than an error. Reads a mutation
+// depends on belong before the Mutate call, or on this type as tx-scoped
+// methods of their own.
+type Mutation struct {
+	tx *sql.Tx
+}
+
+// Mutate applies the changes fn makes and the audit entry fn returns to
+// describe them, in one transaction: either both land or neither does. It is
+// the only way to change vault state, because a mutation this ledger does not
+// record is precisely what the ledger exists to make impossible.
+//
+// fn returns the record instead of receiving one because the record usually
+// cannot be written until the change has happened — it names the version number
+// or the id the change produced. Anything else the caller needs from inside is
+// captured by the closure.
+//
+// Reading the chain head and writing the entry that links to it happen in this
+// same immediate-locked transaction. A mutex alone would not do: it orders
+// writers within this process, but the vault is also reachable from CLI
+// invocations running beside the daemon, and two processes that read the same
+// head both write entries claiming the same prev_hash — a fork the append-only
+// triggers make unrepairable.
+func (s *Store) Mutate(fn func(*Mutation) (AuditRecord, error)) (*AuditEntry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("mutate: begin: %w", err)
+	}
+	defer tx.Rollback()
+
+	rec, err := fn(&Mutation{tx: tx})
+	if err != nil {
+		return nil, err
+	}
+	e, err := appendAuditTx(tx, rec)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("mutate: commit: %w", err)
+	}
+	return e, nil
+}
 
 // newID returns a random 128-bit hex identifier.
 func newID() string {

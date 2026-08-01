@@ -327,15 +327,21 @@ func scanEntry(rows *sql.Rows) (AuditEntry, string, error) {
 	return e, statusJSON, err
 }
 
-// AppendAudit appends an entry to the chain.
+// AppendAudit appends a standalone entry to the chain: an event whose subject
+// is outside the database — a value revealed to a human, a file rendered to
+// disk, a push that has already reached GitHub — and which therefore has no
+// vault mutation to be atomic with.
 //
-// Reading the chain head and writing the entry that links to it happen in one
-// immediate-locked transaction. A mutex alone would not do: it orders appends
-// within this process, but the vault is also reachable from CLI invocations
-// running beside the daemon, and two processes that read the same head both
-// write entries claiming the same prev_hash — a fork the append-only triggers
-// make unrepairable.
+// Anything that does change vault state must go through Mutate instead, so the
+// change and the entry describing it stand or fall together.
 func (s *Store) AppendAudit(rec AuditRecord) (*AuditEntry, error) {
+	return s.Mutate(func(*Mutation) (AuditRecord, error) { return rec, nil })
+}
+
+// appendAuditTx writes one entry inside a caller-owned transaction. The chain
+// lock lives on that transaction, not here — see Mutate for why the head read
+// and the linked write must share it.
+func appendAuditTx(tx *sql.Tx, rec AuditRecord) (*AuditEntry, error) {
 	if err := rec.validate(); err != nil {
 		return nil, err
 	}
@@ -343,15 +349,6 @@ func (s *Store) AppendAudit(rec AuditRecord) (*AuditEntry, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	tx, err := s.db.Begin()
-	if err != nil {
-		return nil, fmt.Errorf("append audit: begin: %w", err)
-	}
-	defer tx.Rollback()
 
 	prev := genesisHash
 	err = tx.QueryRow(`SELECT hash FROM audit_log ORDER BY seq DESC LIMIT 1`).Scan(&prev)
@@ -375,9 +372,6 @@ func (s *Store) AppendAudit(rec AuditRecord) (*AuditEntry, error) {
 		return nil, fmt.Errorf("append audit: %w", err)
 	}
 	e.Seq, _ = res.LastInsertId()
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("append audit: commit: %w", err)
-	}
 	return &e, nil
 }
 
