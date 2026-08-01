@@ -15,12 +15,22 @@ signet import --project lyceum ~/projects/lyceum/.env
 signet set --project construct-server --name API_TOKEN --generate
 signet target add --secret construct-server/RELEASE_BOT_PRIVATE_KEY \
     --gh-repo Einlanzerous/purser
+signet target list [--secret <p>/<NAME>] [--project <p>]
+signet target rm --secret <p>/<NAME> --gh-repo owner/name   # detach only
 signet sync                                          # seal & push to GitHub Actions
 signet render --project lyceum --check               # drift-check the env file
 signet status
 signet audit --verify
 signet serve                                         # HTTP mirror for Switchyard
 ```
+
+**Detaching a target removes signet's record, nothing else.** `target rm` (and
+the mirror's `remove-target`) stop signet managing a destination; the Actions
+secret in the repo, or the rendered env file on disk, is left exactly as it is.
+Deleting a credential from a repo can break that repo's workflows, and that call
+belongs to whoever owns it. Both the CLI and the API say so in their output.
+Audit entries naming a removed target keep pointing at it — the chain is
+append-only, so history is not rewritten when a target goes away.
 
 ## The two secret classes
 
@@ -79,6 +89,7 @@ Bearer auth (`SIGNET_API_TOKEN`), listens on `SIGNET_ADDR`
 | `POST /v1/commands/sync` | `{project, name}` — seal & push that secret's gh targets |
 | `POST /v1/commands/rotate` | `{project, name}` — new version for generated secrets (409 otherwise), then fan-out |
 | `POST /v1/commands/add-target` | `{project, name, repo, secret_name?}` — attach a gh-actions target (validated, deduped; run `sync` to push) |
+| `POST /v1/commands/remove-target` | `{project, name, repo, secret_name?}` — detach a gh-actions target; the destination Actions secret is left in place |
 | `POST /v1/commands/set-expiry` | `{project, name, expires_at}` — set/clear expiry (`YYYY-MM-DD`, empty clears) |
 
 Commands are *issued to* the daemon; the caller never touches key material.
@@ -104,7 +115,8 @@ fall back to the free text rather than inferring a value from it.
 | `hash_version` | which hashing scheme produced `hash` (see below) |
 
 `outcome` is one of `delivered` · `failed` · `rotated` · `created` · `updated` ·
-`unchanged` · `verified_healthy` · `auto_resolved` · `reverted` · `no_action`.
+`unchanged` · `removed` · `verified_healthy` · `auto_resolved` · `reverted` ·
+`no_action`.
 `http_status` and `latency_ms` are recorded from the actual call, not assumed.
 A numeric field is **present iff it was measured** — a push that completed in
 under a millisecond reports `"latency_ms": 0`, which is distinct from the field

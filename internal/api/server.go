@@ -55,6 +55,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /v1/commands/sync", s.auth(s.handleCommandSync))
 	mux.Handle("POST /v1/commands/rotate", s.auth(s.handleCommandRotate))
 	mux.Handle("POST /v1/commands/add-target", s.auth(s.handleCommandAddTarget))
+	mux.Handle("POST /v1/commands/remove-target", s.auth(s.handleCommandRemoveTarget))
 	mux.Handle("POST /v1/commands/set-expiry", s.auth(s.handleCommandSetExpiry))
 	return mux
 }
@@ -228,7 +229,7 @@ func (s *Server) buildViews() ([]ProjectView, error) {
 				}
 				sv.Targets = append(sv.Targets, TargetView{
 					Kind: t.Kind, Repo: cfg.Repo, SecretName: cfg.SecretName,
-					State:        ghState(t, cur),
+					State:        t.GHState(cur),
 					LastPushedAt: t.LastPushedAt, LastError: t.LastError,
 				})
 			}
@@ -242,20 +243,6 @@ func (s *Server) buildViews() ([]ProjectView, error) {
 		out = append(out, pv)
 	}
 	return out, nil
-}
-
-// ghState computes a gh-actions target's local sync state.
-func ghState(t store.Target, cur *store.Version) string {
-	switch {
-	case t.LastError != "":
-		return "error"
-	case t.LastPushedAt == "":
-		return "never"
-	case cur != nil && t.LastPushedVersionID != cur.ID:
-		return "drift" // vault moved on; destination holds an old version
-	default:
-		return "in sync"
-	}
 }
 
 // keyState extracts one key's drift state from a file target's report.
@@ -578,6 +565,72 @@ func (s *Server) handleCommandAddTarget(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"added":  true,
 		"target": TargetView{Kind: t.Kind, Repo: req.Repo, SecretName: dest, State: "never"},
+	})
+}
+
+// handleCommandRemoveTarget detaches a gh-actions destination from a secret.
+// It takes the same {project, name, repo, secret_name?} shape as add-target
+// rather than a target id, because the mirror does not expose ids and
+// (repo, secret_name) already identifies a destination uniquely.
+//
+// It detaches only: the Actions secret in the destination repo is deliberately
+// left alone. Signet fans out credentials, and deleting one from a repo could
+// break that repo's workflows — a decision that belongs to whoever owns it, not
+// to a detach here.
+func (s *Server) handleCommandRemoveTarget(w http.ResponseWriter, r *http.Request) {
+	role, ok := s.actorRole(w, r)
+	if !ok {
+		return
+	}
+	var req addTargetReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Project == "" || req.Name == "" || req.Repo == "" {
+		writeErr(w, http.StatusBadRequest, `body must be {"project": ..., "name": ..., "repo": "owner/name", "secret_name": ...(optional)}`)
+		return
+	}
+	// Validated like add-target so a malformed slug is a 400 naming the
+	// problem, rather than a 404 that reads as "no such target".
+	if !ghRepoRe.MatchString(req.Repo) {
+		writeErr(w, http.StatusBadRequest, "repo %q must be of the form owner/name", req.Repo)
+		return
+	}
+	dest := req.SecretName
+	if dest == "" {
+		dest = req.Name
+	}
+	sec, err := s.st.GetSecret(req.Project, req.Name)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	if sec == nil {
+		writeErr(w, http.StatusNotFound, "no secret %s/%s", req.Project, req.Name)
+		return
+	}
+	t, err := s.st.FindGHTarget(sec.ID, req.Repo, dest)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	if t == nil {
+		writeErr(w, http.StatusNotFound, "no target %s/%s → %s (Actions secret %s)", req.Project, req.Name, req.Repo, dest)
+		return
+	}
+	if err := s.st.RemoveTarget(t.ID); err != nil {
+		writeErr(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	if _, err := s.st.AppendAudit(store.AuditRecord{
+		Actor: s.actor(r), Action: "target.rm", SecretID: sec.ID, TargetID: t.ID,
+		Details:   fmt.Sprintf("%s/%s → %s · Actions secret %s detached", req.Project, req.Name, req.Repo, dest),
+		EventKind: store.KindTargetConfig, ActorRole: role,
+		Status: &store.AuditStatus{Outcome: store.OutcomeRemoved},
+	}); err != nil {
+		writeErr(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"removed": true,
+		"note":    fmt.Sprintf("Actions secret %s in %s was left in place — signet has stopped updating it", dest, req.Repo),
 	})
 }
 

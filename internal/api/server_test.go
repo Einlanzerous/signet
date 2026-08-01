@@ -447,3 +447,58 @@ func TestSummaryReportsHealerWindow(t *testing.T) {
 		t.Fatalf("statusless entry should land in the named bucket: %+v", summary.HealerActions)
 	}
 }
+
+// TestRemoveTargetCommand covers the mirror's detach command: it removes the
+// record, audits it with the removed outcome, says the remote secret was left
+// alone, and 404s rather than silently succeeding on something that is not there.
+func TestRemoveTargetCommand(t *testing.T) {
+	srv, st, _, _ := testServer(t)
+	sec, _ := st.CreateSecret("proj", "TOKEN", "", true, "")
+	if _, err := st.AddGHTarget(sec.ID, "owner/repo", "TOKEN"); err != nil {
+		t.Fatal(err)
+	}
+	h := srv.Handler()
+	const body = `{"project":"proj","name":"TOKEN","repo":"owner/repo"}`
+
+	rec := postCmd(t, h, "/v1/commands/remove-target", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("remove should 200: %d — %s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "left in place") {
+		t.Fatalf("response must state the remote secret was not deleted: %s", rec.Body)
+	}
+	targets, err := st.TargetsForSecret(sec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 0 {
+		t.Fatalf("target not detached: %+v", targets)
+	}
+	entries, err := st.ListAudit(1, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entries[0].Action != "target.rm" || entries[0].EventKind != store.KindTargetConfig {
+		t.Fatalf("audit entry wrong: %+v", entries[0])
+	}
+	if entries[0].Status == nil || entries[0].Status.Outcome != store.OutcomeRemoved {
+		t.Fatalf("outcome should be removed: %+v", entries[0].Status)
+	}
+
+	// Removing it again is a 404, and appends nothing.
+	before, _ := st.CountAudit()
+	if rec := postCmd(t, h, "/v1/commands/remove-target", body); rec.Code != http.StatusNotFound {
+		t.Fatalf("second remove should 404: %d — %s", rec.Code, rec.Body)
+	}
+	if after, _ := st.CountAudit(); after != before {
+		t.Fatalf("failed remove must not append: before=%d after=%d", before, after)
+	}
+
+	// Unknown secret is a 404 too, not a 500.
+	if rec := postCmd(t, h, "/v1/commands/remove-target", `{"project":"nope","name":"NOPE","repo":"o/r"}`); rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown secret should 404: %d — %s", rec.Code, rec.Body)
+	}
+	if ok, badSeq, _, err := st.VerifyAudit(); err != nil || !ok {
+		t.Fatalf("chain broken: ok=%v badSeq=%d err=%v", ok, badSeq, err)
+	}
+}

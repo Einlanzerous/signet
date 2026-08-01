@@ -7,7 +7,9 @@
 //	signet set --project csrv --name API_TOKEN --generate
 //	signet reveal --project csrv --name API_TOKEN  # audited
 //	signet render --project lyceum [--check]       # write / drift-check file targets
+//	signet target list [--secret csrv/NAME] [--project csrv]
 //	signet target add --secret csrv/RELEASE_BOT_PRIVATE_KEY --gh-repo Einlanzerous/purser
+//	signet target rm  --secret csrv/RELEASE_BOT_PRIVATE_KEY --gh-repo Einlanzerous/purser
 //	signet sync [--secret csrv/RELEASE_BOT_PRIVATE_KEY]
 //	signet status
 //	signet audit [--secret csrv/NAME] [--verify]
@@ -457,17 +459,36 @@ func atomicWrite(path, content, mode string) error {
 
 // ---- target -----------------------------------------------------------------
 
+const targetUsage = `usage:
+  signet target list [--secret <p>/<NAME>] [--project <p>]
+  signet target add --secret <p>/<NAME> --gh-repo owner/name [--gh-secret NAME]
+  signet target rm  --secret <p>/<NAME> --gh-repo owner/name [--gh-secret NAME]
+  signet target rm  --project <p> --path </path/to/.env>`
+
 func runTarget(args []string) error {
-	if len(args) == 0 || args[0] != "add" {
-		return fmt.Errorf("usage: signet target add --secret <p>/<NAME> --gh-repo owner/name [--gh-secret NAME]")
+	if len(args) == 0 {
+		return fmt.Errorf("%s", targetUsage)
 	}
+	switch args[0] {
+	case "list":
+		return runTargetList(args[1:])
+	case "rm":
+		return runTargetRm(args[1:])
+	case "add":
+		return runTargetAdd(args[1:])
+	default:
+		return fmt.Errorf("%s", targetUsage)
+	}
+}
+
+func runTargetAdd(args []string) error {
 	fs := flag.NewFlagSet("target add", flag.ExitOnError)
 	ref := fs.String("secret", "", "secret ref project/NAME (required)")
 	ghRepo := fs.String("gh-repo", "", "GitHub repo owner/name (required)")
 	ghSecret := fs.String("gh-secret", "", "destination Actions secret name (default: local name)")
-	fs.Parse(args[1:])
+	fs.Parse(args)
 	if *ref == "" || *ghRepo == "" || !strings.Contains(*ghRepo, "/") {
-		return fmt.Errorf("usage: signet target add --secret <p>/<NAME> --gh-repo owner/name [--gh-secret NAME]")
+		return fmt.Errorf("%s", targetUsage)
 	}
 	project, name, err := parseSecretRef(*ref)
 	if err != nil {
@@ -503,6 +524,253 @@ func runTarget(args []string) error {
 	}
 	fmt.Printf("target added: %s/%s → %s (Actions secret %s)\n", project, name, *ghRepo, dest)
 	fmt.Println("run `signet sync` to push")
+	return nil
+}
+
+// runTargetList prints every target, optionally narrowed to one secret or
+// project. Sync state is derived, not read back: gh targets compare the last
+// pushed version against the secret's current one, and file targets are checked
+// against what is actually on disk.
+func runTargetList(args []string) error {
+	fs := flag.NewFlagSet("target list", flag.ExitOnError)
+	ref := fs.String("secret", "", "only targets of this secret (project/NAME)")
+	project := fs.String("project", "", "only targets in this project")
+	fs.Parse(args)
+
+	a, err := setup()
+	if err != nil {
+		return err
+	}
+	defer a.close()
+
+	// Resolve the secret filter up front so an unknown ref fails loudly rather
+	// than silently printing nothing.
+	var wantSecret *store.Secret
+	wantProject := *project
+	if *ref != "" {
+		p, n, err := parseSecretRef(*ref)
+		if err != nil {
+			return err
+		}
+		if wantProject != "" && wantProject != p {
+			return fmt.Errorf("--secret %s is in project %s, which --project %s excludes", *ref, p, wantProject)
+		}
+		if wantSecret, err = a.st.GetSecret(p, n); err != nil {
+			return err
+		}
+		if wantSecret == nil {
+			return fmt.Errorf("no secret %s/%s", p, n)
+		}
+		wantProject = p
+	}
+
+	targets, err := a.st.ListTargets()
+	if err != nil {
+		return err
+	}
+
+	// projectValues decrypts every secret in the project, so it is cached —
+	// but the drift itself is not, because CheckFile depends on the target's
+	// own path and key set. Two file targets in one project share the values
+	// and nothing else.
+	valuesFor := map[string]map[string]string{}
+	projectValues := func(project string) (map[string]string, error) {
+		if v, ok := valuesFor[project]; ok {
+			return v, nil
+		}
+		v, err := a.projectValues(project)
+		if err != nil {
+			return nil, err
+		}
+		valuesFor[project] = v
+		return v, nil
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
+	rows := 0
+	emit := func(owner, kind, dest, state, synced string) {
+		if rows == 0 {
+			fmt.Fprintln(w, "SECRET\tKIND\tDESTINATION\tSTATE\tLAST SYNCED")
+		}
+		rows++
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", owner, kind, dest, state, dashIfEmpty(synced))
+	}
+
+	for _, t := range targets {
+		switch t.Kind {
+		case "gh-actions":
+			if wantSecret != nil && t.SecretID != wantSecret.ID {
+				continue
+			}
+			sec, err := a.st.GetSecretByID(t.SecretID)
+			if err != nil {
+				return err
+			}
+			if sec == nil || (wantProject != "" && sec.Project != wantProject) {
+				continue
+			}
+			cfg, err := t.GHConfig()
+			if err != nil {
+				return err
+			}
+			// Needs the secret's current version: "in sync" from the last push
+			// is not the same as "still current".
+			cur, err := a.st.CurrentVersion(sec.ID)
+			if err != nil {
+				return err
+			}
+			emit(sec.Project+"/"+sec.Name, t.Kind, cfg.Repo+" · "+cfg.SecretName, t.GHState(cur), t.LastPushedAt)
+
+		case "file":
+			// File targets belong to a project rather than one secret, so a
+			// secret filter keeps one only when it manages that key.
+			if wantProject != "" && t.Project != wantProject {
+				continue
+			}
+			cfg, err := t.FileConfig()
+			if err != nil {
+				return err
+			}
+			if wantSecret != nil && !contains(cfg.Keys, wantSecret.Name) {
+				continue
+			}
+			want, err := projectValues(t.Project)
+			if err != nil {
+				return err
+			}
+			drift := syncpkg.CheckFile(cfg.Path, want, cfg.Keys)
+			// Under a secret filter, report that key's state — collapsing the
+			// whole file could pin another key's drift on the one asked about.
+			key := ""
+			owner := t.Project + fmt.Sprintf(" (%d keys)", len(cfg.Keys))
+			if wantSecret != nil {
+				key = wantSecret.Name
+				owner = t.Project + "/" + wantSecret.Name
+			}
+			emit(owner, t.Kind, cfg.Path, fileState(drift, key), t.LastPushedAt)
+		}
+	}
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	if rows == 0 {
+		fmt.Println("no targets matched")
+	}
+	return nil
+}
+
+// fileState reduces a file target's drift to one word. With key set it reports
+// only that key; otherwise it collapses the whole file, worst state first.
+func fileState(d syncpkg.FileDrift, key string) string {
+	if d.MissingFile {
+		return "missing"
+	}
+	for _, ks := range d.Keys {
+		if key != "" && ks.Key != key {
+			continue
+		}
+		if ks.State != "ok" {
+			return ks.State
+		}
+	}
+	return "in sync"
+}
+
+// runTargetRm detaches a target. It removes signet's record only — whatever is
+// already at the destination stays put — which the output says plainly, because
+// "removed" could otherwise be read as having deleted the remote secret.
+func runTargetRm(args []string) error {
+	fs := flag.NewFlagSet("target rm", flag.ExitOnError)
+	ref := fs.String("secret", "", "secret ref project/NAME (gh targets)")
+	ghRepo := fs.String("gh-repo", "", "GitHub repo owner/name (gh targets)")
+	ghSecret := fs.String("gh-secret", "", "destination Actions secret name (default: local name)")
+	project := fs.String("project", "", "project (file targets)")
+	path := fs.String("path", "", "rendered file path (file targets)")
+	fs.Parse(args)
+
+	ghMode := *ref != "" || *ghRepo != ""
+	fileMode := *project != "" || *path != ""
+	switch {
+	case ghMode && fileMode:
+		return fmt.Errorf("choose one: --secret/--gh-repo for a GitHub target, or --project/--path for a file target")
+	case ghMode && (*ref == "" || *ghRepo == ""):
+		return fmt.Errorf("%s", targetUsage)
+	case fileMode && (*project == "" || *path == ""):
+		return fmt.Errorf("%s", targetUsage)
+	case !ghMode && !fileMode:
+		return fmt.Errorf("%s", targetUsage)
+	}
+
+	a, err := setup()
+	if err != nil {
+		return err
+	}
+	defer a.close()
+
+	if fileMode {
+		t, err := a.st.FindFileTarget(*project, *path)
+		if err != nil {
+			return err
+		}
+		if t == nil {
+			return fmt.Errorf("no file target %s in project %s", *path, *project)
+		}
+		cfg, err := t.FileConfig()
+		if err != nil {
+			return err
+		}
+		if err := a.st.RemoveTarget(t.ID); err != nil {
+			return err
+		}
+		if _, err := a.st.AppendAudit(store.AuditRecord{
+			Actor: cliActor(), Action: "target.rm", TargetID: t.ID,
+			Details:   fmt.Sprintf("%s → %s (%d keys) detached", *project, cfg.Path, len(cfg.Keys)),
+			EventKind: store.KindTargetConfig, ActorRole: store.RoleHuman,
+			Status: &store.AuditStatus{Outcome: store.OutcomeRemoved},
+		}); err != nil {
+			return err
+		}
+		fmt.Printf("target removed: %s → %s\n", *project, cfg.Path)
+		fmt.Printf("the file itself is untouched — delete %s by hand if you want it gone\n", cfg.Path)
+		return nil
+	}
+
+	p, n, err := parseSecretRef(*ref)
+	if err != nil {
+		return err
+	}
+	sec, err := a.st.GetSecret(p, n)
+	if err != nil {
+		return err
+	}
+	if sec == nil {
+		return fmt.Errorf("no secret %s/%s", p, n)
+	}
+	dest := *ghSecret
+	if dest == "" {
+		dest = n
+	}
+	t, err := a.st.FindGHTarget(sec.ID, *ghRepo, dest)
+	if err != nil {
+		return err
+	}
+	if t == nil {
+		return fmt.Errorf("no target %s/%s → %s (Actions secret %s) — `signet target list --secret %s` shows what is attached",
+			p, n, *ghRepo, dest, *ref)
+	}
+	if err := a.st.RemoveTarget(t.ID); err != nil {
+		return err
+	}
+	if _, err := a.st.AppendAudit(store.AuditRecord{
+		Actor: cliActor(), Action: "target.rm", SecretID: sec.ID, TargetID: t.ID,
+		Details:   fmt.Sprintf("%s/%s → %s · Actions secret %s detached", p, n, *ghRepo, dest),
+		EventKind: store.KindTargetConfig, ActorRole: store.RoleHuman,
+		Status: &store.AuditStatus{Outcome: store.OutcomeRemoved},
+	}); err != nil {
+		return err
+	}
+	fmt.Printf("target removed: %s/%s → %s (Actions secret %s)\n", p, n, *ghRepo, dest)
+	fmt.Printf("the Actions secret %s in %s is left in place — signet just stops updating it\n", dest, *ghRepo)
 	return nil
 }
 
@@ -653,18 +921,7 @@ func runStatus(args []string) error {
 			if err != nil {
 				return err
 			}
-			state := "never"
-			switch {
-			case t.LastError != "":
-				state = "error"
-			case t.LastPushedAt == "":
-				state = "never"
-			case cur != nil && t.LastPushedVersionID != cur.ID:
-				state = "drift"
-			default:
-				state = "in sync"
-			}
-			tgt = append(tgt, fmt.Sprintf("gh:%s→%s [%s]", cfg.Repo, cfg.SecretName, state))
+			tgt = append(tgt, fmt.Sprintf("gh:%s→%s [%s]", cfg.Repo, cfg.SecretName, t.GHState(cur)))
 		}
 		for _, fi := range fileByProject[sec.Project] {
 			if !contains(fi.cfg.Keys, sec.Name) {
