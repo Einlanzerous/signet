@@ -15,9 +15,11 @@ type Target struct {
 	Config              string // JSON: FileConfig or GHConfig
 	LastPushedVersionID string
 	LastPushedAt        string
-	LastState           string // never | in sync | drift | error
-	LastError           string
-	CreatedAt           string
+	// LastState is what the last push recorded: never | in sync | error.
+	// "drift" is NOT stored — see GHState, which derives it.
+	LastState string
+	LastError string
+	CreatedAt string
 }
 
 // FileConfig is the config payload of a kind=file target.
@@ -49,6 +51,25 @@ func (t *Target) GHConfig() (GHConfig, error) {
 		return c, fmt.Errorf("target %s: bad gh config: %w", t.ID, err)
 	}
 	return c, nil
+}
+
+// GHState derives a gh-actions target's sync state against the secret's current
+// version. It is derived rather than stored: last_state only ever records what
+// the last push did ("in sync" / "error", or the "never" default), so drift —
+// the vault moving on while the destination keeps an older version — is
+// invisible to it. Any view that answers "is this destination current?" has to
+// compute it.
+func (t *Target) GHState(cur *Version) string {
+	switch {
+	case t.LastError != "":
+		return "error"
+	case t.LastPushedAt == "":
+		return "never"
+	case cur != nil && t.LastPushedVersionID != cur.ID:
+		return "drift" // vault moved on; destination holds an old version
+	default:
+		return "in sync"
+	}
 }
 
 const targetCols = `id, kind, COALESCE(secret_id, ''), COALESCE(project, ''), config,
@@ -138,6 +159,72 @@ func (s *Store) AddGHTarget(secretID, repo, secretName string) (*Target, error) 
 		return nil, fmt.Errorf("add gh target: %w", err)
 	}
 	return &t, nil
+}
+
+// FindGHTarget returns the gh-actions target on secretID delivering to repo
+// under secretName, or nil when there is none. (repo, secretName) is what
+// uniquely identifies a destination for a given secret — the same pair
+// add-target refuses to duplicate.
+func (s *Store) FindGHTarget(secretID, repo, secretName string) (*Target, error) {
+	targets, err := s.TargetsForSecret(secretID)
+	if err != nil {
+		return nil, err
+	}
+	for i := range targets {
+		if targets[i].Kind != "gh-actions" {
+			continue
+		}
+		cfg, err := targets[i].GHConfig()
+		if err != nil {
+			return nil, err
+		}
+		if cfg.Repo == repo && cfg.SecretName == secretName {
+			return &targets[i], nil
+		}
+	}
+	return nil, nil
+}
+
+// FindFileTarget returns the project's file target for path, or nil when there
+// is none. A project has at most one target per path (UpsertFileTarget merges
+// into it rather than adding a second).
+func (s *Store) FindFileTarget(project, path string) (*Target, error) {
+	targets, err := s.FileTargetsForProject(project)
+	if err != nil {
+		return nil, err
+	}
+	for i := range targets {
+		cfg, err := targets[i].FileConfig()
+		if err != nil {
+			return nil, err
+		}
+		if cfg.Path == path {
+			return &targets[i], nil
+		}
+	}
+	return nil, nil
+}
+
+// RemoveTarget detaches a target, so signet stops managing that destination.
+//
+// It removes only signet's record. Whatever is already at the destination — an
+// Actions secret in a GitHub repo, a rendered env file on disk — is left
+// exactly as it is; signet simply stops maintaining it. Audit entries that
+// reference this target keep their target_id, because the chain is append-only
+// and history is not rewritten when a target goes away.
+func (s *Store) RemoveTarget(id string) error {
+	res, err := s.db.Exec(`DELETE FROM targets WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("remove target: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("remove target: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("remove target: no target %s", id)
+	}
+	return nil
 }
 
 // UpdateTargetPush records the outcome of a push attempt.

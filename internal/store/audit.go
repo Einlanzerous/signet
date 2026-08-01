@@ -130,6 +130,8 @@ const (
 	OutcomeUpdated Outcome = "updated"
 	// OutcomeUnchanged means the operation was a no-op.
 	OutcomeUnchanged Outcome = "unchanged"
+	// OutcomeRemoved means an object was detached or deleted.
+	OutcomeRemoved Outcome = "removed"
 	// OutcomeVerifiedHealthy means a check confirmed healthy state.
 	OutcomeVerifiedHealthy Outcome = "verified_healthy"
 	// OutcomeAutoResolved means a remediation fixed the problem.
@@ -143,6 +145,7 @@ const (
 var validOutcomes = map[Outcome]bool{
 	OutcomeDelivered: true, OutcomeFailed: true, OutcomeRotated: true,
 	OutcomeCreated: true, OutcomeUpdated: true, OutcomeUnchanged: true,
+	OutcomeRemoved:         true,
 	OutcomeVerifiedHealthy: true, OutcomeAutoResolved: true,
 	OutcomeReverted: true, OutcomeNoAction: true,
 }

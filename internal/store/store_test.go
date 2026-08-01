@@ -164,3 +164,145 @@ func TestGHTargetStateUpdates(t *testing.T) {
 		t.Fatalf("error state wrong: %+v", targets[0])
 	}
 }
+
+func TestFindAndRemoveTargets(t *testing.T) {
+	s := testStore(t)
+	sec, _ := s.CreateSecret("proj", "KEY", "", false, "")
+	gh, err := s.AddGHTarget(sec.ID, "owner/repo", "KEY")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A second destination for the same secret: (repo, secret_name) is the
+	// identifying pair, so a different name on the same repo is its own target.
+	if _, err := s.AddGHTarget(sec.ID, "owner/repo", "OTHER_NAME"); err != nil {
+		t.Fatal(err)
+	}
+	file, err := s.UpsertFileTarget("proj", "/tmp/x/.env", []string{"KEY"}, "0600")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found, err := s.FindGHTarget(sec.ID, "owner/repo", "KEY")
+	if err != nil || found == nil || found.ID != gh.ID {
+		t.Fatalf("gh lookup wrong: %+v err=%v", found, err)
+	}
+	if miss, err := s.FindGHTarget(sec.ID, "owner/repo", "NOPE"); err != nil || miss != nil {
+		t.Fatalf("unknown secret_name should not match: %+v err=%v", miss, err)
+	}
+	if miss, err := s.FindGHTarget(sec.ID, "other/repo", "KEY"); err != nil || miss != nil {
+		t.Fatalf("unknown repo should not match: %+v err=%v", miss, err)
+	}
+	if f, err := s.FindFileTarget("proj", "/tmp/x/.env"); err != nil || f == nil || f.ID != file.ID {
+		t.Fatalf("file lookup wrong: %+v err=%v", f, err)
+	}
+
+	if err := s.RemoveTarget(gh.ID); err != nil {
+		t.Fatal(err)
+	}
+	// Only that one went; the sibling destination survives.
+	remaining, err := s.TargetsForSecret(sec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remaining) != 1 {
+		t.Fatalf("want 1 remaining gh target, got %d", len(remaining))
+	}
+	if cfg, _ := remaining[0].GHConfig(); cfg.SecretName != "OTHER_NAME" {
+		t.Fatalf("removed the wrong target: %+v", cfg)
+	}
+	if gone, err := s.FindGHTarget(sec.ID, "owner/repo", "KEY"); err != nil || gone != nil {
+		t.Fatalf("removed target still found: %+v", gone)
+	}
+	// Removing something already gone is an error, not a silent success.
+	if err := s.RemoveTarget(gh.ID); err == nil {
+		t.Fatal("removing a missing target should error")
+	}
+}
+
+// TestRemovedTargetKeepsAuditHistory: the chain is append-only, so detaching a
+// target must not disturb entries that reference it.
+func TestRemovedTargetKeepsAuditHistory(t *testing.T) {
+	s := testStore(t)
+	sec, _ := s.CreateSecret("proj", "KEY", "", false, "")
+	tgt, err := s.AddGHTarget(sec.ID, "owner/repo", "KEY")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendAudit(AuditRecord{
+		Actor: "cli:test", Action: "target.add", SecretID: sec.ID, TargetID: tgt.ID,
+		EventKind: KindTargetConfig, ActorRole: RoleHuman,
+		Status: &AuditStatus{Outcome: OutcomeCreated},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RemoveTarget(tgt.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendAudit(AuditRecord{
+		Actor: "cli:test", Action: "target.rm", SecretID: sec.ID, TargetID: tgt.ID,
+		EventKind: KindTargetConfig, ActorRole: RoleHuman,
+		Status: &AuditStatus{Outcome: OutcomeRemoved},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := s.ListAudit(10, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 || entries[0].TargetID != tgt.ID || entries[1].TargetID != tgt.ID {
+		t.Fatalf("audit history should still name the removed target: %+v", entries)
+	}
+	if ok, badSeq, _, err := s.VerifyAudit(); err != nil || !ok {
+		t.Fatalf("chain broken after target removal: ok=%v badSeq=%d err=%v", ok, badSeq, err)
+	}
+}
+
+// TestGHStateDerivesDrift pins the reason target state is computed rather than
+// read back: last_state only ever records what the last push did, so a vault
+// that has moved on since still reads "in sync" there.
+func TestGHStateDerivesDrift(t *testing.T) {
+	s := testStore(t)
+	sec, _ := s.CreateSecret("proj", "KEY", "", true, "")
+	v1, err := s.AddVersion(sec.ID, []byte("n"), []byte("c"), "aaa", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tgt, err := s.AddGHTarget(sec.ID, "owner/repo", "KEY")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := tgt.GHState(v1); got != "never" {
+		t.Fatalf("unpushed target: want never, got %q", got)
+	}
+
+	// Push v1: in sync, and last_state agrees.
+	if err := s.UpdateTargetPush(tgt.ID, "in sync", "", v1.ID, "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	targets, _ := s.TargetsForSecret(sec.ID)
+	if got := targets[0].GHState(v1); got != "in sync" {
+		t.Fatalf("just pushed: want in sync, got %q", got)
+	}
+
+	// Vault moves on without a push. This is the case last_state cannot see.
+	v2, err := s.AddVersion(sec.ID, []byte("n2"), []byte("c2"), "bbb", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	targets, _ = s.TargetsForSecret(sec.ID)
+	if targets[0].LastState != "in sync" {
+		t.Fatalf("precondition: stored state should still read in sync, got %q", targets[0].LastState)
+	}
+	if got := targets[0].GHState(v2); got != "drift" {
+		t.Fatalf("vault moved on: want drift, got %q", got)
+	}
+
+	// An error on the target outranks everything.
+	if err := s.UpdateTargetPush(tgt.ID, "error", "boom", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	targets, _ = s.TargetsForSecret(sec.ID)
+	if got := targets[0].GHState(v2); got != "error" {
+		t.Fatalf("failed push: want error, got %q", got)
+	}
+}
