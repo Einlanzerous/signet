@@ -1,6 +1,8 @@
 package envfile
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -148,6 +150,217 @@ func TestRenderParseRoundTrip(t *testing.T) {
 	}
 	if !sortedStrings(keys) {
 		t.Fatalf("render not sorted: %v", keys)
+	}
+}
+
+// shaped is a hand-maintained file of the kind signet manages: a header, comment
+// section titles, blank-line grouping, an "export " prefix, and a key someone
+// added by hand that the vault does not know about.
+const shaped = `# managed by signet — do not edit by hand
+
+# Datadog
+DD_API_KEY=old-dd-key
+DD_SITE=datadoghq.com
+
+# Semaphore UI
+export SEMAPHORE_ADMIN=old-admin
+UNMANAGED_TOKEN=hand-added-value
+
+# trailing note
+`
+
+// managed is what the vault holds for shaped's target: one value changed, one
+// unchanged, one key the file does not have yet. UNMANAGED_TOKEN is absent —
+// that is the point.
+var managed = []Pair{
+	{"DD_API_KEY", "new-dd-key"},
+	{"DD_SITE", "datadoghq.com"},
+	{"SEMAPHORE_ADMIN", "rotated-admin"},
+	{"NEW_KEY", "appended"},
+}
+
+func writeTemp(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), ".env")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestRenderIntoPreservesShape pins the whole contract in one comparison:
+// managed values updated in place, everything else — comments, blank lines,
+// ordering, the "export " prefix, the unmanaged key — exactly as it was found.
+func TestRenderIntoPreservesShape(t *testing.T) {
+	content, unmanaged, err := RenderInto(writeTemp(t, shaped), managed, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Header + `
+
+# Datadog
+DD_API_KEY=new-dd-key
+DD_SITE=datadoghq.com
+
+# Semaphore UI
+export SEMAPHORE_ADMIN=rotated-admin
+UNMANAGED_TOKEN=hand-added-value
+
+# trailing note
+NEW_KEY=appended
+`
+	if content != want {
+		t.Fatalf("merge mismatch:\n got:\n%s\nwant:\n%s", content, want)
+	}
+	if !reflect.DeepEqual(unmanaged, []string{"UNMANAGED_TOKEN"}) {
+		t.Fatalf("unmanaged keys: got %v, want [UNMANAGED_TOKEN]", unmanaged)
+	}
+}
+
+// TestRenderIntoKeepsUnmanagedValues guards the specific loss the merge exists to
+// prevent: a credential only the file has must still be readable afterwards, not
+// merely present as a line.
+func TestRenderIntoKeepsUnmanagedValues(t *testing.T) {
+	content, _, err := RenderInto(writeTemp(t, shaped), managed, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	back, err := Parse(strings.NewReader(content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := Map(back)["UNMANAGED_TOKEN"]; got != "hand-added-value" {
+		t.Fatalf("unmanaged value lost: got %q", got)
+	}
+}
+
+func TestRenderIntoPrune(t *testing.T) {
+	content, unmanaged, err := RenderInto(writeTemp(t, shaped), managed, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(content, "UNMANAGED_TOKEN") {
+		t.Fatalf("--prune kept the unmanaged key:\n%s", content)
+	}
+	if !reflect.DeepEqual(unmanaged, []string{"UNMANAGED_TOKEN"}) {
+		t.Fatalf("prune must report what it deleted: got %v", unmanaged)
+	}
+	// Pruning drops unmanaged keys, not the file's structure.
+	for _, c := range []string{"# Datadog", "# Semaphore UI", "# trailing note"} {
+		if !strings.Contains(content, c) {
+			t.Fatalf("--prune dropped comment %q:\n%s", c, content)
+		}
+	}
+}
+
+// TestRenderIntoMissingFile covers the disaster-recovery case: nothing on disk
+// to preserve, so the canonical render is what gets written.
+func TestRenderIntoMissingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "absent.env")
+	content, unmanaged, err := RenderInto(path, managed, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if content != Render(managed) {
+		t.Fatalf("missing file should render canonically:\n%s", content)
+	}
+	if unmanaged != nil {
+		t.Fatalf("no file means no unmanaged keys: got %v", unmanaged)
+	}
+}
+
+// TestRenderIntoRefusesUnparseable: a file signet cannot read is a file it cannot
+// merge into, and overwriting it would destroy exactly the content the parse
+// failure says signet does not understand.
+func TestRenderIntoRefusesUnparseable(t *testing.T) {
+	path := writeTemp(t, "KEY=value\nthis line is not a pair\n")
+	content, _, err := RenderInto(path, managed, false)
+	if err == nil {
+		t.Fatal("expected an error rather than a rewrite")
+	}
+	if content != "" {
+		t.Fatalf("refused render must return no content, got:\n%s", content)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != "KEY=value\nthis line is not a pair\n" {
+		t.Fatalf("file was modified despite the refusal:\n%s", after)
+	}
+}
+
+// TestRenderIntoHeaderHandling: a stale signet header is replaced so the file
+// stops promising something render no longer does, but a file signet did not
+// write does not acquire one.
+func TestRenderIntoHeaderHandling(t *testing.T) {
+	content, _, err := RenderInto(writeTemp(t, shaped), managed, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(content, Header+"\n") {
+		t.Fatalf("stale header not refreshed:\n%s", content)
+	}
+	if strings.Contains(content, "do not edit by hand") {
+		t.Fatalf("old header text survived:\n%s", content)
+	}
+
+	unheaded := writeTemp(t, "# my own notes\nDD_SITE=datadoghq.com\n")
+	content, _, err = RenderInto(unheaded, []Pair{{"DD_SITE", "datadoghq.com"}}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if content != "# my own notes\nDD_SITE=datadoghq.com\n" {
+		t.Fatalf("render added lines to a file it did not write:\n%s", content)
+	}
+}
+
+// TestDocumentUntouchedIsVerbatim: parse-then-render with no edits reproduces the
+// source byte for byte, including a multi-line PEM value.
+func TestDocumentUntouchedIsVerbatim(t *testing.T) {
+	in := `# note
+  indented   =  spaced out
+KEY="-----BEGIN CERTIFICATE-----
+body-line-one
+-----END CERTIFICATE-----"
+export AFTER=sentinel
+`
+	doc, err := ParseDocument(strings.NewReader(in))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := doc.String(); got != in {
+		t.Fatalf("not verbatim:\n got:\n%s\nwant:\n%s", got, in)
+	}
+	// Editing a multi-line value collapses it to one quoted line, which has to
+	// re-parse to the value that was set.
+	doc.Set("KEY", "-----BEGIN CERTIFICATE-----\nrotated\n-----END CERTIFICATE-----")
+	back, err := Parse(strings.NewReader(doc.String()))
+	if err != nil {
+		t.Fatalf("re-parse after edit: %v\n%s", err, doc.String())
+	}
+	m := Map(back)
+	if m["KEY"] != "-----BEGIN CERTIFICATE-----\nrotated\n-----END CERTIFICATE-----" {
+		t.Fatalf("edited multi-line value round-trip mismatch: got %q", m["KEY"])
+	}
+	if m["AFTER"] != "sentinel" || m["indented"] != "spaced out" {
+		t.Fatalf("neighbouring entries disturbed by the edit: %#v", m)
+	}
+}
+
+// TestDocumentSetUpdatesEveryDuplicate: a dotenv reader keeps the last value, so
+// leaving an earlier duplicate stale would make the file disagree with itself.
+func TestDocumentSetUpdatesEveryDuplicate(t *testing.T) {
+	doc, err := ParseDocument(strings.NewReader("DUP=first\nOTHER=x\nDUP=second\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc.Set("DUP", "third")
+	if got := doc.String(); got != "DUP=third\nOTHER=x\nDUP=third\n" {
+		t.Fatalf("duplicate not fully updated:\n%s", got)
+	}
+	if got := doc.Pairs(); !reflect.DeepEqual(got, []Pair{{"DUP", "third"}, {"OTHER", "x"}}) {
+		t.Fatalf("pairs mismatch: %#v", got)
 	}
 }
 

@@ -214,6 +214,45 @@ func TestFileTargetUpsertMergesKeys(t *testing.T) {
 	}
 }
 
+// TestMutationFindFileTargetScopesToTx covers the lookup `target add-key` widens
+// an existing target through. It has to see the transaction's own writes, or a
+// caller that means "widen this target" cannot tell it apart from "create one".
+func TestMutationFindFileTargetScopesToTx(t *testing.T) {
+	s := testStore(t)
+	mustUpsertFileTarget(t, s, "proj", "/tmp/x/.env", []string{"A"}, "0600")
+
+	if _, err := s.Mutate(func(m *Mutation) (AuditRecord, error) {
+		found, err := m.FindFileTarget("proj", "/tmp/x/.env")
+		if err != nil {
+			return AuditRecord{}, err
+		}
+		if found == nil {
+			return AuditRecord{}, fmt.Errorf("existing target not found in tx")
+		}
+		if missing, err := m.FindFileTarget("proj", "/tmp/other/.env"); err != nil || missing != nil {
+			return AuditRecord{}, fmt.Errorf("unknown path should be nil: %v %v", missing, err)
+		}
+		// A target created earlier in this transaction is visible to the lookup;
+		// the Store variant reads a snapshot from before it and would not be.
+		if _, _, err := m.UpsertFileTarget("proj", "/tmp/new/.env", []string{"B"}, "0600"); err != nil {
+			return AuditRecord{}, err
+		}
+		fresh, err := m.FindFileTarget("proj", "/tmp/new/.env")
+		if err != nil {
+			return AuditRecord{}, err
+		}
+		if fresh == nil {
+			return AuditRecord{}, fmt.Errorf("target created in this tx not visible to the tx lookup")
+		}
+		return AuditRecord{
+			Actor: "test", Action: "target.file", Details: "tx lookup",
+			EventKind: KindTargetConfig, ActorRole: RoleHuman,
+		}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestGHTargetStateUpdates(t *testing.T) {
 	s := testStore(t)
 	sec := mustCreateSecret(t, s, "proj", "KEY", "", false)

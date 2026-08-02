@@ -6,9 +6,10 @@
 //	signet import --project lyceum ~/projects/lyceum/.env
 //	signet set --project csrv --name API_TOKEN --generate
 //	signet reveal --project csrv --name API_TOKEN  # audited
-//	signet render --project lyceum [--check]       # write / drift-check file targets
+//	signet render --project lyceum [--check] [--prune]  # write / drift-check file targets
 //	signet target list [--secret csrv/NAME] [--project csrv]
 //	signet target add --secret csrv/RELEASE_BOT_PRIVATE_KEY --gh-repo Einlanzerous/purser
+//	signet target add-key --project csrv --path ~/construct-server/.env --name API_TOKEN
 //	signet target rm  --secret csrv/RELEASE_BOT_PRIVATE_KEY --gh-repo Einlanzerous/purser
 //	signet sync [--secret csrv/RELEASE_BOT_PRIVATE_KEY]
 //	signet status
@@ -278,7 +279,41 @@ func runSet(args []string) error {
 		return err
 	}
 	fmt.Printf("%s/%s → version %d #%s\n", *project, *name, v.VersionNo, v.VHash)
+	warnUndelivered(a, *project, *name)
 	return nil
+}
+
+// warnUndelivered reports a value that landed in the vault but that no file
+// target lists, so `render` will not write it anywhere.
+//
+// "the vault has it" and "render writes it" are separate facts: set records the
+// value, and only import or `target add-key` records that a file wants it.
+// Nothing puts the two side by side, so the gap stays invisible until someone
+// happens to run `render --check` — which is how a key can be fully present in
+// signet and still be missing from the file it was set for.
+//
+// It stays quiet when the lookup fails: the value is already written, and a
+// warning that could not be computed is not worth failing a successful set over.
+func warnUndelivered(a *app, project, name string) {
+	targets, err := a.st.FileTargetsForProject(project)
+	if err != nil || len(targets) == 0 {
+		return // no rendered file for this project — nothing to be wrong about
+	}
+	var paths []string
+	for _, t := range targets {
+		cfg, err := t.FileConfig()
+		if err != nil {
+			return
+		}
+		if contains(cfg.Keys, name) {
+			return
+		}
+		paths = append(paths, cfg.Path)
+	}
+	fmt.Fprintf(os.Stderr, "warning: no file target for %s manages %s — render will not write it to %s\n",
+		project, name, strings.Join(paths, ", "))
+	fmt.Fprintf(os.Stderr, "  add it with: signet target add-key --project %s --path %s --name %s\n",
+		project, paths[0], name)
 }
 
 // ---- reveal -----------------------------------------------------------------
@@ -328,13 +363,26 @@ func runReveal(args []string) error {
 
 // ---- render -----------------------------------------------------------------
 
+// runRender writes each of the project's file targets from the vault.
+//
+// The write is a merge, not a replacement: the managed keys get the vault's
+// current values and every other line of the file — comments, blank lines, key
+// order, keys signet does not manage — is left as it was found. These files are
+// hand-maintained and gitignored, so a canonical rewrite would delete live
+// credentials and the structure organizing them with no copy to restore from,
+// and render is reached for precisely when a file is already in trouble.
+// Dropping the unmanaged keys is available, but only by asking for it: --prune.
 func runRender(args []string) error {
 	fs := flag.NewFlagSet("render", flag.ExitOnError)
 	project := fs.String("project", "", "project (required)")
 	check := fs.Bool("check", false, "report drift without writing")
+	prune := fs.Bool("prune", false, "delete keys the target does not manage instead of keeping them")
 	fs.Parse(args)
 	if *project == "" {
-		return fmt.Errorf("usage: signet render --project <p> [--check]")
+		return fmt.Errorf("usage: signet render --project <p> [--check] [--prune]")
+	}
+	if *check && *prune {
+		return fmt.Errorf("--check reports without writing; --prune only affects a write")
 	}
 	a, err := setup()
 	if err != nil {
@@ -372,8 +420,23 @@ func runRender(args []string) error {
 			}
 			pairs = append(pairs, envfile.Pair{Key: k, Value: v})
 		}
-		if err := atomicWrite(cfg.Path, envfile.Render(pairs), cfg.Mode); err != nil {
+		content, unmanaged, err := envfile.RenderInto(cfg.Path, pairs, *prune)
+		if err != nil {
+			return fmt.Errorf("%w — refusing to overwrite a file signet cannot read; fix it or move it aside", err)
+		}
+		if err := atomicWrite(cfg.Path, content, cfg.Mode); err != nil {
 			return err
+		}
+		// What happened to keys signet does not manage belongs in the ledger as
+		// much as on the terminal: --prune deletes credentials signet has no
+		// record of and therefore cannot restore, so the entry has to name them.
+		note := ""
+		if len(unmanaged) > 0 {
+			verb := "kept"
+			if *prune {
+				verb = "DELETED"
+			}
+			note = fmt.Sprintf(", %d unmanaged %s: %s", len(unmanaged), verb, strings.Join(unmanaged, ", "))
 		}
 		// The file is already written, so a failure here cannot be undone — but
 		// it leaves the target's recorded state describing the render before
@@ -383,13 +446,13 @@ func runRender(args []string) error {
 		}
 		if _, err := a.st.AppendAudit(store.AuditRecord{
 			Actor: cliActor(), Action: "render", TargetID: t.ID,
-			Details:   fmt.Sprintf("rendered %d keys → %s (mode %s)", len(pairs), cfg.Path, cfg.Mode),
+			Details:   fmt.Sprintf("rendered %d keys → %s (mode %s)%s", len(pairs), cfg.Path, cfg.Mode, note),
 			EventKind: store.KindRender, ActorRole: store.RoleHuman,
 			Status: &store.AuditStatus{Outcome: store.OutcomeDelivered},
 		}); err != nil {
 			return err
 		}
-		fmt.Printf("rendered %s (%d keys)\n", cfg.Path, len(pairs))
+		fmt.Printf("rendered %s (%d keys%s)\n", cfg.Path, len(pairs), note)
 	}
 	return nil
 }
@@ -437,7 +500,7 @@ func printDrift(d syncpkg.FileDrift) {
 		}
 	}
 	if len(d.Unmanaged) > 0 {
-		fmt.Printf("  unmanaged keys in file: %s\n", strings.Join(d.Unmanaged, ", "))
+		fmt.Printf("  unmanaged keys in file (kept on render, --prune deletes them): %s\n", strings.Join(d.Unmanaged, ", "))
 	}
 }
 
@@ -475,6 +538,7 @@ func atomicWrite(path, content, mode string) error {
 const targetUsage = `usage:
   signet target list [--secret <p>/<NAME>] [--project <p>]
   signet target add --secret <p>/<NAME> --gh-repo owner/name [--gh-secret NAME]
+  signet target add-key --project <p> --path </path/to/.env> --name NAME[,NAME…]
   signet target rm  --secret <p>/<NAME> --gh-repo owner/name [--gh-secret NAME]
   signet target rm  --project <p> --path </path/to/.env>`
 
@@ -489,9 +553,93 @@ func runTarget(args []string) error {
 		return runTargetRm(args[1:])
 	case "add":
 		return runTargetAdd(args[1:])
+	case "add-key":
+		return runTargetAddKey(args[1:])
 	default:
 		return fmt.Errorf("%s", targetUsage)
 	}
+}
+
+// runTargetAddKey brings existing vault secrets into a file target's key set, so
+// render starts writing them.
+//
+// It is the other half of the gap warnUndelivered reports. Before this, the only
+// thing that widened a target's key set was import, which reads the file — so
+// delivering a key that was never in the file meant writing a placeholder in by
+// hand and importing it back, overwriting the real value with the placeholder on
+// the way through.
+func runTargetAddKey(args []string) error {
+	fs := flag.NewFlagSet("target add-key", flag.ExitOnError)
+	project := fs.String("project", "", "project (required)")
+	path := fs.String("path", "", "rendered file path (required)")
+	name := fs.String("name", "", "secret name(s) to add, comma-separated (required)")
+	fs.Parse(args)
+	if *project == "" || *path == "" || *name == "" {
+		return fmt.Errorf("%s", targetUsage)
+	}
+	var names []string
+	for _, n := range strings.Split(*name, ",") {
+		if n = strings.TrimSpace(n); n != "" {
+			names = append(names, n)
+		}
+	}
+	if len(names) == 0 {
+		return fmt.Errorf("%s", targetUsage)
+	}
+
+	a, err := setup()
+	if err != nil {
+		return err
+	}
+	defer a.close()
+
+	// Every name has to exist first. A target listing a key the vault cannot
+	// supply is not a partial success — render refuses the whole file over one
+	// missing value, so a typo here would take the other keys down with it.
+	for _, n := range names {
+		sec, err := a.st.GetSecret(*project, n)
+		if err != nil {
+			return err
+		}
+		if sec == nil {
+			return fmt.Errorf("no secret %s/%s — set it before adding it to a target", *project, n)
+		}
+	}
+
+	var keys int
+	if _, err := a.st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
+		// Looked up inside the transaction that writes: UpsertFileTarget creates
+		// a target when it finds no match, and this command widens an existing
+		// one. Checking outside would leave a window where a `target rm` between
+		// the two turns "add a key" into "attach a new file".
+		existing, err := m.FindFileTarget(*project, *path)
+		if err != nil {
+			return store.AuditRecord{}, err
+		}
+		if existing == nil {
+			return store.AuditRecord{}, fmt.Errorf("no file target %s in project %s — `signet import` it first", *path, *project)
+		}
+		t, outcome, err := m.UpsertFileTarget(*project, *path, names, "")
+		if err != nil {
+			return store.AuditRecord{}, err
+		}
+		cfg, err := t.FileConfig()
+		if err != nil {
+			return store.AuditRecord{}, err
+		}
+		keys = len(cfg.Keys)
+		return store.AuditRecord{
+			Actor: cliActor(), Action: "target.file", TargetID: t.ID,
+			Details:   fmt.Sprintf("%s → %s +%s (%d keys)", *project, *path, strings.Join(names, ", "), keys),
+			EventKind: store.KindTargetConfig, ActorRole: store.RoleHuman,
+			Status: &store.AuditStatus{Outcome: outcome},
+		}, nil
+	}); err != nil {
+		return err
+	}
+	fmt.Printf("target updated: %s → %s now manages %d keys\n", *project, *path, keys)
+	fmt.Printf("run `signet render --project %s` to write them\n", *project)
+	return nil
 }
 
 func runTargetAdd(args []string) error {
