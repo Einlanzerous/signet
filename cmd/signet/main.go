@@ -218,6 +218,15 @@ func runSet(args []string) error {
 		}
 		expiresAt = t.UTC().Format(time.RFC3339)
 	}
+	// Whether the flag was given at all, which is not the same question as
+	// whether it carries a date: absent means "leave the expiry alone", and an
+	// explicit --expires "" means "clear it", matching the API's set-expiry.
+	expiresGiven := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "expires" {
+			expiresGiven = true
+		}
+	})
 
 	var value string
 	if *generate {
@@ -251,10 +260,26 @@ func runSet(args []string) error {
 	if err != nil {
 		return err
 	}
+	// On an existing secret the expiry is a second change riding along with the
+	// value, and it used to be read off the command line and dropped — `set
+	// --expires` moved the value and left the old date in place. Rotating a
+	// credential is exactly when both move together, and the failure was silent:
+	// the command printed the new version and said nothing about the expiry it
+	// had not written. Derived here, from the secret as read, so nothing has to
+	// escape the transaction through a captured variable.
+	setExpiry := expiresGiven && sec != nil && expiresAt != sec.ExpiresAt
+	expiryNote := ""
+	if setExpiry {
+		expiryNote = " · expiry cleared"
+		if expiresAt != "" {
+			expiryNote = " · expiry set to " + *expires
+		}
+	}
 	// Creating the secret, writing the version and recording it are one
 	// transaction: a half-created secret with no version, or a value that landed
 	// with nothing in the ledger to say so, are both worse than the write simply
-	// failing.
+	// failing. The expiry joins them for the same reason — a rotation that half
+	// landed is the state this is meant to prevent.
 	v, _, err := store.MutateValue(a.st, func(m *store.Mutation) (*store.Version, store.AuditRecord, error) {
 		target, action, outcome := sec, "secret.update", store.OutcomeUpdated
 		if target == nil {
@@ -263,14 +288,21 @@ func runSet(args []string) error {
 				return nil, store.AuditRecord{}, err
 			}
 			target, action, outcome = created, "secret.create", store.OutcomeCreated
+		} else if setExpiry {
+			if err := m.SetExpiry(target.ID, expiresAt); err != nil {
+				return nil, store.AuditRecord{}, err
+			}
 		}
 		ver, err := m.AddVersion(target.ID, nonce, ct, vault.VersionHash(nonce, ct), cliActor())
 		if err != nil {
 			return nil, store.AuditRecord{}, err
 		}
+		// One entry, because it was one transaction. The version write is the
+		// event; the expiry rides in its details rather than becoming a second
+		// entry that could only ever be appended after the first had committed.
 		return ver, store.AuditRecord{
 			Actor: cliActor(), Action: action, SecretID: target.ID,
-			Details:   fmt.Sprintf("%s/%s · version %d #%s", *project, *name, ver.VersionNo, ver.VHash),
+			Details:   fmt.Sprintf("%s/%s · version %d #%s%s", *project, *name, ver.VersionNo, ver.VHash, expiryNote),
 			EventKind: store.KindSecretWrite, ActorRole: store.RoleHuman,
 			Status: &store.AuditStatus{Outcome: outcome},
 		}, nil
@@ -278,7 +310,7 @@ func runSet(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("%s/%s → version %d #%s\n", *project, *name, v.VersionNo, v.VHash)
+	fmt.Printf("%s/%s → version %d #%s%s\n", *project, *name, v.VersionNo, v.VHash, expiryNote)
 	warnUndelivered(a, *project, *name)
 	return nil
 }
@@ -1060,12 +1092,7 @@ func runSync(args []string) error {
 		return err
 	}
 	defer a.close()
-	if a.cfg.GitHubToken == "" {
-		return fmt.Errorf("SIGNET_GITHUB_TOKEN is not set — cannot push to GitHub Actions")
-	}
-	gh := syncpkg.NewGHClient(a.cfg.GitHubToken)
-
-	var toSync []store.Secret
+	var candidates []store.Secret
 	if *ref != "" {
 		project, name, err := parseSecretRef(*ref)
 		if err != nil {
@@ -1078,41 +1105,77 @@ func runSync(args []string) error {
 		if sec == nil {
 			return fmt.Errorf("no secret %s/%s", project, name)
 		}
-		toSync = []store.Secret{*sec}
+		candidates = []store.Secret{*sec}
 	} else {
 		all, err := a.st.ListSecrets()
 		if err != nil {
 			return err
 		}
-		for _, sec := range all {
-			targets, err := a.st.TargetsForSecret(sec.ID)
-			if err != nil {
-				return err
-			}
-			if len(targets) > 0 {
-				toSync = append(toSync, sec)
-			}
+		candidates = all
+	}
+	// Narrowed to secrets that actually have a GitHub destination, so that a run
+	// with nothing to push never reaches for the PAT. One read of the target
+	// table rather than one query per candidate: this only has to answer "is
+	// there a gh-actions destination at all", and PushSecret re-reads each
+	// secret's targets below anyway.
+	hasGH := map[string]bool{}
+	allTargets, err := a.st.ListTargets()
+	if err != nil {
+		return err
+	}
+	for _, t := range allTargets {
+		if t.Kind == "gh-actions" {
+			hasGH[t.SecretID] = true
+		}
+	}
+	var toSync []store.Secret
+	for _, sec := range candidates {
+		if hasGH[sec.ID] {
+			toSync = append(toSync, sec)
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
 	pushed, failed := 0, 0
-	for i := range toSync {
-		results, err := syncpkg.PushSecret(ctx, a.st, a.key, gh, &toSync[i], cliActor(), store.RoleHuman)
+	// The credential is resolved inside this guard, not above it: the fallback
+	// decrypts the vault's root credential, and doing that for a run with no
+	// destinations would record an authentication that never happened.
+	if len(toSync) > 0 {
+		tok, err := ops.ResolveGHToken(a.st, a.key, a.cfg.GitHubToken, cliActor(), store.RoleHuman)
 		if err != nil {
 			return err
 		}
-		for _, r := range results {
-			if r.State == "in sync" {
-				pushed++
-				fmt.Printf("  ✓ %s/%s → %s (%s)\n", toSync[i].Project, toSync[i].Name, r.Repo, r.Secret)
-				if r.Note != "" {
-					fmt.Printf("    note: %s\n", r.Note)
+		if tok.Source == ops.TokenFromVault {
+			// The vault just decrypted its own root credential. That is the
+			// arrangement the README documents, not an incident, but it is not
+			// something to do silently either — and the expiry goes with it, since
+			// a sync that works today and 401s in a month gives no other warning.
+			note := ""
+			if s := expiresIn(tok.ExpiresAt); s != "" {
+				note = ", expires " + s
+			}
+			fmt.Fprintf(os.Stderr, "using %s/%s from the vault (SIGNET_GITHUB_TOKEN unset%s)\n",
+				ops.GHTokenProject, ops.GHTokenName, note)
+		}
+		gh := syncpkg.NewGHClient(tok.Value)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		for i := range toSync {
+			results, err := syncpkg.PushSecret(ctx, a.st, a.key, gh, &toSync[i], cliActor(), store.RoleHuman)
+			if err != nil {
+				return err
+			}
+			for _, r := range results {
+				if r.State == "in sync" {
+					pushed++
+					fmt.Printf("  ✓ %s/%s → %s (%s)\n", toSync[i].Project, toSync[i].Name, r.Repo, r.Secret)
+					if r.Note != "" {
+						fmt.Printf("    note: %s\n", r.Note)
+					}
+				} else {
+					failed++
+					fmt.Printf("  ✗ %s/%s → %s: %s\n", toSync[i].Project, toSync[i].Name, r.Repo, r.Err)
 				}
-			} else {
-				failed++
-				fmt.Printf("  ✗ %s/%s → %s: %s\n", toSync[i].Project, toSync[i].Name, r.Repo, r.Err)
 			}
 		}
 	}
@@ -1180,11 +1243,8 @@ func runStatus(args []string) error {
 			vhash = "#" + cur.VHash
 		}
 		expires := "-"
-		if sec.ExpiresAt != "" {
-			if t, err := time.Parse(time.RFC3339, sec.ExpiresAt); err == nil {
-				days := int(time.Until(t).Hours() / 24)
-				expires = fmt.Sprintf("%s (%dd)", t.Format("2006-01-02"), days)
-			}
+		if s := expiresIn(sec.ExpiresAt); s != "" {
+			expires = s
 		}
 		var tgt []string
 		ghTargets, err := a.st.TargetsForSecret(sec.ID)
@@ -1213,6 +1273,20 @@ func runStatus(args []string) error {
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", sec.Project, sec.Name, vhash, sec.Status, expires, strings.Join(tgt, ", "))
 	}
 	return w.Flush()
+}
+
+// expiresIn renders an RFC3339 expiry as "2026-10-19 (79d)", or "" when there
+// is none to render. Shared by `status` and sync's fallback notice so the two
+// cannot disagree about when a credential dies.
+func expiresIn(expiresAt string) string {
+	if expiresAt == "" {
+		return ""
+	}
+	t, err := time.Parse(time.RFC3339, expiresAt)
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf("%s (%dd)", t.Format("2006-01-02"), int(time.Until(t).Hours()/24))
 }
 
 func contains(xs []string, s string) bool {

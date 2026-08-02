@@ -1,0 +1,143 @@
+package ops
+
+import (
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/Einlanzerous/signet/internal/store"
+	"github.com/Einlanzerous/signet/internal/vault"
+)
+
+// The vault's own GitHub credential. sync reads it when the environment
+// carries no token, so the PAT can be held the way every other secret is —
+// encrypted, expiry tracked, reads audited — instead of being arranged by each
+// caller's shell on the way in.
+const (
+	GHTokenProject = "signet"
+	GHTokenName    = "SIGNET_PAT"
+)
+
+// ghTokenFix is the command that stores a PAT under the ref sync looks for,
+// quoted by every failure below so the fix is in hand rather than looked up.
+// Each of these is read at the moment a sync stopped working, which is not when
+// anyone wants to go and reconstruct the invocation.
+const ghTokenFix = "`signet set --project " + GHTokenProject + " --name " + GHTokenName +
+	" --expires YYYY-MM-DD`, with the PAT on stdin"
+
+// ActionSecretRead is the ledger verb for signet reading a secret in order to
+// use it itself, as distinct from `secret.reveal`, which is plaintext handed to
+// a person. Both are KindSecretReveal — a decrypt is a decrypt, and neither
+// should be filterable out of a review of who touched a credential — but the
+// verb keeps "the operator saw this value" apart from "sync authenticated with
+// it", which is the distinction an audit of the root credential turns on.
+const ActionSecretRead = "secret.read"
+
+// TokenSource records where a resolved token came from. A vault fallback
+// decrypts the credential that can rewrite every other destination, so the
+// caller is expected to say out loud that it happened.
+type TokenSource string
+
+const (
+	// TokenFromEnv is a token the environment supplied.
+	TokenFromEnv TokenSource = "env"
+	// TokenFromVault is signet/SIGNET_PAT, read out of the vault.
+	TokenFromVault TokenSource = "vault"
+)
+
+// GHToken is a resolved GitHub credential and where it came from.
+type GHToken struct {
+	Value  string
+	Source TokenSource
+	// ExpiresAt is the vault's recorded expiry (RFC3339), empty when the token
+	// came from the environment or carries none: signet knows nothing about the
+	// lifetime of a token it was simply handed.
+	ExpiresAt string
+}
+
+// ResolveGHToken returns the credential sync should authenticate with. envToken
+// is the environment's answer — SIGNET_GITHUB_TOKEN, or SIGNET_PAT, which
+// config collapses into one value — and when it is empty the vault's own
+// signet/SIGNET_PAT is read instead.
+//
+// The fallback decrypts a credential, so it is appended to the ledger like any
+// other plaintext leaving the vault, and a ledger write that fails fails the
+// resolve: a root credential read that nothing recorded is exactly what this
+// vault exists to prevent.
+func ResolveGHToken(st *store.Store, key []byte, envToken, actor string, role store.ActorRole) (GHToken, error) {
+	if envToken != "" {
+		return GHToken{Value: envToken, Source: TokenFromEnv}, nil
+	}
+	ref := GHTokenProject + "/" + GHTokenName
+	sec, err := st.GetSecret(GHTokenProject, GHTokenName)
+	if err != nil {
+		return GHToken{}, err
+	}
+	if sec == nil {
+		return GHToken{}, fmt.Errorf("SIGNET_GITHUB_TOKEN is not set and the vault has no %s — cannot push to GitHub Actions; store the PAT with %s",
+			ref, ghTokenFix)
+	}
+	// Checked before the decrypt, and reported as itself: an expired PAT
+	// otherwise surfaces as a 401 from the GitHub API, which names neither the
+	// credential that failed nor the reason it did.
+	if expired, on := expiredOn(sec.ExpiresAt); expired {
+		return GHToken{}, fmt.Errorf("%s expired on %s — cannot push to GitHub Actions; issue a new PAT, then %s",
+			ref, on, ghTokenFix)
+	}
+	cur, err := st.CurrentVersion(sec.ID)
+	if err != nil {
+		return GHToken{}, err
+	}
+	// A registered secret with nothing in it is a half-finished `set`, not a
+	// broken vault, so it gets the same one-command fix as an absent one rather
+	// than a bare statement of the fact.
+	if cur == nil {
+		return GHToken{}, fmt.Errorf("SIGNET_GITHUB_TOKEN is not set and %s has no value stored — cannot push to GitHub Actions; store the PAT with %s",
+			ref, ghTokenFix)
+	}
+	plain, err := vault.Decrypt(key, cur.Nonce, cur.Ciphertext)
+	if err != nil {
+		return GHToken{}, fmt.Errorf("%s: %w", ref, err)
+	}
+	// Trimmed at the point of use. The value goes straight into an Authorization
+	// header, and a trailing newline from `printf | signet set` or a \r carried
+	// in from a CRLF env file is refused by the transport with an error that
+	// names neither the credential nor the whitespace that broke it.
+	token := strings.TrimSpace(string(plain))
+	if token == "" {
+		return GHToken{}, fmt.Errorf("%s is empty — cannot push to GitHub Actions; store the PAT with %s", ref, ghTokenFix)
+	}
+	if _, err := st.AppendAudit(store.AuditRecord{
+		Actor: actor, Action: ActionSecretRead, SecretID: sec.ID,
+		Details: fmt.Sprintf("read %s version %d #%s to authenticate GitHub Actions sync (SIGNET_GITHUB_TOKEN unset)",
+			ref, cur.VersionNo, cur.VHash),
+		EventKind: store.KindSecretReveal, ActorRole: role,
+		Status: &store.AuditStatus{Outcome: store.OutcomeDelivered},
+	}); err != nil {
+		return GHToken{}, fmt.Errorf("%s read but not recorded: %w", ref, err)
+	}
+	return GHToken{Value: token, Source: TokenFromVault, ExpiresAt: sec.ExpiresAt}, nil
+}
+
+// expiredOn reports whether an RFC3339 expiry has passed, and the date it was.
+//
+// An expiry is a date: both `set --expires` and the API store midnight UTC of
+// the day given, and GitHub honors a PAT through the whole of that day. So the
+// credential is spent only once the day is over — refusing at 00:00:00Z would
+// reject, for its entire last day, a token GitHub still accepts.
+//
+// An unparseable or absent expiry is not an expiry: signet declines to guess a
+// lifetime for a credential whose recorded one it cannot read.
+func expiredOn(expiresAt string) (bool, string) {
+	if expiresAt == "" {
+		return false, ""
+	}
+	t, err := time.Parse(time.RFC3339, expiresAt)
+	if err != nil {
+		return false, ""
+	}
+	if time.Now().Before(t.AddDate(0, 0, 1)) {
+		return false, ""
+	}
+	return true, t.Format("2006-01-02")
+}

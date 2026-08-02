@@ -99,11 +99,26 @@ public key, seal with a libsodium-compatible anonymous box, PUT the secret.
 Drift is metadata-based (GitHub never returns values): a destination updated
 out-of-band after our last push, or missing entirely, counts as drift.
 
-Set `SIGNET_GITHUB_TOKEN` to a fine-grained PAT with *Secrets: read/write* on
-the target repos. This is the vault's **root credential** — it cannot itself be
-blind, and its expiry should be tracked in the vault like anything else. For
-convenience, `SIGNET_PAT` is accepted as a fallback when `SIGNET_GITHUB_TOKEN`
-is unset, so a vault-managed `SIGNET_PAT` in `.env` can drive `sync` directly.
+Sync authenticates with a fine-grained PAT holding *Secrets: read/write* on the
+target repos. This is the vault's **root credential** — it cannot itself be
+blind, and its expiry should be tracked in the vault like anything else.
+
+`sync` resolves it in order, most specific first:
+
+1. `SIGNET_GITHUB_TOKEN` from the environment
+2. `SIGNET_PAT` from the environment
+3. `signet/SIGNET_PAT` from the vault
+4. otherwise it fails, naming both the environment and the vault
+
+Step 3 is what keeps the root credential out of the caller's hands: the vault
+holds its own PAT like any other secret, so `signet sync` needs no wrapper
+arranging the environment first, and nothing has to put the token on a command
+line to get it there. The fallback decrypts a credential, so it is recorded in
+the ledger as a `secret_reveal` and printed on stderr rather than happening
+silently, and a PAT whose expiry day has passed is refused at this seam, with
+the date — a dead PAT otherwise arrives as a bare 401 from GitHub. Only
+`sync` reads the vault this way; `serve` still takes its token from the
+environment.
 
 ## HTTP API (Switchyard mirror contract)
 
@@ -177,7 +192,7 @@ somehow carries typed fields is rejected rather than trusted.
 |---|---|---|
 | `SIGNET_DB` | `~/.local/share/signet/signet.db` | SQLite database |
 | `SIGNET_MASTER_KEY_FILE` | `~/.config/signet/master.key` | hex AES-256 key, 0400 |
-| `SIGNET_GITHUB_TOKEN` | *(empty — sync disabled)* | fine-grained PAT (falls back to `SIGNET_PAT`) |
+| `SIGNET_GITHUB_TOKEN` | *(empty — `sync` falls back to the vault)* | fine-grained PAT (env `SIGNET_PAT`, then vault `signet/SIGNET_PAT`) |
 | `SIGNET_API_TOKEN` | *(required for `serve`)* | mirror bearer token |
 | `SIGNET_ADDR` | `127.0.0.1:4010` | API listen address |
 
