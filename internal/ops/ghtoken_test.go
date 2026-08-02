@@ -122,7 +122,7 @@ func TestResolveGHTokenFallsBackToVault(t *testing.T) {
 func TestResolveGHTokenExpired(t *testing.T) {
 	st, key := newVault(t)
 	// Midnight UTC of yesterday, stored the way `set --expires` stores a date.
-	expired := time.Now().UTC().Truncate(24 * time.Hour).AddDate(0, 0, -1)
+	expired := time.Now().UTC().Truncate(24*time.Hour).AddDate(0, 0, -1)
 	putSecret(t, st, key, GHTokenProject, GHTokenName, "ghp_dead", expired.Format(time.RFC3339))
 	before := countAudit(t, st)
 
@@ -176,7 +176,7 @@ func TestResolveGHTokenTrimsWhitespace(t *testing.T) {
 // Each of these messages is read at the moment a sync stopped working, so each
 // has to carry the command that fixes it.
 func TestResolveGHTokenFailuresNameTheFix(t *testing.T) {
-	yesterday := time.Now().UTC().Truncate(24 * time.Hour).AddDate(0, 0, -1).Format(time.RFC3339)
+	yesterday := time.Now().UTC().Truncate(24*time.Hour).AddDate(0, 0, -1).Format(time.RFC3339)
 	cases := []struct {
 		name  string
 		setup func(t *testing.T, st *store.Store, key []byte)
