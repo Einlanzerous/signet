@@ -810,16 +810,18 @@ func serveListeners(ctx context.Context, listeners []net.Listener, h http.Handle
 
 	select {
 	case <-ctx.Done():
-		// A listener that had already died on its own outranks a clean stop.
-		// Without this, a daemon that spent the last hour refusing an entire
-		// interface exits 0 on SIGTERM and the unit records an ordinary
-		// shutdown — the half-listening state not merely surviving but being
-		// signed off as healthy on its way out. Read before shutting anything
-		// down, while that error is alone in the channel rather than racing
-		// ErrServerClosed from its siblings.
-		lost := firstUnexpected(errCh)
+		// A listener that died on its own outranks a clean stop. Without this,
+		// a daemon that spent the last hour refusing an entire interface exits
+		// 0 on SIGTERM and the unit records an ordinary shutdown — the
+		// half-listening state not merely surviving but being signed off as
+		// healthy on its way out.
+		//
+		// Shut down first, then hear from every listener. Peeking at what had
+		// already arrived would miss the one that died moments before the
+		// signal, whose error is still in flight — which is precisely the case
+		// where the two events look alike and the wrong one wins the select.
 		stopErr := shutdownAll(servers)
-		if lost != nil {
+		if lost := awaitStopped(errCh, len(servers)); lost != nil {
 			return lost
 		}
 		return stopErr
@@ -834,20 +836,25 @@ func serveListeners(ctx context.Context, listeners []net.Listener, h http.Handle
 	}
 }
 
-// firstUnexpected returns the first error already waiting in errCh that is not
-// the ordinary result of a shutdown, or nil when there is none. It never
-// blocks: it reports what has already happened, not what might.
-func firstUnexpected(errCh chan error) error {
-	for {
-		select {
-		case err := <-errCh:
-			if err != nil && !errors.Is(err, http.ErrServerClosed) {
-				return err
-			}
-		default:
-			return nil
+// awaitStopped receives one result per listener and reports the first that is
+// not the ordinary consequence of shutting down.
+//
+// It waits rather than peeks, which is the whole point: a listener that failed
+// moments before the signal has not necessarily delivered its error yet, and
+// that near-simultaneous case is exactly the one where a peek reports a clean
+// stop for a daemon that had lost an interface. Waiting terminates because
+// every Serve returns exactly once — Shutdown closes the listeners out from
+// under the ones still accepting — and errCh is buffered per listener, so no
+// send can block on a reader that has gone away.
+func awaitStopped(errCh chan error, n int) error {
+	var lost error
+	for i := 0; i < n; i++ {
+		err := <-errCh
+		if lost == nil && err != nil && !errors.Is(err, http.ErrServerClosed) {
+			lost = err
 		}
 	}
+	return lost
 }
 
 // shutdownAll drains every server concurrently and reports every failure

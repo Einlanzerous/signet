@@ -152,39 +152,46 @@ func TestServeRejectsAddressesThatDefeatTheGuarantee(t *testing.T) {
 	}
 }
 
-// firstUnexpected is what keeps a lost listener from being reported as a clean
-// stop when SIGTERM lands at the same moment. It is unit-tested because the
-// race it settles cannot be staged through serveListeners: whichever of the
-// two select cases is ready first wins, and by construction that is usually
-// errCh.
-func TestFirstUnexpected(t *testing.T) {
+// awaitStopped is what keeps a lost listener from being reported as a clean
+// stop when SIGTERM lands at the same moment.
+func TestAwaitStopped(t *testing.T) {
 	// An ordinary shutdown is not a failure, however many listeners report it.
-	ch := make(chan error, 4)
+	ch := make(chan error, 3)
 	ch <- http.ErrServerClosed
 	ch <- nil
 	ch <- http.ErrServerClosed
-	if got := firstUnexpected(ch); got != nil {
+	if got := awaitStopped(ch, 3); got != nil {
 		t.Fatalf("ordinary shutdown reported as a failure: %v", got)
 	}
 
-	// A real one is found behind them, not hidden by them.
+	// A real one is found behind them rather than hidden by them.
 	lost := errors.New("accept tcp 172.17.0.1:4010: use of closed network connection")
 	ch <- http.ErrServerClosed
 	ch <- lost
-	if got := firstUnexpected(ch); !errors.Is(got, lost) {
+	if got := awaitStopped(ch, 2); !errors.Is(got, lost) {
 		t.Fatalf("got %v, want %v", got, lost)
 	}
 
-	// And it never blocks on a channel with nothing in it.
-	if got := firstUnexpected(make(chan error, 1)); got != nil {
-		t.Fatalf("got %v from an empty channel", got)
+	// A result that has not arrived yet is waited for, not missed — the case
+	// that made this a wait instead of a peek.
+	slow := make(chan error, 1)
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		slow <- lost
+	}()
+	if got := awaitStopped(slow, 1); !errors.Is(got, lost) {
+		t.Fatalf("in-flight error missed: got %v", got)
 	}
 }
 
-// A listener that dies on its own has to be reported rather than swallowed —
-// whichever way the select resolves. Exiting 0 here would sign off as healthy
-// a daemon that had been refusing an entire interface.
-func TestServeReportsALostListenerOnShutdown(t *testing.T) {
+// A listener that dies on its own has to be reported rather than swallowed.
+//
+// This exercises whichever way the select happens to resolve on the machine
+// running it, and on an unloaded one that is reliably the errCh side — the
+// near-simultaneous case, where the report is still in flight when the signal
+// lands, is pinned deterministically by TestAwaitStopped instead. Both paths
+// have to reach the same answer, which is what this checks.
+func TestServeReportsALostListener(t *testing.T) {
 	srv, _, _, _ := testServer(t)
 	listeners, addrs := listenLoopback(t, 2)
 
