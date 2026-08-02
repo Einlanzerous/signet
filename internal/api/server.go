@@ -14,10 +14,12 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Einlanzerous/signet/internal/store"
@@ -708,18 +710,170 @@ func (s *Server) handleCommandSetExpiry(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-// Serve runs the API server until ctx is cancelled.
-func Serve(ctx context.Context, addr string, s *Server) error {
-	srv := &http.Server{Addr: addr, Handler: s.Handler(), ReadHeaderTimeout: 5 * time.Second}
-	errCh := make(chan error, 1)
-	go func() { errCh <- srv.ListenAndServe() }()
-	log.Printf("api listening on %s", addr)
-	select {
-	case <-ctx.Done():
-		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		return srv.Shutdown(shutCtx)
-	case err := <-errCh:
+// Serve runs the API on every address in addrs until ctx is cancelled.
+//
+// Every address is bound before any of them starts serving, and one failure
+// aborts the whole start. A daemon that came up on loopback but was refused on
+// the docker bridge answers /healthz from the host while refusing every
+// container — it looks healthy from the one place that isn't broken, which is
+// the state this is shaped to prevent.
+func Serve(ctx context.Context, addrs []string, s *Server) error {
+	listeners, err := listenAll(addrs)
+	if err != nil {
 		return err
 	}
+	return serveListeners(ctx, listeners, s.Handler())
+}
+
+// listenAll binds every address, closing anything it has already opened if one
+// fails, so a refused start leaves no port held behind it. Every address is
+// checked before any port is taken.
+func listenAll(addrs []string) ([]net.Listener, error) {
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("serve: no listen address configured (SIGNET_ADDR)")
+	}
+	for _, addr := range addrs {
+		if err := checkAddr(addr); err != nil {
+			return nil, err
+		}
+	}
+	var listeners []net.Listener
+	for _, addr := range addrs {
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			for _, open := range listeners {
+				open.Close()
+			}
+			return nil, fmt.Errorf("serve: listen %s: %w", addr, err)
+		}
+		listeners = append(listeners, ln)
+	}
+	return listeners, nil
+}
+
+// checkAddr rejects the two spellings that would quietly defeat the guarantee
+// listenAll exists to make.
+//
+// A hostname is refused because net.Listen resolves it and binds exactly one
+// of the answers: `localhost:4010` on a dual-stack host listens on 127.0.0.1
+// or on ::1, never both. "Every address bound, or none" would then hold
+// vacuously while half the clients are refused — the half-listening state
+// wearing the costume of a successful start. Writing the literals out is the
+// fix, and it is what the operator meant anyway.
+//
+// An entry with no port is refused because net.Listen("tcp", "") binds the
+// wildcard. A credential vault should not arrive on every interface the host
+// has because a list entry was empty.
+func checkAddr(addr string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("serve: listen address %q: %w", addr, err)
+	}
+	// An empty host is the explicit wildcard (":4010"), which is a choice
+	// someone can only make deliberately. A non-empty one has to be a literal.
+	if host != "" && net.ParseIP(host) == nil {
+		return fmt.Errorf("serve: listen address %q: host must be an IP literal, not a hostname — "+
+			"a name can resolve to several addresses and only one of them gets bound "+
+			"(write 127.0.0.1:port, or [::1]:port, and list both if you want both)", addr)
+	}
+	return nil
+}
+
+// serveListeners runs one http.Server per listener over the same handler, so
+// every address reaches the same store, the same token check and the same
+// chain: a request is identical whichever address it arrived on.
+func serveListeners(ctx context.Context, listeners []net.Listener, h http.Handler) error {
+	servers := make([]*http.Server, 0, len(listeners))
+	bound := make([]string, 0, len(listeners))
+	errCh := make(chan error, len(listeners))
+	for _, ln := range listeners {
+		srv := &http.Server{
+			Handler:           h,
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       30 * time.Second,
+			IdleTimeout:       120 * time.Second,
+			// WriteTimeout is deliberately unset. The command handlers push to
+			// GitHub, and how long that takes is the network's to decide; a write
+			// deadline would cut the response to a push that had already landed,
+			// leaving the caller unable to tell whether a secret moved. The read
+			// and idle deadlines already bound an unattended connection, which is
+			// the exposure that widening past loopback actually adds.
+		}
+		servers = append(servers, srv)
+		// The address as bound rather than as configured: a port of 0 resolves to
+		// the one actually taken, so the line answers "which interfaces am I on"
+		// exactly, without anyone reaching for ss.
+		bound = append(bound, ln.Addr().String())
+		go func() { errCh <- srv.Serve(ln) }()
+	}
+	log.Printf("api listening on %s", strings.Join(bound, ", "))
+
+	select {
+	case <-ctx.Done():
+		// A listener that died on its own outranks a clean stop. Without this,
+		// a daemon that spent the last hour refusing an entire interface exits
+		// 0 on SIGTERM and the unit records an ordinary shutdown — the
+		// half-listening state not merely surviving but being signed off as
+		// healthy on its way out.
+		//
+		// Shut down first, then hear from every listener. Peeking at what had
+		// already arrived would miss the one that died moments before the
+		// signal, whose error is still in flight — which is precisely the case
+		// where the two events look alike and the wrong one wins the select.
+		stopErr := shutdownAll(servers)
+		if lost := awaitStopped(errCh, len(servers)); lost != nil {
+			return lost
+		}
+		return stopErr
+	case err := <-errCh:
+		// One listener stopped on its own while the others keep accepting — the
+		// half-listening state again, arrived at from the other direction. Take
+		// them all down and report what actually happened.
+		if stopErr := shutdownAll(servers); stopErr != nil {
+			log.Printf("api: draining the remaining listeners after %v: %v", err, stopErr)
+		}
+		return err
+	}
+}
+
+// awaitStopped receives one result per listener and reports the first that is
+// not the ordinary consequence of shutting down.
+//
+// It waits rather than peeks, which is the whole point: a listener that failed
+// moments before the signal has not necessarily delivered its error yet, and
+// that near-simultaneous case is exactly the one where a peek reports a clean
+// stop for a daemon that had lost an interface. Waiting terminates because
+// every Serve returns exactly once — Shutdown closes the listeners out from
+// under the ones still accepting — and errCh is buffered per listener, so no
+// send can block on a reader that has gone away.
+func awaitStopped(errCh chan error, n int) error {
+	var lost error
+	for i := 0; i < n; i++ {
+		err := <-errCh
+		if lost == nil && err != nil && !errors.Is(err, http.ErrServerClosed) {
+			lost = err
+		}
+	}
+	return lost
+}
+
+// shutdownAll drains every server concurrently and reports every failure
+// rather than the first: each one is a listener that did not finish cleanly,
+// and keeping only one would hide the others behind it. Sequentially, the
+// first server could spend the entire grace period and leave the rest none,
+// cutting the connections the deadline exists to protect.
+func shutdownAll(servers []*http.Server) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	errs := make([]error, len(servers))
+	var wg sync.WaitGroup
+	for i, srv := range servers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = srv.Shutdown(ctx)
+		}()
+	}
+	wg.Wait()
+	return errors.Join(errs...)
 }

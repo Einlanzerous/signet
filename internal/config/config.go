@@ -4,8 +4,10 @@
 package config
 
 import (
+	"net"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // Config is the resolved runtime configuration.
@@ -20,9 +22,19 @@ type Config struct {
 	GitHubToken string
 	// APIToken is the bearer token required by the HTTP API (SIGNET_API_TOKEN).
 	APIToken string
-	// Addr is the HTTP listen address (SIGNET_ADDR).
-	Addr string
+	// Addrs are the HTTP listen addresses (SIGNET_ADDR, comma-separated).
+	//
+	// A list rather than a single address because a host serving both
+	// host-local and containerized clients would otherwise have to choose:
+	// loopback strands every container, and 0.0.0.0 puts a credential vault on
+	// every interface the host happens to have, including the LAN.
+	Addrs []string
 }
+
+// defaultAddr is where the daemon listens when SIGNET_ADDR says nothing:
+// loopback only, because a vault should not arrive on a new interface by
+// default.
+const defaultAddr = "127.0.0.1:4010"
 
 // Load reads configuration from the environment, filling defaults.
 func Load() Config {
@@ -35,8 +47,52 @@ func Load() Config {
 		MasterKeyFile: envOr("SIGNET_MASTER_KEY_FILE", filepath.Join(home, ".config", "signet", "master.key")),
 		GitHubToken:   envOr("SIGNET_GITHUB_TOKEN", os.Getenv("SIGNET_PAT")),
 		APIToken:      os.Getenv("SIGNET_API_TOKEN"),
-		Addr:          envOr("SIGNET_ADDR", "127.0.0.1:4010"),
+		Addrs:         parseAddrs(envOr("SIGNET_ADDR", defaultAddr)),
 	}
+}
+
+// parseAddrs splits a comma-separated SIGNET_ADDR, trimming each entry so
+// `a, b` and `a,b` mean the same thing.
+//
+// An exact repeat is collapsed: that is a copy-paste stutter in a unit file,
+// and it would otherwise fail the start with "address already in use" against
+// an address that is in fact free. Entries that overlap without being
+// identical — `:4010` and `0.0.0.0:4010` — are deliberately left as written
+// and fail at bind, named: only the kernel knows those two collide, and
+// guessing at it here would mean silently dropping an address someone asked
+// for. Port 0 is never collapsed, because it means "any free port", so two
+// such entries are two different listeners rather than a repeat.
+//
+// A value that yields nothing at all falls back to the default, which is what
+// an empty SIGNET_ADDR already does.
+func parseAddrs(raw string) []string {
+	var addrs []string
+	seen := map[string]bool{}
+	for _, part := range strings.Split(raw, ",") {
+		addr := strings.TrimSpace(part)
+		if addr == "" {
+			continue
+		}
+		if !ephemeralPort(addr) {
+			if seen[addr] {
+				continue
+			}
+			seen[addr] = true
+		}
+		addrs = append(addrs, addr)
+	}
+	if len(addrs) == 0 {
+		return []string{defaultAddr}
+	}
+	return addrs
+}
+
+// ephemeralPort reports whether addr asks the kernel for whatever port is
+// free. An address the daemon will reject outright is not this function's
+// business — it answers false and lets the bind path say so.
+func ephemeralPort(addr string) bool {
+	_, port, err := net.SplitHostPort(addr)
+	return err == nil && port == "0"
 }
 
 func envOr(key, def string) string {
