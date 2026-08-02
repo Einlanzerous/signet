@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.1](https://github.com/Einlanzerous/signet/compare/v1.4.0...v1.4.1) (2026-08-02)
+
+
+### Bug Fixes
+
+* **api:** serve every address in SIGNET_ADDR (SGNT-17) ([#16](https://github.com/Einlanzerous/signet/issues/16)) ([a5818d9](https://github.com/Einlanzerous/signet/commit/a5818d93f2c48820a58574810dcfa10a83a75b8f))
+
 ## [1.4.0](https://github.com/Einlanzerous/signet/compare/v1.3.0...v1.4.0) (2026-08-02)
 
 
