@@ -1,7 +1,8 @@
 package sync
 
 import (
-	"os"
+	"errors"
+	"io/fs"
 
 	"github.com/Einlanzerous/signet/internal/envfile"
 )
@@ -14,15 +15,20 @@ type KeyState struct {
 
 // FileDrift is the drift report for one file target.
 type FileDrift struct {
-	Path        string     `json:"path"`
-	MissingFile bool       `json:"missing_file"`
-	Keys        []KeyState `json:"keys,omitempty"`
-	Unmanaged   []string   `json:"unmanaged,omitempty"` // keys present in the file signet doesn't manage
+	Path        string `json:"path"`
+	MissingFile bool   `json:"missing_file"`
+	// Unreadable carries the parse failure when the file is present but is not a
+	// readable env file. It is reported apart from ordinary drift because render
+	// refuses such a file rather than rewriting it: describing it as keys that
+	// have "changed" would promise a repair that will not happen.
+	Unreadable string     `json:"unreadable,omitempty"`
+	Keys       []KeyState `json:"keys,omitempty"`
+	Unmanaged  []string   `json:"unmanaged,omitempty"` // keys present in the file signet doesn't manage
 }
 
 // Clean reports whether the target matches the vault exactly.
 func (d FileDrift) Clean() bool {
-	if d.MissingFile {
+	if d.MissingFile || d.Unreadable != "" {
 		return false
 	}
 	for _, k := range d.Keys {
@@ -40,17 +46,17 @@ func CheckFile(path string, want map[string]string, managedKeys []string) FileDr
 	drift := FileDrift{Path: path}
 	pairs, err := envfile.ParseFile(path)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, fs.ErrNotExist) {
 			drift.MissingFile = true
 			for _, k := range managedKeys {
 				drift.Keys = append(drift.Keys, KeyState{Key: k, State: "missing"})
 			}
 			return drift
 		}
-		// Unparseable counts as changed wholesale.
-		for _, k := range managedKeys {
-			drift.Keys = append(drift.Keys, KeyState{Key: k, State: "changed"})
-		}
+		// Unparseable is its own state, not drift. Render will not rewrite a file
+		// it cannot read, so listing every key as "changed" would describe a
+		// situation render is about to decline to fix.
+		drift.Unreadable = err.Error()
 		return drift
 	}
 	got := envfile.Map(pairs)

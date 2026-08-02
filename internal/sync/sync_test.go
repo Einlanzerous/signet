@@ -146,3 +146,26 @@ func TestCheckFileDrift(t *testing.T) {
 		t.Fatal("missing file not reported")
 	}
 }
+
+// TestCheckFileUnreadable: render refuses a file it cannot parse rather than
+// rewriting it, so the report has to name that state. Describing it as keys that
+// have "changed" would promise a repair that will not happen.
+func TestCheckFileUnreadable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".env")
+	if err := os.WriteFile(path, []byte("A=1\nnot a pair\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d := CheckFile(path, map[string]string{"A": "1"}, []string{"A"})
+	if d.Unreadable == "" {
+		t.Fatal("unparseable file not reported as unreadable")
+	}
+	if d.MissingFile {
+		t.Fatal("the file exists; it just cannot be read")
+	}
+	if d.Clean() {
+		t.Fatal("unreadable file reported clean")
+	}
+	if len(d.Keys) != 0 {
+		t.Fatalf("per-key drift invented for a file that was never parsed: %v", d.Keys)
+	}
+}

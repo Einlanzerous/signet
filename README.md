@@ -16,9 +16,11 @@ signet set --project construct-server --name API_TOKEN --generate
 signet target add --secret construct-server/RELEASE_BOT_PRIVATE_KEY \
     --gh-repo Einlanzerous/purser
 signet target list [--secret <p>/<NAME>] [--project <p>]
+signet target add-key --project <p> --path </path/.env> --name NAME
 signet target rm --secret <p>/<NAME> --gh-repo owner/name   # detach only
 signet sync                                          # seal & push to GitHub Actions
 signet render --project lyceum --check               # drift-check the env file
+signet render --project lyceum                       # write it
 signet status
 signet audit --verify
 signet serve                                         # HTTP mirror for Switchyard
@@ -31,6 +33,33 @@ Deleting a credential from a repo can break that repo's workflows, and that call
 belongs to whoever owns it. Both the CLI and the API say so in their output.
 Audit entries naming a removed target keep pointing at it — the chain is
 append-only, so history is not rewritten when a target goes away.
+
+**`render` merges; it does not retype the file.** The managed keys get the
+vault's current values and every other line survives — comments, blank-line
+grouping, key order, and keys signet does not manage. These files are
+hand-maintained and gitignored, so anything a canonical rewrite dropped would be
+gone with no copy to restore from, and `render` is what you reach for when a file
+is *already* in trouble. Two consequences worth knowing:
+
+- A key present in the file but not on the target is **kept**, and both `render`
+  and `render --check` name it. `--prune` deletes those keys instead, listing
+  each one on the terminal and in the audit entry; `render --check --prune` is
+  the dry run for it.
+- A file that exists but does not parse is an error, not a rewrite. Signet will
+  not overwrite content it could not read, and `--check`, `target list` and
+  `status` all report that file as `unreadable` rather than as drift, since
+  render is not going to fix it.
+- An existing file keeps the mode and ownership it already has; the recorded
+  mode applies to a file signet is creating. A `.env` deliberately set to 0640
+  for a service group stays that way.
+- Multi-line values (PEM keys) are written as literal blocks, not collapsed to
+  backslash-escaped single lines, so a rotation does not change a file's format
+  out from under `source .env` or compose's `env_file`.
+
+**Being in the vault and being rendered are different states.** `set` stores a
+value; only `import` or `target add-key` records that a file *wants* it. `set`
+warns when it writes a key no file target lists, because otherwise the gap is
+invisible until someone runs `render --check` by hand.
 
 ## The two secret classes
 

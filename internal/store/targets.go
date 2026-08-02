@@ -240,7 +240,27 @@ func (s *Store) FindFileTarget(project, path string) (*Target, error) {
 	if err != nil {
 		return nil, err
 	}
+	return findFileTarget(targets, path)
+}
+
+// FindFileTarget is the tx-scoped lookup, for callers whose write depends on the
+// target already existing. UpsertFileTarget inserts when it matches nothing, so
+// a caller meaning "widen this target" rather than "create one" has to establish
+// that inside the same transaction — outside it, a concurrent removal turns the
+// upsert into a create.
+func (m *Mutation) FindFileTarget(project, path string) (*Target, error) {
+	targets, err := m.queryTargets(`WHERE kind = 'file' AND project = ? ORDER BY created_at, id`, project)
+	if err != nil {
+		return nil, err
+	}
+	return findFileTarget(targets, path)
+}
+
+func findFileTarget(targets []Target, path string) (*Target, error) {
 	for i := range targets {
+		if targets[i].Kind != "file" {
+			continue
+		}
 		cfg, err := targets[i].FileConfig()
 		if err != nil {
 			return nil, err
