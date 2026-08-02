@@ -142,6 +142,31 @@ failure worth preventing: it answers `/healthz` from the host while refusing
 every container, so it looks healthy from the one place that isn't broken. The
 startup log states the addresses as actually bound.
 
+Hosts must be IP literals. A name is refused, because `net.Listen` resolves it
+and binds exactly one of the answers — `localhost:4010` on a dual-stack host
+listens on `127.0.0.1` **or** `::1`, so "all of them or none" would hold while
+half the clients are turned away. List `127.0.0.1:4010,[::1]:4010` to get both.
+
+> **Listing a Docker address makes Docker a boot dependency.** `172.17.0.1`
+> only exists once dockerd has created `docker0`, and refusing to start is the
+> whole point of the binding rule — so a unit that wins the race against Docker
+> now fails to come up *at all*, including on loopback, where it used to come
+> up fine. Order the unit behind Docker, and let it retry:
+>
+> ```ini
+> [Unit]
+> Wants=docker.service
+> After=docker.service
+>
+> [Service]
+> Restart=on-failure
+> RestartSec=5
+> ```
+>
+> This is the deliberate trade: a vault that is reachable on some interfaces
+> and silently not on others is worse than one that is honestly down. Only list
+> an address that something else creates if the unit is ordered behind it.
+
 | Route | Purpose |
 |---|---|
 | `GET /healthz` | liveness (no auth) |

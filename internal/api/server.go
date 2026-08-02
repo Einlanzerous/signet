@@ -726,10 +726,16 @@ func Serve(ctx context.Context, addrs []string, s *Server) error {
 }
 
 // listenAll binds every address, closing anything it has already opened if one
-// fails, so a refused start leaves no port held behind it.
+// fails, so a refused start leaves no port held behind it. Every address is
+// checked before any port is taken.
 func listenAll(addrs []string) ([]net.Listener, error) {
 	if len(addrs) == 0 {
 		return nil, fmt.Errorf("serve: no listen address configured (SIGNET_ADDR)")
+	}
+	for _, addr := range addrs {
+		if err := checkAddr(addr); err != nil {
+			return nil, err
+		}
 	}
 	var listeners []net.Listener
 	for _, addr := range addrs {
@@ -745,6 +751,34 @@ func listenAll(addrs []string) ([]net.Listener, error) {
 	return listeners, nil
 }
 
+// checkAddr rejects the two spellings that would quietly defeat the guarantee
+// listenAll exists to make.
+//
+// A hostname is refused because net.Listen resolves it and binds exactly one
+// of the answers: `localhost:4010` on a dual-stack host listens on 127.0.0.1
+// or on ::1, never both. "Every address bound, or none" would then hold
+// vacuously while half the clients are refused — the half-listening state
+// wearing the costume of a successful start. Writing the literals out is the
+// fix, and it is what the operator meant anyway.
+//
+// An entry with no port is refused because net.Listen("tcp", "") binds the
+// wildcard. A credential vault should not arrive on every interface the host
+// has because a list entry was empty.
+func checkAddr(addr string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("serve: listen address %q: %w", addr, err)
+	}
+	// An empty host is the explicit wildcard (":4010"), which is a choice
+	// someone can only make deliberately. A non-empty one has to be a literal.
+	if host != "" && net.ParseIP(host) == nil {
+		return fmt.Errorf("serve: listen address %q: host must be an IP literal, not a hostname — "+
+			"a name can resolve to several addresses and only one of them gets bound "+
+			"(write 127.0.0.1:port, or [::1]:port, and list both if you want both)", addr)
+	}
+	return nil
+}
+
 // serveListeners runs one http.Server per listener over the same handler, so
 // every address reaches the same store, the same token check and the same
 // chain: a request is identical whichever address it arrived on.
@@ -753,49 +787,86 @@ func serveListeners(ctx context.Context, listeners []net.Listener, h http.Handle
 	bound := make([]string, 0, len(listeners))
 	errCh := make(chan error, len(listeners))
 	for _, ln := range listeners {
-		srv := &http.Server{Handler: h, ReadHeaderTimeout: 5 * time.Second}
+		srv := &http.Server{
+			Handler:           h,
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       30 * time.Second,
+			IdleTimeout:       120 * time.Second,
+			// WriteTimeout is deliberately unset. The command handlers push to
+			// GitHub, and how long that takes is the network's to decide; a write
+			// deadline would cut the response to a push that had already landed,
+			// leaving the caller unable to tell whether a secret moved. The read
+			// and idle deadlines already bound an unattended connection, which is
+			// the exposure that widening past loopback actually adds.
+		}
 		servers = append(servers, srv)
 		// The address as bound rather than as configured: a port of 0 resolves to
 		// the one actually taken, so the line answers "which interfaces am I on"
 		// exactly, without anyone reaching for ss.
 		bound = append(bound, ln.Addr().String())
-		go func(srv *http.Server, ln net.Listener) { errCh <- srv.Serve(ln) }(srv, ln)
+		go func() { errCh <- srv.Serve(ln) }()
 	}
 	log.Printf("api listening on %s", strings.Join(bound, ", "))
 
 	select {
 	case <-ctx.Done():
-		return shutdownAll(servers)
+		// A listener that had already died on its own outranks a clean stop.
+		// Without this, a daemon that spent the last hour refusing an entire
+		// interface exits 0 on SIGTERM and the unit records an ordinary
+		// shutdown — the half-listening state not merely surviving but being
+		// signed off as healthy on its way out. Read before shutting anything
+		// down, while that error is alone in the channel rather than racing
+		// ErrServerClosed from its siblings.
+		lost := firstUnexpected(errCh)
+		stopErr := shutdownAll(servers)
+		if lost != nil {
+			return lost
+		}
+		return stopErr
 	case err := <-errCh:
 		// One listener stopped on its own while the others keep accepting — the
 		// half-listening state again, arrived at from the other direction. Take
 		// them all down and report what actually happened.
-		shutdownAll(servers)
+		if stopErr := shutdownAll(servers); stopErr != nil {
+			log.Printf("api: draining the remaining listeners after %v: %v", err, stopErr)
+		}
 		return err
 	}
 }
 
-// shutdownAll drains every server concurrently. Sequentially, the first could
-// spend the entire grace period and leave the rest none, cutting connections
-// the deadline was meant to protect.
+// firstUnexpected returns the first error already waiting in errCh that is not
+// the ordinary result of a shutdown, or nil when there is none. It never
+// blocks: it reports what has already happened, not what might.
+func firstUnexpected(errCh chan error) error {
+	for {
+		select {
+		case err := <-errCh:
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+				return err
+			}
+		default:
+			return nil
+		}
+	}
+}
+
+// shutdownAll drains every server concurrently and reports every failure
+// rather than the first: each one is a listener that did not finish cleanly,
+// and keeping only one would hide the others behind it. Sequentially, the
+// first server could spend the entire grace period and leave the rest none,
+// cutting the connections the deadline exists to protect.
 func shutdownAll(servers []*http.Server) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	errs := make(chan error, len(servers))
+	errs := make([]error, len(servers))
 	var wg sync.WaitGroup
-	for _, srv := range servers {
+	for i, srv := range servers {
 		wg.Add(1)
-		go func(srv *http.Server) {
+		go func() {
 			defer wg.Done()
-			errs <- srv.Shutdown(ctx)
-		}(srv)
+			errs[i] = srv.Shutdown(ctx)
+		}()
 	}
 	wg.Wait()
-	close(errs)
-	for err := range errs {
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+	return errors.Join(errs...)
 }

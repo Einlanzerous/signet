@@ -4,6 +4,7 @@
 package config
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -53,10 +54,14 @@ func Load() Config {
 // parseAddrs splits a comma-separated SIGNET_ADDR, trimming each entry so
 // `a, b` and `a,b` mean the same thing.
 //
-// Duplicates are collapsed rather than passed through: binding the same
-// address twice can only be a typo, and it would otherwise fail the daemon's
-// start with "address already in use" against an address that is in fact free —
-// a confusing way to report a stutter in a config file.
+// An exact repeat is collapsed: that is a copy-paste stutter in a unit file,
+// and it would otherwise fail the start with "address already in use" against
+// an address that is in fact free. Entries that overlap without being
+// identical — `:4010` and `0.0.0.0:4010` — are deliberately left as written
+// and fail at bind, named: only the kernel knows those two collide, and
+// guessing at it here would mean silently dropping an address someone asked
+// for. Port 0 is never collapsed, because it means "any free port", so two
+// such entries are two different listeners rather than a repeat.
 //
 // A value that yields nothing at all falls back to the default, which is what
 // an empty SIGNET_ADDR already does.
@@ -65,16 +70,29 @@ func parseAddrs(raw string) []string {
 	seen := map[string]bool{}
 	for _, part := range strings.Split(raw, ",") {
 		addr := strings.TrimSpace(part)
-		if addr == "" || seen[addr] {
+		if addr == "" {
 			continue
 		}
-		seen[addr] = true
+		if !ephemeralPort(addr) {
+			if seen[addr] {
+				continue
+			}
+			seen[addr] = true
+		}
 		addrs = append(addrs, addr)
 	}
 	if len(addrs) == 0 {
 		return []string{defaultAddr}
 	}
 	return addrs
+}
+
+// ephemeralPort reports whether addr asks the kernel for whatever port is
+// free. An address the daemon will reject outright is not this function's
+// business — it answers false and lets the bind path say so.
+func ephemeralPort(addr string) bool {
+	_, port, err := net.SplitHostPort(addr)
+	return err == nil && port == "0"
 }
 
 func envOr(key, def string) string {

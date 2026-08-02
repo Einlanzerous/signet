@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -49,9 +50,12 @@ func TestServeBindsEveryAddress(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	// Cancelled on every exit, not only the happy one: without this a t.Fatalf
+	// below leaves Serve running, holding three ports for the rest of the binary.
+	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- Serve(ctx, addrs, srv) }()
-	waitReady(t, addrs[0])
+	waitReady(t, addrs)
 
 	for _, addr := range addrs {
 		if code := healthz(t, addr); code != http.StatusOK {
@@ -110,6 +114,101 @@ func TestServeRejectsEmptyAddressList(t *testing.T) {
 	}
 }
 
+// Addresses that would bind something other than what they appear to say are
+// refused before any port is taken — both of these would otherwise defeat the
+// all-or-nothing guarantee while looking like a clean start.
+func TestServeRejectsAddressesThatDefeatTheGuarantee(t *testing.T) {
+	// A known-good address to pair each bad one with. The port is handed back
+	// immediately — the test needs the address, not the listener.
+	held, free := listenLoopback(t, 1)
+	held[0].Close()
+	cases := []struct {
+		name string
+		addr string
+		want string
+	}{
+		// Resolves to 127.0.0.1 and ::1 but binds exactly one of them.
+		{name: "hostname", addr: "localhost:4010", want: "IP literal"},
+		// net.Listen("tcp", "") binds the wildcard — the whole-LAN exposure.
+		{name: "empty entry", addr: "", want: "missing port"},
+		{name: "no port", addr: "127.0.0.1", want: "missing port"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, _, _, _ := testServer(t)
+			err := Serve(context.Background(), []string{free[0], tc.addr}, srv)
+			if err == nil {
+				t.Fatalf("Serve accepted %q", tc.addr)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q does not explain %q", err, tc.want)
+			}
+			// Rejected before anything was bound, so the valid address in the
+			// same list was never taken.
+			if reachable(free[0]) {
+				t.Errorf("%s was bound despite a bad entry later in the list", free[0])
+			}
+		})
+	}
+}
+
+// firstUnexpected is what keeps a lost listener from being reported as a clean
+// stop when SIGTERM lands at the same moment. It is unit-tested because the
+// race it settles cannot be staged through serveListeners: whichever of the
+// two select cases is ready first wins, and by construction that is usually
+// errCh.
+func TestFirstUnexpected(t *testing.T) {
+	// An ordinary shutdown is not a failure, however many listeners report it.
+	ch := make(chan error, 4)
+	ch <- http.ErrServerClosed
+	ch <- nil
+	ch <- http.ErrServerClosed
+	if got := firstUnexpected(ch); got != nil {
+		t.Fatalf("ordinary shutdown reported as a failure: %v", got)
+	}
+
+	// A real one is found behind them, not hidden by them.
+	lost := errors.New("accept tcp 172.17.0.1:4010: use of closed network connection")
+	ch <- http.ErrServerClosed
+	ch <- lost
+	if got := firstUnexpected(ch); !errors.Is(got, lost) {
+		t.Fatalf("got %v, want %v", got, lost)
+	}
+
+	// And it never blocks on a channel with nothing in it.
+	if got := firstUnexpected(make(chan error, 1)); got != nil {
+		t.Fatalf("got %v from an empty channel", got)
+	}
+}
+
+// A listener that dies on its own has to be reported rather than swallowed —
+// whichever way the select resolves. Exiting 0 here would sign off as healthy
+// a daemon that had been refusing an entire interface.
+func TestServeReportsALostListenerOnShutdown(t *testing.T) {
+	srv, _, _, _ := testServer(t)
+	listeners, addrs := listenLoopback(t, 2)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- serveListeners(ctx, listeners, srv.Handler()) }()
+	waitReady(t, addrs)
+
+	// Take one listener out from under the daemon: it is now half-listening.
+	listeners[1].Close()
+	waitGone(t, addrs[1])
+	cancel()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("clean stop reported for a daemon that had lost a listener")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("serveListeners did not return")
+	}
+}
+
 // reachable reports whether anything accepts a connection on addr.
 func reachable(addr string) bool {
 	conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
@@ -120,14 +219,30 @@ func reachable(addr string) bool {
 	return true
 }
 
-func waitReady(t *testing.T, addr string) {
+// waitReady blocks until every address accepts, not just the first. listenAll
+// binds sequentially and a socket accepts the moment net.Listen returns, so
+// waiting on one address says nothing about whether the rest exist yet.
+func waitReady(t *testing.T, addrs []string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if reachable(addr) {
-			return
+	for _, addr := range addrs {
+		for !reachable(addr) {
+			if time.Now().After(deadline) {
+				t.Fatalf("%s never came up", addr)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+}
+
+// waitGone blocks until addr stops accepting.
+func waitGone(t *testing.T, addr string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for reachable(addr) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s still accepting", addr)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("%s never came up", addr)
 }
