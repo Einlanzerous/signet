@@ -115,8 +115,8 @@ holds its own PAT like any other secret, so `signet sync` needs no wrapper
 arranging the environment first, and nothing has to put the token on a command
 line to get it there. The fallback decrypts a credential, so it is recorded in
 the ledger as a `secret_reveal` and printed on stderr rather than happening
-silently, and an expiry the vault has already passed is refused at this seam
-with the date — a dead PAT otherwise arrives as a bare 401 from GitHub. Only
+silently, and a PAT whose expiry day has passed is refused at this seam, with
+the date — a dead PAT otherwise arrives as a bare 401 from GitHub. Only
 `sync` reads the vault this way; `serve` still takes its token from the
 environment.
 

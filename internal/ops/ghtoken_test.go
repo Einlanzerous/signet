@@ -121,7 +121,8 @@ func TestResolveGHTokenFallsBackToVault(t *testing.T) {
 
 func TestResolveGHTokenExpired(t *testing.T) {
 	st, key := newVault(t)
-	expired := time.Now().Add(-24 * time.Hour).UTC()
+	// Midnight UTC of yesterday, stored the way `set --expires` stores a date.
+	expired := time.Now().UTC().Truncate(24 * time.Hour).AddDate(0, 0, -1)
 	putSecret(t, st, key, GHTokenProject, GHTokenName, "ghp_dead", expired.Format(time.RFC3339))
 	before := countAudit(t, st)
 
@@ -138,6 +139,71 @@ func TestResolveGHTokenExpired(t *testing.T) {
 	// Refused before the decrypt: nothing was revealed, so nothing is recorded.
 	if got := countAudit(t, st); got != before {
 		t.Fatalf("expired path wrote %d audit entries", got-before)
+	}
+}
+
+// An expiry is a date, and GitHub honors the PAT through all of it. Refusing at
+// midnight would take a working credential away for its whole last day.
+func TestResolveGHTokenLastDayStillValid(t *testing.T) {
+	st, key := newVault(t)
+	today := time.Now().UTC().Truncate(24 * time.Hour)
+	putSecret(t, st, key, GHTokenProject, GHTokenName, "ghp_lastday", today.Format(time.RFC3339))
+
+	tok, err := ResolveGHToken(st, key, "", "test", store.RoleHuman)
+	if err != nil {
+		t.Fatalf("token expiring today refused: %v", err)
+	}
+	if tok.Value != "ghp_lastday" {
+		t.Fatalf("got %+v", tok)
+	}
+}
+
+// Values arrive from `printf | signet set` and from CRLF env files, and the
+// token goes straight into an Authorization header.
+func TestResolveGHTokenTrimsWhitespace(t *testing.T) {
+	st, key := newVault(t)
+	putSecret(t, st, key, GHTokenProject, GHTokenName, "  ghp_padded\r\n", "")
+
+	tok, err := ResolveGHToken(st, key, "", "test", store.RoleHuman)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.Value != "ghp_padded" {
+		t.Fatalf("whitespace not trimmed: %q", tok.Value)
+	}
+}
+
+// Each of these messages is read at the moment a sync stopped working, so each
+// has to carry the command that fixes it.
+func TestResolveGHTokenFailuresNameTheFix(t *testing.T) {
+	yesterday := time.Now().UTC().Truncate(24 * time.Hour).AddDate(0, 0, -1).Format(time.RFC3339)
+	cases := []struct {
+		name  string
+		setup func(t *testing.T, st *store.Store, key []byte)
+	}{
+		{"absent", func(*testing.T, *store.Store, []byte) {}},
+		{"expired", func(t *testing.T, st *store.Store, key []byte) {
+			putSecret(t, st, key, GHTokenProject, GHTokenName, "ghp_dead", yesterday)
+		}},
+		{"empty", func(t *testing.T, st *store.Store, key []byte) {
+			putSecret(t, st, key, GHTokenProject, GHTokenName, "", "")
+		}},
+		{"no versions", func(t *testing.T, st *store.Store, key []byte) {
+			mustCreateBare(t, st)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st, key := newVault(t)
+			tc.setup(t, st, key)
+			_, err := ResolveGHToken(st, key, "", "test", store.RoleHuman)
+			if err == nil {
+				t.Fatal("resolved a token it should have refused")
+			}
+			if !strings.Contains(err.Error(), "signet set --project signet --name SIGNET_PAT --expires") {
+				t.Fatalf("no remediation command in: %v", err)
+			}
+		})
 	}
 }
 
@@ -172,8 +238,10 @@ func TestResolveGHTokenAbsent(t *testing.T) {
 	}
 }
 
-func TestResolveGHTokenNoVersions(t *testing.T) {
-	st, key := newVault(t)
+// mustCreateBare registers the secret without ever storing a value: a `set`
+// that failed partway, not a corrupt vault.
+func mustCreateBare(t *testing.T, st *store.Store) {
+	t.Helper()
 	if _, err := st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
 		sec, err := m.CreateSecret(GHTokenProject, GHTokenName, "", false, "")
 		if err != nil {
@@ -187,10 +255,15 @@ func TestResolveGHTokenNoVersions(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestResolveGHTokenNoVersions(t *testing.T) {
+	st, key := newVault(t)
+	mustCreateBare(t, st)
 
 	_, err := ResolveGHToken(st, key, "", "test", store.RoleHuman)
-	if err == nil || !strings.Contains(err.Error(), "no versions") {
-		t.Fatalf("want no-versions error, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "no value stored") {
+		t.Fatalf("want no-value error, got %v", err)
 	}
 }
 

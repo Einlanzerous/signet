@@ -2,6 +2,7 @@ package ops
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Einlanzerous/signet/internal/store"
@@ -16,6 +17,21 @@ const (
 	GHTokenProject = "signet"
 	GHTokenName    = "SIGNET_PAT"
 )
+
+// ghTokenFix is the command that stores a PAT under the ref sync looks for,
+// quoted by every failure below so the fix is in hand rather than looked up.
+// Each of these is read at the moment a sync stopped working, which is not when
+// anyone wants to go and reconstruct the invocation.
+const ghTokenFix = "`signet set --project " + GHTokenProject + " --name " + GHTokenName +
+	" --expires YYYY-MM-DD`, with the PAT on stdin"
+
+// ActionSecretRead is the ledger verb for signet reading a secret in order to
+// use it itself, as distinct from `secret.reveal`, which is plaintext handed to
+// a person. Both are KindSecretReveal — a decrypt is a decrypt, and neither
+// should be filterable out of a review of who touched a credential — but the
+// verb keeps "the operator saw this value" apart from "sync authenticated with
+// it", which is the distinction an audit of the root credential turns on.
+const ActionSecretRead = "secret.read"
 
 // TokenSource records where a resolved token came from. A vault fallback
 // decrypts the credential that can rewrite every other destination, so the
@@ -58,32 +74,41 @@ func ResolveGHToken(st *store.Store, key []byte, envToken, actor string, role st
 		return GHToken{}, err
 	}
 	if sec == nil {
-		return GHToken{}, fmt.Errorf("SIGNET_GITHUB_TOKEN is not set and the vault has no %s — cannot push to GitHub Actions; store the PAT with `signet set --project %s --name %s --expires YYYY-MM-DD`",
-			ref, GHTokenProject, GHTokenName)
+		return GHToken{}, fmt.Errorf("SIGNET_GITHUB_TOKEN is not set and the vault has no %s — cannot push to GitHub Actions; store the PAT with %s",
+			ref, ghTokenFix)
 	}
 	// Checked before the decrypt, and reported as itself: an expired PAT
 	// otherwise surfaces as a 401 from the GitHub API, which names neither the
 	// credential that failed nor the reason it did.
 	if expired, on := expiredOn(sec.ExpiresAt); expired {
-		return GHToken{}, fmt.Errorf("%s expired on %s — cannot push to GitHub Actions; issue a new PAT, then `signet set --project %s --name %s --expires YYYY-MM-DD`",
-			ref, on, GHTokenProject, GHTokenName)
+		return GHToken{}, fmt.Errorf("%s expired on %s — cannot push to GitHub Actions; issue a new PAT, then %s",
+			ref, on, ghTokenFix)
 	}
 	cur, err := st.CurrentVersion(sec.ID)
 	if err != nil {
 		return GHToken{}, err
 	}
+	// A registered secret with nothing in it is a half-finished `set`, not a
+	// broken vault, so it gets the same one-command fix as an absent one rather
+	// than a bare statement of the fact.
 	if cur == nil {
-		return GHToken{}, fmt.Errorf("SIGNET_GITHUB_TOKEN is not set and %s has no versions — cannot push to GitHub Actions", ref)
+		return GHToken{}, fmt.Errorf("SIGNET_GITHUB_TOKEN is not set and %s has no value stored — cannot push to GitHub Actions; store the PAT with %s",
+			ref, ghTokenFix)
 	}
 	plain, err := vault.Decrypt(key, cur.Nonce, cur.Ciphertext)
 	if err != nil {
 		return GHToken{}, fmt.Errorf("%s: %w", ref, err)
 	}
-	if len(plain) == 0 {
-		return GHToken{}, fmt.Errorf("%s is empty — cannot push to GitHub Actions", ref)
+	// Trimmed at the point of use. The value goes straight into an Authorization
+	// header, and a trailing newline from `printf | signet set` or a \r carried
+	// in from a CRLF env file is refused by the transport with an error that
+	// names neither the credential nor the whitespace that broke it.
+	token := strings.TrimSpace(string(plain))
+	if token == "" {
+		return GHToken{}, fmt.Errorf("%s is empty — cannot push to GitHub Actions; store the PAT with %s", ref, ghTokenFix)
 	}
 	if _, err := st.AppendAudit(store.AuditRecord{
-		Actor: actor, Action: "secret.read", SecretID: sec.ID,
+		Actor: actor, Action: ActionSecretRead, SecretID: sec.ID,
 		Details: fmt.Sprintf("read %s version %d #%s to authenticate GitHub Actions sync (SIGNET_GITHUB_TOKEN unset)",
 			ref, cur.VersionNo, cur.VHash),
 		EventKind: store.KindSecretReveal, ActorRole: role,
@@ -91,10 +116,16 @@ func ResolveGHToken(st *store.Store, key []byte, envToken, actor string, role st
 	}); err != nil {
 		return GHToken{}, fmt.Errorf("%s read but not recorded: %w", ref, err)
 	}
-	return GHToken{Value: string(plain), Source: TokenFromVault, ExpiresAt: sec.ExpiresAt}, nil
+	return GHToken{Value: token, Source: TokenFromVault, ExpiresAt: sec.ExpiresAt}, nil
 }
 
 // expiredOn reports whether an RFC3339 expiry has passed, and the date it was.
+//
+// An expiry is a date: both `set --expires` and the API store midnight UTC of
+// the day given, and GitHub honors a PAT through the whole of that day. So the
+// credential is spent only once the day is over — refusing at 00:00:00Z would
+// reject, for its entire last day, a token GitHub still accepts.
+//
 // An unparseable or absent expiry is not an expiry: signet declines to guess a
 // lifetime for a credential whose recorded one it cannot read.
 func expiredOn(expiresAt string) (bool, string) {
@@ -105,7 +136,7 @@ func expiredOn(expiresAt string) (bool, string) {
 	if err != nil {
 		return false, ""
 	}
-	if time.Now().Before(t) {
+	if time.Now().Before(t.AddDate(0, 0, 1)) {
 		return false, ""
 	}
 	return true, t.Format("2006-01-02")
