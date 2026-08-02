@@ -1397,5 +1397,5 @@ func runServe() error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return api.Serve(ctx, a.cfg.Addr, srv)
+	return api.Serve(ctx, a.cfg.Addrs, srv)
 }
