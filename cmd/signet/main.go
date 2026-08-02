@@ -283,8 +283,8 @@ func runSet(args []string) error {
 	return nil
 }
 
-// warnUndelivered reports a value that landed in the vault but that no file
-// target lists, so `render` will not write it anywhere.
+// warnUndelivered reports a value that landed in the vault but that nothing
+// delivers, so no destination will ever receive it.
 //
 // "the vault has it" and "render writes it" are separate facts: set records the
 // value, and only import or `target add-key` records that a file wants it.
@@ -292,12 +292,24 @@ func runSet(args []string) error {
 // happens to run `render --check` — which is how a key can be fully present in
 // signet and still be missing from the file it was set for.
 //
-// It stays quiet when the lookup fails: the value is already written, and a
+// A secret with a gh-actions target is delivered, just not to a file, so it is
+// not warned about: telling someone to add-key a repo credential into an env
+// file would talk them into writing a secret somewhere it was never meant to go.
+//
+// It stays quiet when a lookup fails: the value is already written, and a
 // warning that could not be computed is not worth failing a successful set over.
 func warnUndelivered(a *app, project, name string) {
 	targets, err := a.st.FileTargetsForProject(project)
 	if err != nil || len(targets) == 0 {
 		return // no rendered file for this project — nothing to be wrong about
+	}
+	sec, err := a.st.GetSecret(project, name)
+	if err != nil || sec == nil {
+		return
+	}
+	gh, err := a.st.TargetsForSecret(sec.ID)
+	if err != nil || len(gh) > 0 {
+		return // delivered somewhere, so silence is the honest answer
 	}
 	var paths []string
 	for _, t := range targets {
@@ -381,9 +393,6 @@ func runRender(args []string) error {
 	if *project == "" {
 		return fmt.Errorf("usage: signet render --project <p> [--check] [--prune]")
 	}
-	if *check && *prune {
-		return fmt.Errorf("--check reports without writing; --prune only affects a write")
-	}
 	a, err := setup()
 	if err != nil {
 		return err
@@ -408,8 +417,10 @@ func runRender(args []string) error {
 			return err
 		}
 		if *check {
-			drift := syncpkg.CheckFile(cfg.Path, want, cfg.Keys)
-			printDrift(drift)
+			// --check --prune is the dry run for a delete that cannot be undone,
+			// so it is answered rather than rejected: same report, framed as what
+			// --prune would take.
+			printDrift(syncpkg.CheckFile(cfg.Path, want, cfg.Keys), *prune)
 			continue
 		}
 		var pairs []envfile.Pair
@@ -484,14 +495,21 @@ func (a *app) projectValues(project string) (map[string]string, error) {
 	return want, nil
 }
 
-func printDrift(d syncpkg.FileDrift) {
-	if d.MissingFile {
+// printDrift reports one file target's state. With prune set the report is the
+// dry run for `render --prune`, so the unmanaged keys are framed as what that
+// write would delete rather than what an ordinary one would keep.
+func printDrift(d syncpkg.FileDrift, prune bool) {
+	switch {
+	case d.MissingFile:
 		fmt.Printf("%s: MISSING FILE\n", d.Path)
 		return
-	}
-	if d.Clean() {
+	case d.Unreadable != "":
+		fmt.Printf("%s: UNREADABLE — render will refuse this file rather than overwrite it\n", d.Path)
+		fmt.Printf("  %s\n", d.Unreadable)
+		return
+	case d.Clean():
 		fmt.Printf("%s: in sync (%d keys)\n", d.Path, len(d.Keys))
-	} else {
+	default:
 		fmt.Printf("%s: DRIFT\n", d.Path)
 		for _, k := range d.Keys {
 			if k.State != "ok" {
@@ -500,10 +518,28 @@ func printDrift(d syncpkg.FileDrift) {
 		}
 	}
 	if len(d.Unmanaged) > 0 {
+		if prune {
+			fmt.Printf("  --prune WOULD DELETE these keys, which signet has no copy of: %s\n", strings.Join(d.Unmanaged, ", "))
+			return
+		}
 		fmt.Printf("  unmanaged keys in file (kept on render, --prune deletes them): %s\n", strings.Join(d.Unmanaged, ", "))
 	}
 }
 
+// atomicWrite replaces path's contents via a temp file in the same directory and
+// a rename.
+//
+// mode applies to a file being created. An existing file keeps the mode and
+// ownership it already has: those are as much a deliberate part of a
+// hand-maintained file as its contents, and the recorded mode is not a
+// considered alternative — import hardcodes 0600 for every target it registers,
+// so honouring it here would silently revert a 0640 set for a service group
+// every time the file was rendered.
+//
+// Ownership is restored best-effort, and only where the caller has the privilege
+// to restore it. A rename replaces a file the caller could never have opened for
+// writing, so an unprivileged render of a service-owned file would otherwise take
+// it over quietly; when the chown is refused, so is the write.
 func atomicWrite(path, content, mode string) error {
 	perm := os.FileMode(0o600)
 	if mode != "" {
@@ -511,6 +547,11 @@ func atomicWrite(path, content, mode string) error {
 		if _, err := fmt.Sscanf(mode, "%o", &parsed); err == nil {
 			perm = os.FileMode(parsed)
 		}
+	}
+	var owner *syscall.Stat_t
+	if st, err := os.Stat(path); err == nil {
+		perm = st.Mode().Perm()
+		owner, _ = st.Sys().(*syscall.Stat_t)
 	}
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".signet-*")
@@ -527,10 +568,32 @@ func atomicWrite(path, content, mode string) error {
 		tmp.Close()
 		return err
 	}
+	if owner != nil && (int(owner.Uid) != os.Getuid() || int(owner.Gid) != os.Getgid()) {
+		if err := tmp.Chown(int(owner.Uid), int(owner.Gid)); err != nil {
+			tmp.Close()
+			return fmt.Errorf("%s belongs to uid %d:%d and this cannot be preserved: %w", path, owner.Uid, owner.Gid, err)
+		}
+	}
+	// The content has to be on the disk before the rename publishes it, and the
+	// rename has to be on the disk before this returns. Without both, a crash can
+	// leave a file that exists and is empty — which for these files means the
+	// unmanaged credentials in them are gone, with no copy anywhere.
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmpName, path)
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // ---- target -----------------------------------------------------------------
@@ -586,6 +649,16 @@ func runTargetAddKey(args []string) error {
 	if len(names) == 0 {
 		return fmt.Errorf("%s", targetUsage)
 	}
+	// Normalized the way import records it. A relative --path would match no
+	// target, and the "import it first" error that follows would send the
+	// operator to the one command that *does* normalize — which would match,
+	// re-import the file's on-disk values over the vault's, and undo whatever
+	// they had just set. Sending someone into a data-loss path over a leading
+	// "./" is precisely the failure this command was added to remove.
+	abs, err := filepath.Abs(*path)
+	if err != nil {
+		return err
+	}
 
 	a, err := setup()
 	if err != nil {
@@ -606,40 +679,55 @@ func runTargetAddKey(args []string) error {
 		}
 	}
 
-	var keys int
-	if _, err := a.st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
+	// The key count and the outcome are what the transaction decided, so they
+	// come back through MutateValue rather than a captured variable: a value
+	// assigned inside a transaction that then rolls back has no claim to be read.
+	res, _, err := store.MutateValue(a.st, func(m *store.Mutation) (addKeyResult, store.AuditRecord, error) {
 		// Looked up inside the transaction that writes: UpsertFileTarget creates
 		// a target when it finds no match, and this command widens an existing
 		// one. Checking outside would leave a window where a `target rm` between
 		// the two turns "add a key" into "attach a new file".
-		existing, err := m.FindFileTarget(*project, *path)
+		existing, err := m.FindFileTarget(*project, abs)
 		if err != nil {
-			return store.AuditRecord{}, err
+			return addKeyResult{}, store.AuditRecord{}, err
 		}
 		if existing == nil {
-			return store.AuditRecord{}, fmt.Errorf("no file target %s in project %s — `signet import` it first", *path, *project)
+			return addKeyResult{}, store.AuditRecord{}, fmt.Errorf("no file target %s in project %s — `signet import` it first", abs, *project)
 		}
-		t, outcome, err := m.UpsertFileTarget(*project, *path, names, "")
+		t, outcome, err := m.UpsertFileTarget(*project, abs, names, "")
 		if err != nil {
-			return store.AuditRecord{}, err
+			return addKeyResult{}, store.AuditRecord{}, err
 		}
 		cfg, err := t.FileConfig()
 		if err != nil {
-			return store.AuditRecord{}, err
+			return addKeyResult{}, store.AuditRecord{}, err
 		}
-		keys = len(cfg.Keys)
-		return store.AuditRecord{
+		res := addKeyResult{keys: len(cfg.Keys), outcome: outcome}
+		return res, store.AuditRecord{
 			Actor: cliActor(), Action: "target.file", TargetID: t.ID,
-			Details:   fmt.Sprintf("%s → %s +%s (%d keys)", *project, *path, strings.Join(names, ", "), keys),
+			Details:   fmt.Sprintf("%s → %s +%s (%d keys)", *project, abs, strings.Join(names, ", "), res.keys),
 			EventKind: store.KindTargetConfig, ActorRole: store.RoleHuman,
 			Status: &store.AuditStatus{Outcome: outcome},
 		}, nil
-	}); err != nil {
+	})
+	if err != nil {
 		return err
 	}
-	fmt.Printf("target updated: %s → %s now manages %d keys\n", *project, *path, keys)
+	// An upsert that changed nothing is not an update, and telling someone to go
+	// render would imply a pending change that does not exist.
+	if res.outcome == store.OutcomeUnchanged {
+		fmt.Printf("target unchanged: %s → %s already manages %s\n", *project, abs, strings.Join(names, ", "))
+		return nil
+	}
+	fmt.Printf("target updated: %s → %s now manages %d keys\n", *project, abs, res.keys)
 	fmt.Printf("run `signet render --project %s` to write them\n", *project)
 	return nil
+}
+
+// addKeyResult is what runTargetAddKey's transaction reports back to its caller.
+type addKeyResult struct {
+	keys    int
+	outcome store.Outcome
 }
 
 func runTargetAdd(args []string) error {
@@ -839,6 +927,9 @@ func fileState(d syncpkg.FileDrift, key string) string {
 	if d.MissingFile {
 		return "missing"
 	}
+	if d.Unreadable != "" {
+		return "unreadable"
+	}
 	for _, ks := range d.Keys {
 		if key != "" && ks.Key != key {
 			continue
@@ -882,12 +973,18 @@ func runTargetRm(args []string) error {
 	defer a.close()
 
 	if fileMode {
-		t, err := a.st.FindFileTarget(*project, *path)
+		// Normalized like import's, so the path that registered the target is
+		// the path that can detach it — see runTargetAddKey.
+		abs, err := filepath.Abs(*path)
+		if err != nil {
+			return err
+		}
+		t, err := a.st.FindFileTarget(*project, abs)
 		if err != nil {
 			return err
 		}
 		if t == nil {
-			return fmt.Errorf("no file target %s in project %s", *path, *project)
+			return fmt.Errorf("no file target %s in project %s", abs, *project)
 		}
 		cfg, err := t.FileConfig()
 		if err != nil {
@@ -1105,17 +1202,10 @@ func runStatus(args []string) error {
 			if !contains(fi.cfg.Keys, sec.Name) {
 				continue
 			}
-			state := "in sync"
-			if fi.drift.MissingFile {
-				state = "missing"
-			} else {
-				for _, ks := range fi.drift.Keys {
-					if ks.Key == sec.Name && ks.State != "ok" {
-						state = ks.State
-					}
-				}
-			}
-			tgt = append(tgt, fmt.Sprintf("file:%s [%s]", fi.cfg.Path, state))
+			// Shared with `target list` rather than recomputed: this had its own
+			// copy of the reduction, which meant a state added to FileDrift was
+			// reported by one view and silently read as "in sync" by the other.
+			tgt = append(tgt, fmt.Sprintf("file:%s [%s]", fi.cfg.Path, fileState(fi.drift, sec.Name)))
 		}
 		if len(tgt) == 0 {
 			tgt = []string{"-"}

@@ -43,9 +43,18 @@ is *already* in trouble. Two consequences worth knowing:
 
 - A key present in the file but not on the target is **kept**, and both `render`
   and `render --check` name it. `--prune` deletes those keys instead, listing
-  each one on the terminal and in the audit entry.
+  each one on the terminal and in the audit entry; `render --check --prune` is
+  the dry run for it.
 - A file that exists but does not parse is an error, not a rewrite. Signet will
-  not overwrite content it could not read.
+  not overwrite content it could not read, and `--check`, `target list` and
+  `status` all report that file as `unreadable` rather than as drift, since
+  render is not going to fix it.
+- An existing file keeps the mode and ownership it already has; the recorded
+  mode applies to a file signet is creating. A `.env` deliberately set to 0640
+  for a service group stays that way.
+- Multi-line values (PEM keys) are written as literal blocks, not collapsed to
+  backslash-escaped single lines, so a rotation does not change a file's format
+  out from under `source .env` or compose's `env_file`.
 
 **Being in the vault and being rendered are different states.** `set` stores a
 value; only `import` or `target add-key` records that a file *wants* it. `set`

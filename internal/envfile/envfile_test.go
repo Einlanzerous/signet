@@ -1,6 +1,8 @@
 package envfile
 
 import (
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -205,9 +207,9 @@ DD_SITE=datadoghq.com
 # Semaphore UI
 export SEMAPHORE_ADMIN=rotated-admin
 UNMANAGED_TOKEN=hand-added-value
+NEW_KEY=appended
 
 # trailing note
-NEW_KEY=appended
 `
 	if content != want {
 		t.Fatalf("merge mismatch:\n got:\n%s\nwant:\n%s", content, want)
@@ -345,6 +347,122 @@ export AFTER=sentinel
 	}
 	if m["AFTER"] != "sentinel" || m["indented"] != "spaced out" {
 		t.Fatalf("neighbouring entries disturbed by the edit: %#v", m)
+	}
+}
+
+// TestSetKeepsNewKeysWithTheEntries: a key appended past the end lands under
+// whatever trailing comment happens to be last, which reads as a claim about the
+// key that signet has no basis for.
+func TestSetKeepsNewKeysWithTheEntries(t *testing.T) {
+	doc, err := ParseDocument(strings.NewReader("A=1\nB=2\n\n# a note about something else\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc.Set("C", "3")
+	want := "A=1\nB=2\nC=3\n\n# a note about something else\n"
+	if got := doc.String(); got != want {
+		t.Fatalf("new key filed under the trailing comment:\n got:\n%s\nwant:\n%s", got, want)
+	}
+	// With no entries to sit beside there is nowhere better than the end.
+	doc, err = ParseDocument(strings.NewReader("# just a note\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc.Set("A", "1")
+	if got := doc.String(); got != "# just a note\nA=1\n" {
+		t.Fatalf("comments-only document:\n%s", got)
+	}
+}
+
+// TestMultilineValuesStayMultiline: collapsing a PEM to a backslash-escaped line
+// is a format change on the values whose format is load bearing. Signet's parser
+// reads "\n" back; `source .env` and compose's env_file do not.
+func TestMultilineValuesStayMultiline(t *testing.T) {
+	pem := "-----BEGIN CERTIFICATE-----\nbody-line-one\nbody-line-two\n-----END CERTIFICATE-----"
+	doc, err := ParseDocument(strings.NewReader("KEY=\"" + pem + "\"\nAFTER=sentinel\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotated := strings.Replace(pem, "body-line-one", "body-rotated", 1)
+	doc.Set("KEY", rotated)
+	out := doc.String()
+	if strings.Contains(out, `\n`) {
+		t.Fatalf("rotation collapsed the block to an escaped line:\n%s", out)
+	}
+	if !strings.Contains(out, "\nbody-rotated\n") {
+		t.Fatalf("rotated value is not a literal block:\n%s", out)
+	}
+	back, err := Parse(strings.NewReader(out))
+	if err != nil {
+		t.Fatalf("re-parse: %v\n%s", err, out)
+	}
+	if m := Map(back); m["KEY"] != rotated || m["AFTER"] != "sentinel" {
+		t.Fatalf("block did not round-trip: %#v", m)
+	}
+	// The canonical path writes the same shape, so a file recovered from scratch
+	// is readable by the same consumers as one that was merged into.
+	if strings.Contains(Render([]Pair{{"KEY", pem}}), `\n`) {
+		t.Fatal("canonical render still collapses multi-line values")
+	}
+	// A value that cannot survive as a literal block — an embedded quote, a
+	// line with meaningful leading space — falls back rather than corrupting.
+	for _, v := range []string{"a\nsay \"hi\"", "a\n  indented", "a\nb\\c"} {
+		if blockSafe(v) {
+			t.Fatalf("blockSafe accepted a value it cannot round-trip: %q", v)
+		}
+		round, err := Parse(strings.NewReader("K=" + maybeQuote(v) + "\n"))
+		if err != nil {
+			t.Fatalf("fallback did not parse for %q: %v", v, err)
+		}
+		if got := Map(round)["K"]; got != v {
+			t.Fatalf("fallback lossy for %q: got %q", v, got)
+		}
+	}
+}
+
+// TestRefreshHeaderRequiresAnExactMatch: a prefix match would let the one
+// function whose job is not destroying hand-written lines destroy one.
+func TestRefreshHeaderRequiresAnExactMatch(t *testing.T) {
+	mine := "# managed by signet and by the deploy script — see the runbook before editing"
+	content, _, err := RenderInto(writeTemp(t, mine+"\nDD_SITE=datadoghq.com\n"),
+		[]Pair{{"DD_SITE", "datadoghq.com"}}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(content, mine+"\n") {
+		t.Fatalf("hand-written line starting with the header words was overwritten:\n%s", content)
+	}
+}
+
+// TestRenderIntoEmptyFile: an empty file has no more shape to preserve than a
+// missing one, and the two recovery paths should not diverge.
+func TestRenderIntoEmptyFile(t *testing.T) {
+	for name, body := range map[string]string{"zero bytes": "", "blank lines": "\n\n  \n"} {
+		content, unmanaged, err := RenderInto(writeTemp(t, body), managed, false)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if content != Render(managed) {
+			t.Fatalf("%s: expected the canonical render, got:\n%s", name, content)
+		}
+		if unmanaged != nil {
+			t.Fatalf("%s: unexpected unmanaged keys %v", name, unmanaged)
+		}
+	}
+}
+
+// TestRenderIntoMissingFileUnwraps pins the branch that stands between a live
+// file and a canonical rewrite of it: it must not depend on the not-exist error
+// arriving unwrapped from wherever it was raised.
+func TestRenderIntoMissingFileUnwraps(t *testing.T) {
+	_, err := ParseDocumentFile(filepath.Join(t.TempDir(), "absent.env"))
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("a missing file must report as fs.ErrNotExist through errors.Is, got %#v", err)
+	}
+	// A parse failure must not be mistaken for one, or an unreadable file would
+	// be silently replaced by the canonical render instead of refused.
+	if _, err := ParseDocumentFile(writeTemp(t, "not a pair\n")); errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("parse failure reported as not-exist: %v", err)
 	}
 }
 

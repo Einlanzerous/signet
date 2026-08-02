@@ -21,8 +21,10 @@ package envfile
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"sort"
 	"strings"
@@ -37,11 +39,15 @@ type Pair struct {
 // Header is the first line of every env file signet creates.
 const Header = "# managed by signet — managed values are overwritten on render; other lines are kept"
 
-// headerPrefix identifies a signet header already in a file, whatever wording it
-// was written with. The line states a promise about what render does to the
-// file, so when the promise changes the stale line has to be replaced rather
-// than left standing — see Document.refreshHeader.
-const headerPrefix = "# managed by signet"
+// priorHeaders is every header signet has ever written, current one first. The
+// line states a promise about what render does to the file, so when the promise
+// changes the stale line is replaced rather than left standing — but only when it
+// is one of these exactly, so a hand-written line is never mistaken for one.
+// Changing Header means adding the old text here, not editing it.
+var priorHeaders = []string{
+	Header,
+	"# managed by signet — do not edit by hand",
+}
 
 // Document is a parsed env file with its original shape intact: every comment,
 // blank line and entry in source order, each entry remembering the exact text it
@@ -236,8 +242,33 @@ func (d *Document) Set(key, value string) {
 		d.nodes[i].edited = true
 	}
 	if !found {
-		d.nodes = append(d.nodes, node{head: key + "=", key: key, value: value, edited: true})
+		d.insertEntry(node{head: key + "=", key: key, value: value, edited: true})
 	}
+}
+
+// insertEntry places a new entry directly after the last one in the document
+// rather than at the end of the file. Appending past the end files the key under
+// whatever trailing comment happens to be last, which reads as a claim about the
+// key that signet has no basis for. Landing among the other entries says nothing
+// it cannot support.
+func (d *Document) insertEntry(n node) {
+	last := -1
+	for i := range d.nodes {
+		if d.nodes[i].key != "" {
+			last = i
+		}
+	}
+	if last == len(d.nodes)-1 { // includes the no-entries case (-1 == len-1 only when empty)
+		d.nodes = append(d.nodes, n)
+		return
+	}
+	if last < 0 {
+		d.nodes = append(d.nodes, n) // comments only: nothing to sit beside
+		return
+	}
+	d.nodes = append(d.nodes, node{})
+	copy(d.nodes[last+2:], d.nodes[last+1:])
+	d.nodes[last+1] = n
 }
 
 // Remove deletes every entry for key, reporting whether it removed anything.
@@ -257,8 +288,12 @@ func (d *Document) Remove(key string) bool {
 }
 
 // String renders the document back to file content. Untouched nodes are written
-// from their original text, so anything signet did not edit comes out exactly as
-// it went in.
+// from their original text, so anything signet did not edit comes back as it was
+// read, with two normalizations that come from reading the file by line: lines
+// are terminated with "\n" (a CRLF file is rewritten LF), and the last line
+// always gets a terminator whether or not it had one. Every env file on this
+// host is already LF-terminated, so in practice a file that is not edited is
+// reproduced byte for byte.
 func (d *Document) String() string {
 	var b strings.Builder
 	for _, n := range d.nodes {
@@ -276,19 +311,41 @@ func (d *Document) String() string {
 // refreshHeader replaces a signet header carrying older wording, so a file does
 // not go on making a promise about render that render no longer keeps. A file
 // without one does not get one: render adds no lines to a file it did not write.
+//
+// The match is against the exact text of a header signet has written, never a
+// prefix. A hand-written line that merely opens with the same words is someone's
+// own sentence, and overwriting it is the precise thing this whole change exists
+// to stop — a loose match here would make the one function whose job is not
+// destroying hand-written lines the one that destroys them.
 func (d *Document) refreshHeader() {
 	for i := range d.nodes {
 		if d.nodes[i].key != "" {
 			return // an entry came first; there is no header to refresh
 		}
-		if strings.TrimSpace(d.nodes[i].raw) == "" {
+		line := strings.TrimSpace(d.nodes[i].raw)
+		if line == "" {
 			continue // leading blank lines
 		}
-		if strings.HasPrefix(strings.TrimSpace(d.nodes[i].raw), headerPrefix) {
-			d.nodes[i].raw = Header
+		for _, known := range priorHeaders {
+			if line == known {
+				d.nodes[i].raw = Header
+				break
+			}
 		}
 		return // only the first non-blank line can be the header
 	}
+}
+
+// isEmpty reports whether the document holds nothing worth preserving — no
+// entries and no comments. A file like that is shape signet would be pretending
+// to find, so it is rendered as if it were not there at all.
+func (d *Document) isEmpty() bool {
+	for _, n := range d.nodes {
+		if n.key != "" || strings.TrimSpace(n.raw) != "" {
+			return false
+		}
+	}
+	return true
 }
 
 // Map converts pairs to a lookup map.
@@ -305,18 +362,26 @@ func Map(pairs []Pair) map[string]string {
 // pairs does not name — carried through into the content, or dropped from it and
 // listed for the caller to report when prune is set.
 //
-// A missing file is rendered canonically; there is no shape to preserve, and
-// this is the disaster-recovery case render exists for. A file that is present
-// but unparseable is an error rather than a rewrite: the content cannot be read,
-// so it cannot be merged into, and overwriting it would destroy the very thing
-// the parse failure says signet does not understand.
+// A file that is missing, or present but holding nothing to preserve, is
+// rendered canonically; there is no shape to keep, and this is the
+// disaster-recovery case render exists for. A file that is present but
+// unparseable is an error rather than a rewrite: the content cannot be read, so
+// it cannot be merged into, and overwriting it would destroy the very thing the
+// parse failure says signet does not understand.
+//
+// The not-exist test unwraps. It is the single branch standing between a live
+// file and a canonical rewrite of it, so it does not rest on an error happening
+// to arrive unwrapped from wherever it was raised.
 func RenderInto(path string, pairs []Pair, prune bool) (content string, unmanaged []string, err error) {
 	doc, err := ParseDocumentFile(path)
-	if os.IsNotExist(err) {
+	if errors.Is(err, fs.ErrNotExist) {
 		return Render(pairs), nil, nil
 	}
 	if err != nil {
 		return "", nil, err
+	}
+	if doc.isEmpty() {
+		return Render(pairs), nil, nil
 	}
 	managed := make(map[string]bool, len(pairs))
 	for _, p := range pairs {
@@ -442,6 +507,35 @@ func maybeQuote(v string) string {
 	if !needsQuote(v) {
 		return v
 	}
+	// A value that arrived as a block of real lines — a PEM key is the case that
+	// matters — is written back as one. Collapsing it to a backslash-escaped
+	// single line is a format change on exactly the values whose format is load
+	// bearing: signet's own parser reads "\n" back, but `source .env` and
+	// compose's env_file hand the consumer a literal backslash and an n, so a
+	// rotation would break a key that was working before it.
+	if blockSafe(v) {
+		return "\"" + v + "\""
+	}
 	r := strings.NewReplacer("\\", "\\\\", "\"", "\\\"", "\n", "\\n", "\t", "\\t")
 	return "\"" + r.Replace(v) + "\""
+}
+
+// blockSafe reports whether v can be written as a literal multi-line block that
+// Parse reads back byte for byte.
+//
+// It needs no escaping (no quote to close the block early, no backslash to be
+// read as one), and no line may carry leading or trailing whitespace, since
+// accumulation trims each continuation line and would not give it back. PEM
+// bodies satisfy all of this; anything that does not falls back to the escaped
+// single line, which is uglier but never lossy.
+func blockSafe(v string) bool {
+	if !strings.Contains(v, "\n") || strings.ContainsAny(v, "\"\\") {
+		return false
+	}
+	for _, line := range strings.Split(v, "\n") {
+		if strings.TrimSpace(line) != line {
+			return false
+		}
+	}
+	return true
 }
