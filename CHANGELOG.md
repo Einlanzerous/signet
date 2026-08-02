@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.4.0](https://github.com/Einlanzerous/signet/compare/v1.3.0...v1.4.0) (2026-08-02)
+
+
+### Features
+
+* **sync:** fall back to the vault's SIGNET_PAT (SGNT-16) ([#15](https://github.com/Einlanzerous/signet/issues/15)) ([0d2eae1](https://github.com/Einlanzerous/signet/commit/0d2eae124b84b5c43de80bc06d37850fc34e12ee))
+
+
+### Bug Fixes
+
+* **render:** merge into env files instead of rewriting them (SGNT-15) ([#13](https://github.com/Einlanzerous/signet/issues/13)) ([e8c212d](https://github.com/Einlanzerous/signet/commit/e8c212db737b93a83850b62f94472918a810ce44))
+
 ## [1.3.0](https://github.com/Einlanzerous/signet/compare/v1.2.0...v1.3.0) (2026-08-01)
 
 
