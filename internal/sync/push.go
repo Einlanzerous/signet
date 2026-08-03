@@ -18,6 +18,11 @@ type PushResult struct {
 	State    string `json:"state"` // in sync | error
 	Note     string `json:"note,omitempty"`
 	Err      string `json:"error,omitempty"`
+	// Hint is the fix for a failure signet could attribute to a cause — a
+	// repository missing from the PAT's grant list, most often. It accompanies
+	// Err rather than replacing it: the ledger keeps the transport detail, and
+	// the operator gets the sentence that names the next action.
+	Hint string `json:"hint,omitempty"`
 	// AuditErr reports a push that happened but could not be written to the
 	// ledger. It is surfaced rather than swallowed: an unrecorded mutation of a
 	// live destination is precisely what this vault must never do quietly.
@@ -101,6 +106,7 @@ func PushSecret(ctx context.Context, st *store.Store, key []byte, gh *GHClient, 
 		if err != nil {
 			res.State = "error"
 			res.Err = err.Error()
+			res.Hint = AccessHint(cfg.Repo, err)
 			status.Outcome = store.OutcomeFailed
 			recordPush(st, &res, store.AuditRecord{
 				Actor: actor, Action: "sync.push.failed", SecretID: sec.ID, TargetID: t.ID,

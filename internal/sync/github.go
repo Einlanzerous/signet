@@ -23,8 +23,57 @@ import (
 	"golang.org/x/crypto/nacl/box"
 )
 
-// ErrNotFound reports a 404 from the GitHub API (repo or secret absent).
-var ErrNotFound = errors.New("not found")
+// Sentinels for the GitHub API failures signet can attribute to a cause. They
+// exist so a caller can tell "this credential was never granted the repo" apart
+// from "GitHub is unhappy for some other reason" without matching on the
+// response body, which is prose GitHub is free to reword.
+var (
+	// ErrNotFound reports a 404 from the GitHub API (repo or secret absent).
+	ErrNotFound = errors.New("not found")
+	// ErrUnauthorized reports a 401: the credential itself was rejected.
+	ErrUnauthorized = errors.New("unauthorized")
+	// ErrForbidden reports a 403 that is about what the credential may reach
+	// rather than how often it asks. With a fine-grained PAT this is nearly
+	// always a repository missing from the token's grant list.
+	ErrForbidden = errors.New("forbidden")
+	// ErrRateLimited reports a throttled request, which is a 403 as often as it
+	// is a 429 and must not be read as a missing grant.
+	ErrRateLimited = errors.New("rate limited")
+)
+
+// apiError is a non-2xx GitHub response: the full transport detail, which is
+// what the ledger records, wrapped around the sentinel that classifies it.
+// Error() is unchanged from the bare message so nothing loses the status line
+// or the body, and errors.Is still reaches the cause.
+type apiError struct {
+	kind error // sentinel, nil when the status maps to no particular cause
+	msg  string
+}
+
+func (e *apiError) Error() string { return e.msg }
+func (e *apiError) Unwrap() error { return e.kind }
+
+// classifyStatus maps a failing response to its cause, or nil when the status
+// says nothing specific.
+//
+// A throttled request is separated from a denied one by headers alone: GitHub
+// answers secondary rate limits with 403 and the same "Forbidden" status line a
+// missing repository grant gets, so reading the status code by itself would
+// send an operator off to edit a PAT that is in fact correct.
+func classifyStatus(resp *http.Response) error {
+	switch resp.StatusCode {
+	case http.StatusUnauthorized:
+		return ErrUnauthorized
+	case http.StatusTooManyRequests:
+		return ErrRateLimited
+	case http.StatusForbidden:
+		if resp.Header.Get("X-RateLimit-Remaining") == "0" || resp.Header.Get("Retry-After") != "" {
+			return ErrRateLimited
+		}
+		return ErrForbidden
+	}
+	return nil
+}
 
 // GHClient is a minimal GitHub REST client for Actions repo secrets.
 type GHClient struct {
@@ -91,7 +140,10 @@ func (c *GHClient) do(ctx context.Context, method, path string, body []byte, out
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return stat, fmt.Errorf("%s %s: %s: %s", method, path, resp.Status, strings.TrimSpace(string(msg)))
+		return stat, &apiError{
+			kind: classifyStatus(resp),
+			msg:  fmt.Sprintf("%s %s: %s: %s", method, path, resp.Status, strings.TrimSpace(string(msg))),
+		}
 	}
 	if out != nil {
 		return stat, json.NewDecoder(resp.Body).Decode(out)

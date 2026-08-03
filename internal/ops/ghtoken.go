@@ -45,6 +45,21 @@ const (
 	TokenFromVault TokenSource = "vault"
 )
 
+// TokenPurpose is what a resolved credential is about to be used for, written
+// into the ledger entry the vault fallback appends. The root PAT is read for
+// more than one reason now — a push, and the preflight that checks a repo is
+// even reachable — and an audit of that credential is worth less if every read
+// claims to have been a sync.
+type TokenPurpose string
+
+const (
+	// PurposeSync is authenticating a push to GitHub Actions.
+	PurposeSync TokenPurpose = "authenticate GitHub Actions sync"
+	// PurposePreflight is checking whether the PAT can reach a repository's
+	// Actions secrets at all. No secret material leaves the vault for it.
+	PurposePreflight TokenPurpose = "preflight a repository's Actions Secrets access"
+)
+
 // GHToken is a resolved GitHub credential and where it came from.
 type GHToken struct {
 	Value  string
@@ -65,6 +80,12 @@ type GHToken struct {
 // resolve: a root credential read that nothing recorded is exactly what this
 // vault exists to prevent.
 func ResolveGHToken(st *store.Store, key []byte, envToken, actor string, role store.ActorRole) (GHToken, error) {
+	return ResolveGHTokenFor(st, key, envToken, actor, role, PurposeSync)
+}
+
+// ResolveGHTokenFor is ResolveGHToken with the ledger entry's stated purpose
+// named by the caller, for reads that are not a push.
+func ResolveGHTokenFor(st *store.Store, key []byte, envToken, actor string, role store.ActorRole, purpose TokenPurpose) (GHToken, error) {
 	if envToken != "" {
 		return GHToken{Value: envToken, Source: TokenFromEnv}, nil
 	}
@@ -109,8 +130,8 @@ func ResolveGHToken(st *store.Store, key []byte, envToken, actor string, role st
 	}
 	if _, err := st.AppendAudit(store.AuditRecord{
 		Actor: actor, Action: ActionSecretRead, SecretID: sec.ID,
-		Details: fmt.Sprintf("read %s version %d #%s to authenticate GitHub Actions sync (SIGNET_GITHUB_TOKEN unset)",
-			ref, cur.VersionNo, cur.VHash),
+		Details: fmt.Sprintf("read %s version %d #%s to %s (SIGNET_GITHUB_TOKEN unset)",
+			ref, cur.VersionNo, cur.VHash, purpose),
 		EventKind: store.KindSecretReveal, ActorRole: role,
 		Status: &store.AuditStatus{Outcome: store.OutcomeDelivered},
 	}); err != nil {

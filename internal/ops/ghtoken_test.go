@@ -119,6 +119,43 @@ func TestResolveGHTokenFallsBackToVault(t *testing.T) {
 	}
 }
 
+// The root credential is read for more than one reason now. An audit of it is
+// worth less if a preflight is recorded as a push, so the entry states which
+// it was.
+func TestResolveGHTokenRecordsItsPurpose(t *testing.T) {
+	st, key := newVault(t)
+	putSecret(t, st, key, GHTokenProject, GHTokenName, "ghp_vaulted", "")
+
+	if _, err := ResolveGHTokenFor(st, key, "", "cli:test", store.RoleHuman, PurposePreflight); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := st.ListAudit(1, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("want 1 newest entry, got %d", len(entries))
+	}
+	if !strings.Contains(entries[0].Details, string(PurposePreflight)) {
+		t.Fatalf("entry does not state the preflight purpose: %q", entries[0].Details)
+	}
+	if strings.Contains(entries[0].Details, string(PurposeSync)) {
+		t.Fatalf("preflight recorded as a sync: %q", entries[0].Details)
+	}
+
+	// The default path still says what it always said.
+	if _, err := ResolveGHToken(st, key, "", "cli:test", store.RoleHuman); err != nil {
+		t.Fatal(err)
+	}
+	entries, err = st.ListAudit(1, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(entries[0].Details, string(PurposeSync)) {
+		t.Fatalf("sync read does not state its purpose: %q", entries[0].Details)
+	}
+}
+
 func TestResolveGHTokenExpired(t *testing.T) {
 	st, key := newVault(t)
 	// Midnight UTC of yesterday, stored the way `set --expires` stores a date.

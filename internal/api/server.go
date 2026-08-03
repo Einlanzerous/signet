@@ -573,10 +573,24 @@ func (s *Server) handleCommandAddTarget(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"added":  true,
 		"target": TargetView{Kind: t.Kind, Repo: req.Repo, SecretName: dest, State: "never"},
-	})
+	}
+	// Same preflight the CLI runs, for the same reason: the mirror can attach a
+	// destination the root PAT was never granted, and without this the mistake
+	// only surfaces at the next sync as a 403 against an unrelated secret. The
+	// target is already added — this is a warning on a success, not a failure.
+	if s.gh != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancel()
+		if access, perr := s.gh.PreflightRepo(ctx, req.Repo); access != syncpkg.AccessOK {
+			if hint := syncpkg.AccessHint(req.Repo, perr); hint != "" {
+				resp["warning"] = hint
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handleCommandRemoveTarget detaches a gh-actions destination from a secret.
