@@ -53,21 +53,39 @@ type apiError struct {
 func (e *apiError) Error() string { return e.msg }
 func (e *apiError) Unwrap() error { return e.kind }
 
+// flatten collapses a response body onto one line. GitHub pretty-prints its
+// error JSON, and this string becomes both a terminal line under a failed push
+// and the Details column of a ledger row — neither of which survives an
+// embedded newline intact. Every token is kept; only the spacing between them
+// is normalized.
+func flatten(body string) string { return strings.Join(strings.Fields(body), " ") }
+
 // classifyStatus maps a failing response to its cause, or nil when the status
 // says nothing specific.
 //
-// A throttled request is separated from a denied one by headers alone: GitHub
-// answers secondary rate limits with 403 and the same "Forbidden" status line a
-// missing repository grant gets, so reading the status code by itself would
-// send an operator off to edit a PAT that is in fact correct.
-func classifyStatus(resp *http.Response) error {
+// A throttled request has to be separated from a denied one, because GitHub
+// answers both with 403 and the same "Forbidden" status line: reading the code
+// alone would send an operator off to edit a PAT that is in fact correct.
+//
+// Headers settle it when they can. They often cannot — a *secondary* rate limit
+// comes back 403 with a non-zero remaining count and frequently no Retry-After,
+// and the only thing distinguishing it is the message. So the body is consulted
+// as a fallback, narrowly: it can only ever downgrade a denial to "inconclusive
+// and worth retrying", never the other way, so GitHub rewording it costs the
+// hint's precision rather than its correctness.
+func classifyStatus(resp *http.Response, body string) error {
 	switch resp.StatusCode {
+	case http.StatusNotFound:
+		return ErrNotFound
 	case http.StatusUnauthorized:
 		return ErrUnauthorized
 	case http.StatusTooManyRequests:
 		return ErrRateLimited
 	case http.StatusForbidden:
 		if resp.Header.Get("X-RateLimit-Remaining") == "0" || resp.Header.Get("Retry-After") != "" {
+			return ErrRateLimited
+		}
+		if lower := strings.ToLower(body); strings.Contains(lower, "rate limit") || strings.Contains(lower, "abuse") {
 			return ErrRateLimited
 		}
 		return ErrForbidden
@@ -135,14 +153,16 @@ func (c *GHClient) do(ctx context.Context, method, path string, body []byte, out
 	}
 	defer resp.Body.Close()
 	stat := CallStat{HTTPStatus: resp.StatusCode, LatencyMS: time.Since(started).Milliseconds(), Measured: true}
-	if resp.StatusCode == http.StatusNotFound {
-		return stat, fmt.Errorf("%s %s: %w", method, path, ErrNotFound)
-	}
+	// Every failing status reads its body, 404 included. The ledger entry for a
+	// failed push is the only durable record of what GitHub actually said, and a
+	// 404 that reports nothing but "not found" leaves an operator with a repo
+	// name and no way to tell a typo from a revoked grant.
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		body := flatten(string(msg))
 		return stat, &apiError{
-			kind: classifyStatus(resp),
-			msg:  fmt.Sprintf("%s %s: %s: %s", method, path, resp.Status, strings.TrimSpace(string(msg))),
+			kind: classifyStatus(resp, body),
+			msg:  strings.TrimSpace(fmt.Sprintf("%s %s: %s: %s", method, path, resp.Status, body)),
 		}
 	}
 	if out != nil {

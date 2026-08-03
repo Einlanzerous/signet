@@ -261,8 +261,9 @@ func TestAddTargetWarnsWhenThePATCannotReachTheRepo(t *testing.T) {
 		t.Fatalf("add-target: %d — %s", rec.Code, rec.Body)
 	}
 	var body struct {
-		Added   bool   `json:"added"`
-		Warning string `json:"warning"`
+		Added     bool   `json:"added"`
+		Warning   string `json:"warning"`
+		Preflight string `json:"preflight"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
@@ -272,6 +273,47 @@ func TestAddTargetWarnsWhenThePATCannotReachTheRepo(t *testing.T) {
 	}
 	if !strings.Contains(body.Warning, "repository list") {
 		t.Fatalf("warning does not name the fix: %q", body.Warning)
+	}
+	if body.Preflight != string(syncpkg.AccessDenied) {
+		t.Fatalf("preflight state = %q, want %q", body.Preflight, syncpkg.AccessDenied)
+	}
+}
+
+// A probe that never completed must not read as one that passed. Without the
+// state on the response the mirror cannot tell "the PAT can reach this repo"
+// from "GitHub did not answer in time", and would show the target as verified
+// on the strength of a request that failed.
+func TestAddTargetReportsAnInconclusivePreflight(t *testing.T) {
+	srv, st, _, _ := testServer(t)
+	seedSecret(t, st, "proj", "TOKEN", true)
+	gh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer gh.Close()
+	srv.gh = syncpkg.NewGHClient("tok")
+	srv.gh.BaseURL = gh.URL
+
+	rec := postCmd(t, srv.Handler(), "/v1/commands/add-target", `{"project":"proj","name":"TOKEN","repo":"acme/widgets"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("add-target: %d — %s", rec.Code, rec.Body)
+	}
+	var body struct {
+		Added     bool   `json:"added"`
+		Warning   string `json:"warning"`
+		Preflight string `json:"preflight"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if !body.Added {
+		t.Fatal("an inconclusive probe must not fail the add")
+	}
+	if body.Preflight != string(syncpkg.AccessUnknown) {
+		t.Fatalf("preflight state = %q, want %q", body.Preflight, syncpkg.AccessUnknown)
+	}
+	// Unattributable, so there is no hint — but the failure still has to surface.
+	if body.Warning == "" {
+		t.Fatal("an inconclusive probe was dropped entirely")
 	}
 }
 

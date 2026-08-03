@@ -116,24 +116,122 @@ func TestPreflightClassifiesAccess(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			c := preflightServer(t, map[string]func(http.ResponseWriter){"o/r": tc.respond})
-			access, err := c.PreflightRepo(context.Background(), "o/r")
-			if access != tc.want {
-				t.Fatalf("access = %q, want %q (err %v)", access, tc.want, err)
+			probe := c.CheckRepoAccess(context.Background(), "o/r")
+			if probe.Access != tc.want {
+				t.Fatalf("access = %q, want %q (err %v)", probe.Access, tc.want, probe.Err)
 			}
-			hint := AccessHint("o/r", err)
-			if tc.wantHint == "" {
-				if hint != "" {
-					t.Fatalf("unattributable failure produced a hint: %q", hint)
+			// Only positive evidence may block: an inconclusive probe that failed
+			// a run would turn a rate limit into a report of a broken grant.
+			wantBlocked := tc.want == AccessDenied || tc.want == AccessMissing || tc.want == AccessRejected
+			if probe.Blocked() != wantBlocked {
+				t.Fatalf("%q blocked = %v, want %v", tc.want, probe.Blocked(), wantBlocked)
+			}
+			// Every failure reaches the operator, hint or no hint. A probe that
+			// failed for a reason signet cannot name is still a failure.
+			if tc.want == AccessOK {
+				if probe.Message() != "" {
+					t.Fatalf("successful probe produced a message: %q", probe.Message())
 				}
 				return
 			}
-			if !strings.Contains(hint, tc.wantHint) {
-				t.Fatalf("hint %q does not mention %q", hint, tc.wantHint)
+			if probe.Message() == "" {
+				t.Fatal("failed probe produced no message at all")
 			}
-			if got := strings.Contains(hint, "o/r"); got != tc.aboutRepo {
-				t.Fatalf("hint %q names the repo = %v, want %v", hint, got, tc.aboutRepo)
+			if tc.wantHint == "" {
+				if probe.Hint != "" {
+					t.Fatalf("unattributable failure produced a hint: %q", probe.Hint)
+				}
+				if probe.Message() != probe.Err.Error() {
+					t.Fatalf("unattributable failure did not fall back to the error: %q", probe.Message())
+				}
+				return
+			}
+			if !strings.Contains(probe.Hint, tc.wantHint) {
+				t.Fatalf("hint %q does not mention %q", probe.Hint, tc.wantHint)
+			}
+			if got := strings.Contains(probe.Hint, "o/r"); got != tc.aboutRepo {
+				t.Fatalf("hint %q names the repo = %v, want %v", probe.Hint, got, tc.aboutRepo)
 			}
 		})
+	}
+}
+
+// GitHub answers a secondary rate limit with 403, a non-zero remaining count,
+// and often no Retry-After — the headers alone cannot tell it from a repo
+// missing from the PAT's grant list, and telling someone to edit a correct PAT
+// is the one outcome this feature exists to prevent.
+func TestSecondaryRateLimitIsNotReadAsAMissingGrant(t *testing.T) {
+	c := preflightServer(t, map[string]func(http.ResponseWriter){
+		"o/r": func(w http.ResponseWriter) {
+			w.Header().Set("X-RateLimit-Remaining", "4998") // nowhere near exhausted
+			w.WriteHeader(http.StatusForbidden)
+			w.Write([]byte(`{"message":"You have exceeded a secondary rate limit. Please wait a few minutes before you try again."}`))
+		},
+	})
+	probe := c.CheckRepoAccess(context.Background(), "o/r")
+	if probe.Access != AccessUnknown {
+		t.Fatalf("secondary rate limit classified as %q", probe.Access)
+	}
+	if probe.Blocked() {
+		t.Fatal("a throttled request must not block the run")
+	}
+	if strings.Contains(probe.Message(), "repository list") {
+		t.Fatalf("throttling reported as a grant problem: %q", probe.Message())
+	}
+}
+
+// A 404 has to carry what GitHub said as much as any other failure: it is the
+// ledger's only durable record, and "not found" alone leaves no way to tell a
+// typo from a revoked grant.
+func TestNotFoundKeepsTheResponse(t *testing.T) {
+	c := preflightServer(t, map[string]func(http.ResponseWriter){
+		"o/r": func(w http.ResponseWriter) {
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte(`{"message":"Not Found","documentation_url":"https://docs.github.com/rest"}`))
+		},
+	})
+	probe := c.CheckRepoAccess(context.Background(), "o/r")
+	if probe.Access != AccessMissing {
+		t.Fatalf("access = %q", probe.Access)
+	}
+	if !strings.Contains(probe.Err.Error(), "404") ||
+		!strings.Contains(probe.Err.Error(), "documentation_url") {
+		t.Fatalf("404 dropped the status line or body: %q", probe.Err)
+	}
+}
+
+// The probe proves the repo is in the grant list, not that the grant includes
+// write: the sealing key needs Secrets:read and the push needs read and write,
+// and GitHub offers no way to test a write without performing one. A pass must
+// therefore not be recorded as proof the push will work.
+func TestReadOnlyGrantPassesButPushStillExplainsItself(t *testing.T) {
+	pub, _, err := box.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /repos/o/r/actions/secrets/public-key", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(PublicKey{KeyID: "k1", Key: base64.StdEncoding.EncodeToString(pub[:])})
+	})
+	mux.HandleFunc("PUT /repos/o/r/actions/secrets/TOKEN", func(w http.ResponseWriter, r *http.Request) {
+		ungrantedRepo(w) // read granted, write not
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	c := NewGHClient("tok")
+	c.BaseURL = srv.URL
+
+	if probe := c.CheckRepoAccess(context.Background(), "o/r"); probe.Access != AccessOK {
+		t.Fatalf("a read-only grant should still pass the read probe, got %q", probe.Access)
+	}
+	// The narrower mistake is not caught by the probe, so the push has to be the
+	// thing that explains it.
+	_, err = c.PutSecret(context.Background(), "o/r", "TOKEN", "c2VhbGVk", "k1")
+	if err == nil {
+		t.Fatal("write to a read-only grant succeeded")
+	}
+	if hint := AccessHint("o/r", err); !strings.Contains(hint, "read and write") {
+		t.Fatalf("push hint does not name the write permission: %q", hint)
 	}
 }
 
@@ -151,7 +249,7 @@ func TestPreflightSendsNoSecretMaterial(t *testing.T) {
 	c := NewGHClient("tok")
 	c.BaseURL = srv.URL
 
-	if _, err := c.PreflightRepo(context.Background(), "o/r"); err == nil {
+	if probe := c.CheckRepoAccess(context.Background(), "o/r"); probe.Err == nil {
 		t.Fatal("403 preflight returned no error")
 	}
 	if len(calls) != 1 || calls[0] != "GET /repos/o/r/actions/secrets/public-key" {

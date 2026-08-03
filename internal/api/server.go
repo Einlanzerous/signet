@@ -495,6 +495,11 @@ func validGHSecretName(name string) bool {
 	return ghSecretRe.MatchString(name) && !strings.HasPrefix(strings.ToUpper(name), "GITHUB_")
 }
 
+// addTargetPreflightTimeout bounds the grant probe on add-target. It is short
+// on purpose: the target row is already committed by the time it runs, so the
+// probe must never be the reason a client gives up on the response.
+const addTargetPreflightTimeout = 5 * time.Second
+
 // errTargetExists carries "this destination is already attached" out of the
 // transaction that discovered it, so the handler can answer 409 rather than
 // letting a conflict read as an internal error.
@@ -581,13 +586,23 @@ func (s *Server) handleCommandAddTarget(w http.ResponseWriter, r *http.Request) 
 	// destination the root PAT was never granted, and without this the mistake
 	// only surfaces at the next sync as a 403 against an unrelated secret. The
 	// target is already added — this is a warning on a success, not a failure.
+	//
+	// The write has already committed, so every millisecond spent here is one in
+	// which a client timeout would lose the confirmation for a target that does
+	// in fact exist. Hence a deadline short enough that the probe cannot be what
+	// makes this request slow: a preflight is worth having, not worth waiting
+	// for, and a probe that misses it reports itself as unknown.
 	if s.gh != nil {
-		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(r.Context(), addTargetPreflightTimeout)
 		defer cancel()
-		if access, perr := s.gh.PreflightRepo(ctx, req.Repo); access != syncpkg.AccessOK {
-			if hint := syncpkg.AccessHint(req.Repo, perr); hint != "" {
-				resp["warning"] = hint
-			}
+		probe := s.gh.CheckRepoAccess(ctx, req.Repo)
+		// Always reported, including "unknown". Sending a warning only when
+		// signet can name a cause would leave the mirror unable to tell a probe
+		// that passed from one that never completed — and it would show a target
+		// as verified on the strength of a request that timed out.
+		resp["preflight"] = string(probe.Access)
+		if msg := probe.Message(); msg != "" {
+			resp["warning"] = msg
 		}
 	}
 	writeJSON(w, http.StatusOK, resp)

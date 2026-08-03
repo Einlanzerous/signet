@@ -136,24 +136,44 @@ reach it. **The target is still added**: attaching a destination and widening
 the PAT are two steps in either order, and the check is skippable with
 `--no-preflight` or when no credential resolves. `sync --check` does the same
 across every destination at once, one probe per repository rather than per
-secret, and exits non-zero if any is unreachable. The mirror's `add-target`
-returns the same message as a `warning` on its success response.
+secret. The mirror's `add-target` reports the same thing as a `preflight` state
+plus a `warning` on its success response.
 
-When a push does fail, the cause is named rather than passed through:
+**What a pass proves, and what it does not.** The sealing key needs fine-grained
+*Secrets: read*; the PUT that delivers a secret needs *read and write*, and
+GitHub offers no way to test a write without performing one. So a repository
+granted read-only passes the probe and still fails at push. That is a narrower
+mistake than the one this catches — a repository never added at all — and its
+403 arrives explained, but the check is not a guarantee the push will work.
+
+Adding many destinations at once is better served by `--no-preflight` followed
+by one `sync --check`: each add otherwise decrypts the root PAT and writes a
+`secret_reveal` entry of its own, and the run-wide check resolves it once.
+
+When a push does fail, the cause leads and the response follows:
 
 ```
-✗ construct-server/ANTHROPIC_API_KEY → Einlanzerous/argosy: the GitHub
-  credential has no Actions Secrets access to Einlanzerous/argosy — add the
-  repository to the fine-grained PAT's repository list with Secrets: read and
-  write, then re-run
+✗ construct-server/ANTHROPIC_API_KEY → Einlanzerous/argosy: the GitHub credential
+  cannot reach Actions Secrets on Einlanzerous/argosy — usually the repository is
+  missing from the fine-grained PAT's repository list (Secrets: read and write);
+  an archived repo, disabled Actions, or an org SAML/IP policy answers the same 403
+  GitHub said: GET /repos/…/actions/secrets/public-key: 403 Forbidden: {"message":…}
 ```
 
-The raw GitHub response is not discarded — the `sync.push.failed` ledger entry
-carries the status line and body — but a 403's prose ("Resource not accessible
-by personal access token") is true and leads nowhere, so it does not get to be
-the thing on the terminal. A throttled request is told apart from a denied one
-by the rate-limit headers, since GitHub answers both with 403 and reading one as
-the other would send you to edit a PAT that is already correct.
+A 403's own prose ("Resource not accessible by personal access token") is true
+and leads nowhere, so it does not lead — but it is never suppressed either, on
+the terminal or in the `sync.push.failed` ledger entry, because the grant list
+is only the *likeliest* cause of a 403 and someone told to edit a PAT that is
+already correct needs the response to work that out.
+
+Throttling is told apart from denial: GitHub answers a secondary rate limit with
+403, a non-zero remaining count, and often no `Retry-After`, so the headers are
+checked first and the message consulted as a fallback. That fallback can only
+downgrade a denial to "inconclusive, retry" — never the reverse — so GitHub
+rewording it costs precision, not correctness. Anything inconclusive (rate
+limit, 5xx, timeout) is reported as `?` and never fails `sync --check`: it is
+not evidence against a grant, and failing on it would make an unrelated GitHub
+hiccup indistinguishable from a misconfigured PAT.
 
 ## HTTP API (Switchyard mirror contract)
 
@@ -211,7 +231,7 @@ half the clients are turned away. List `127.0.0.1:4010,[::1]:4010` to get both.
 | `GET /v1/mirror/audit?limit=n` | newest audit entries + chain verification |
 | `POST /v1/commands/sync` | `{project, name}` — seal & push that secret's gh targets |
 | `POST /v1/commands/rotate` | `{project, name}` — new version for generated secrets (409 otherwise), then fan-out |
-| `POST /v1/commands/add-target` | `{project, name, repo, secret_name?}` — attach a gh-actions target (validated, deduped; run `sync` to push). Answers with a `warning` when the PAT cannot reach the repo |
+| `POST /v1/commands/add-target` | `{project, name, repo, secret_name?}` — attach a gh-actions target (validated, deduped; run `sync` to push). Reports the grant probe as `preflight` (`ok`/`denied`/`missing`/`rejected`/`unknown`) plus a `warning` when it did not pass |
 | `POST /v1/commands/remove-target` | `{project, name, repo, secret_name?}` — detach a gh-actions target; the destination Actions secret is left in place |
 | `POST /v1/commands/set-expiry` | `{project, name, expires_at}` — set/clear expiry (`YYYY-MM-DD`, empty clears) |
 
