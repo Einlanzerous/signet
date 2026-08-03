@@ -891,8 +891,8 @@ func noteTokenSource(tok ops.GHToken) {
 	if s := expiresIn(tok.ExpiresAt); s != "" {
 		note = ", expires " + s
 	}
-	fmt.Fprintf(os.Stderr, "using %s/%s from the vault (SIGNET_GITHUB_TOKEN unset%s)\n",
-		ops.GHTokenProject, ops.GHTokenName, note)
+	fmt.Fprintf(os.Stderr, "using %s/%s from the vault (%s%s)\n",
+		ops.GHTokenProject, ops.GHTokenName, ops.GHTokenEnvNone, note)
 }
 
 // runTargetList prints every target, optionally narrowed to one secret or

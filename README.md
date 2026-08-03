@@ -109,7 +109,16 @@ blind, and its expiry should be tracked in the vault like anything else.
 1. `SIGNET_GITHUB_TOKEN` from the environment
 2. `SIGNET_PAT` from the environment
 3. `signet/SIGNET_PAT` from the vault
-4. otherwise it fails, naming both the environment and the vault
+4. otherwise it fails, naming all three by name
+
+A variable holding only whitespace counts as unset and falls through to the
+next step — a CRLF-terminated line exported from a `.env` file is not a
+credential, and letting it shadow the vault would spend the run on a 401 that
+names neither the variable nor the whitespace in it. Step 4 recites the whole
+chain because config collapses the two environment variables into one value
+before `sync` sees it: by the time a resolve fails, signet genuinely cannot
+tell which was consulted, so naming only the first would misdirect whoever
+exported the second.
 
 Step 3 is what keeps the root credential out of the caller's hands: the vault
 holds its own PAT like any other secret, so `signet sync` needs no wrapper
