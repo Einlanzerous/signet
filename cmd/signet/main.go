@@ -11,7 +11,7 @@
 //	signet target add --secret csrv/RELEASE_BOT_PRIVATE_KEY --gh-repo Einlanzerous/purser
 //	signet target add-key --project csrv --path ~/construct-server/.env --name API_TOKEN
 //	signet target rm  --secret csrv/RELEASE_BOT_PRIVATE_KEY --gh-repo Einlanzerous/purser
-//	signet sync [--secret csrv/RELEASE_BOT_PRIVATE_KEY]
+//	signet sync [--secret csrv/RELEASE_BOT_PRIVATE_KEY] [--check]
 //	signet status
 //	signet audit [--secret csrv/NAME] [--verify]
 //	signet serve                                   # HTTP API for the Switchyard mirror
@@ -632,7 +632,7 @@ func atomicWrite(path, content, mode string) error {
 
 const targetUsage = `usage:
   signet target list [--secret <p>/<NAME>] [--project <p>]
-  signet target add --secret <p>/<NAME> --gh-repo owner/name [--gh-secret NAME]
+  signet target add --secret <p>/<NAME> --gh-repo owner/name [--gh-secret NAME] [--no-preflight]
   signet target add-key --project <p> --path </path/to/.env> --name NAME[,NAME…]
   signet target rm  --secret <p>/<NAME> --gh-repo owner/name [--gh-secret NAME]
   signet target rm  --project <p> --path </path/to/.env>`
@@ -767,6 +767,7 @@ func runTargetAdd(args []string) error {
 	ref := fs.String("secret", "", "secret ref project/NAME (required)")
 	ghRepo := fs.String("gh-repo", "", "GitHub repo owner/name (required)")
 	ghSecret := fs.String("gh-secret", "", "destination Actions secret name (default: local name)")
+	noPreflight := fs.Bool("no-preflight", false, "skip the check that the PAT can reach the repo")
 	fs.Parse(args)
 	if *ref == "" || *ghRepo == "" || !strings.Contains(*ghRepo, "/") {
 		return fmt.Errorf("%s", targetUsage)
@@ -817,8 +818,81 @@ func runTargetAdd(args []string) error {
 		return err
 	}
 	fmt.Printf("target added: %s/%s → %s (Actions secret %s)\n", project, name, *ghRepo, dest)
-	fmt.Println("run `signet sync` to push")
+	// The add stands either way. A grant that is not in place yet is a normal
+	// order of operations — attach the destination, then widen the PAT — and
+	// refusing here would make the two commands depend on each other's order for
+	// no reason. What is worth changing is when the operator finds out: at the
+	// add, not at the next push of an unrelated secret. Skipping the check is
+	// not the same as failing it, so --no-preflight leaves the path clear.
+	clear := true
+	if !*noPreflight {
+		clear = preflightGHRepo(preflightClient(a), *ghRepo)
+	}
+	if clear {
+		fmt.Println("run `signet sync` to push")
+	}
 	return nil
+}
+
+// preflightTimeout bounds one probe. Per call rather than across a run: a
+// shared budget turns one slow repository into a wave of reports about
+// repositories that were never actually asked.
+const preflightTimeout = 30 * time.Second
+
+// preflightClient resolves the credential a probe should use, or nil when there
+// is none to resolve. The credential is a sync-time requirement, not an
+// add-time one, so its absence is reported and stepped over rather than failing
+// the command that asked.
+func preflightClient(a *app) *syncpkg.GHClient {
+	tok, err := ops.ResolveGHTokenFor(a.st, a.key, a.cfg.GitHubToken, cliActor(), store.RoleHuman, ops.PurposePreflight)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "preflight skipped: %v\n", err)
+		return nil
+	}
+	noteTokenSource(tok)
+	return syncpkg.NewGHClient(tok.Value)
+}
+
+// preflightGHRepo probes whether gh can manage repo's Actions secrets and
+// prints the fix when it cannot. It reports whether sync has a clear path to
+// the repo: an absent credential or an inconclusive probe counts as clear,
+// because neither is evidence against the grant.
+//
+// It takes the client rather than building one so a test can point it at a
+// server that answers the way GitHub does. Without that the entire preflight
+// surface would only be reachable by talking to api.github.com for real.
+func preflightGHRepo(gh *syncpkg.GHClient, repo string) bool {
+	if gh == nil {
+		return true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), preflightTimeout)
+	defer cancel()
+	probe := gh.CheckRepoAccess(ctx, repo)
+	if probe.Access == syncpkg.AccessOK {
+		return true
+	}
+	// Reported whether or not signet can attribute it: a probe that failed for a
+	// reason signet has no name for is still something the operator asked for
+	// and did not get.
+	fmt.Fprintf(os.Stderr, "warning: %s\n", probe.Message())
+	return !probe.Blocked()
+}
+
+// noteTokenSource says out loud when the vault decrypted its own root
+// credential to authenticate, and when that credential stops working. The
+// arrangement is the documented one, not an incident — but it is not something
+// to do silently either, and a PAT that works today and 401s in a month gives
+// no other warning.
+func noteTokenSource(tok ops.GHToken) {
+	if tok.Source != ops.TokenFromVault {
+		return
+	}
+	note := ""
+	if s := expiresIn(tok.ExpiresAt); s != "" {
+		note = ", expires " + s
+	}
+	fmt.Fprintf(os.Stderr, "using %s/%s from the vault (SIGNET_GITHUB_TOKEN unset%s)\n",
+		ops.GHTokenProject, ops.GHTokenName, note)
 }
 
 // runTargetList prints every target, optionally narrowed to one secret or
@@ -1086,6 +1160,7 @@ func runTargetRm(args []string) error {
 func runSync(args []string) error {
 	fs := flag.NewFlagSet("sync", flag.ExitOnError)
 	ref := fs.String("secret", "", "only sync this secret (project/NAME)")
+	check := fs.Bool("check", false, "preflight every GitHub destination without pushing")
 	fs.Parse(args)
 	a, err := setup()
 	if err != nil {
@@ -1135,6 +1210,14 @@ func runSync(args []string) error {
 		}
 	}
 
+	if *check {
+		gh, err := checkClient(a)
+		if err != nil {
+			return err
+		}
+		return syncCheck(gh, toSync, allTargets)
+	}
+
 	pushed, failed := 0, 0
 	// The credential is resolved inside this guard, not above it: the fallback
 	// decrypts the vault's root credential, and doing that for a run with no
@@ -1144,18 +1227,7 @@ func runSync(args []string) error {
 		if err != nil {
 			return err
 		}
-		if tok.Source == ops.TokenFromVault {
-			// The vault just decrypted its own root credential. That is the
-			// arrangement the README documents, not an incident, but it is not
-			// something to do silently either — and the expiry goes with it, since
-			// a sync that works today and 401s in a month gives no other warning.
-			note := ""
-			if s := expiresIn(tok.ExpiresAt); s != "" {
-				note = ", expires " + s
-			}
-			fmt.Fprintf(os.Stderr, "using %s/%s from the vault (SIGNET_GITHUB_TOKEN unset%s)\n",
-				ops.GHTokenProject, ops.GHTokenName, note)
-		}
+		noteTokenSource(tok)
 		gh := syncpkg.NewGHClient(tok.Value)
 
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -1174,7 +1246,18 @@ func runSync(args []string) error {
 					}
 				} else {
 					failed++
-					fmt.Printf("  ✗ %s/%s → %s: %s\n", toSync[i].Project, toSync[i].Name, r.Repo, r.Err)
+					// The fix leads, because a 403's own prose ("Resource not
+					// accessible by personal access token") is true and goes
+					// nowhere. It does not stand in for the response: a 403 is also
+					// how GitHub answers an archived repo, disabled Actions, and an
+					// org SAML or IP policy, and an operator told to edit a PAT
+					// that is already correct needs the body to find that out.
+					if r.Hint != "" {
+						fmt.Printf("  ✗ %s/%s → %s: %s\n", toSync[i].Project, toSync[i].Name, r.Repo, r.Hint)
+						fmt.Printf("    GitHub said: %s\n", r.Err)
+					} else {
+						fmt.Printf("  ✗ %s/%s → %s: %s\n", toSync[i].Project, toSync[i].Name, r.Repo, r.Err)
+					}
 				}
 			}
 		}
@@ -1184,6 +1267,106 @@ func runSync(args []string) error {
 		os.Exit(1)
 	}
 	return nil
+}
+
+// checkClient resolves the credential `sync --check` probes with. Unlike the
+// add-time preflight, a missing credential fails the command: a check that
+// silently checked nothing would report success.
+func checkClient(a *app) (*syncpkg.GHClient, error) {
+	tok, err := ops.ResolveGHTokenFor(a.st, a.key, a.cfg.GitHubToken, cliActor(), store.RoleHuman, ops.PurposePreflight)
+	if err != nil {
+		return nil, err
+	}
+	noteTokenSource(tok)
+	return syncpkg.NewGHClient(tok.Value), nil
+}
+
+// syncCheck answers, without pushing anything, the question a sync would
+// otherwise answer one secret at a time and only after sealing each value: can
+// this credential reach every repository signet is expected to write to.
+//
+// It probes per repository rather than per target, because the grant is per
+// repository — twelve secrets bound for one repo share one answer, and asking
+// twelve times would spend twelve API calls to learn it.
+//
+// Failure comes back as an error rather than an os.Exit so that the caller's
+// deferred close still runs on a vault this command has just written a
+// secret_reveal to, and so the whole thing can be driven from a test.
+func syncCheck(gh *syncpkg.GHClient, toSync []store.Secret, allTargets []store.Target) error {
+	wanted := map[string]bool{}
+	for i := range toSync {
+		wanted[toSync[i].ID] = true
+	}
+	counts := map[string]int{}
+	for _, t := range allTargets {
+		if t.Kind != "gh-actions" || !wanted[t.SecretID] {
+			continue
+		}
+		cfg, err := t.GHConfig()
+		if err != nil {
+			return err
+		}
+		counts[cfg.Repo]++
+	}
+	if len(counts) == 0 {
+		fmt.Println("no GitHub destinations to check")
+		return nil
+	}
+	repos := make([]string, 0, len(counts))
+	for repo := range counts {
+		repos = append(repos, repo)
+	}
+	sort.Strings(repos)
+
+	// Blocked and inconclusive are counted apart, because they mean opposite
+	// things: one is a destination that will fail until a person fixes it, the
+	// other is a question GitHub declined to answer just now. Failing the run on
+	// the second would turn a rate limit into a report of misconfigured grants.
+	var blocked, unknown int
+	for _, repo := range repos {
+		probe := probeRepo(gh, repo)
+		// A refused credential is the answer for every remaining repository, and
+		// it is not about any of them — which is why the message deliberately
+		// names no repo, and why nothing is appended here that would.
+		if probe.Access == syncpkg.AccessRejected {
+			return fmt.Errorf("%s (stopped before checking the remaining repositories — they would answer the same)", probe.Message())
+		}
+		plural := "secrets"
+		if counts[repo] == 1 {
+			plural = "secret"
+		}
+		switch {
+		case probe.Access == syncpkg.AccessOK:
+			fmt.Printf("  ✓ %s (%d %s)\n", repo, counts[repo], plural)
+		case probe.Blocked():
+			blocked++
+			fmt.Printf("  ✗ %s (%d %s): %s\n", repo, counts[repo], plural, probe.Message())
+		default:
+			unknown++
+			fmt.Printf("  ? %s (%d %s): %s\n", repo, counts[repo], plural, probe.Message())
+		}
+	}
+
+	summary := fmt.Sprintf("preflight complete: %d of %d repositories reachable", len(repos)-blocked-unknown, len(repos))
+	if unknown > 0 {
+		summary += fmt.Sprintf(", %d inconclusive", unknown)
+	}
+	fmt.Println(summary)
+	// Only positive evidence fails the run. An inconclusive probe is reported
+	// and left at that: it says nothing about the grant, so failing on it would
+	// make an unrelated GitHub hiccup indistinguishable from a real problem.
+	if blocked > 0 {
+		return fmt.Errorf("%d of %d repositories are unreachable — sync would fail against them", blocked, len(repos))
+	}
+	return nil
+}
+
+// probeRepo runs one preflight under its own deadline, so a repository that
+// hangs costs its own timeout rather than the rest of the run's.
+func probeRepo(gh *syncpkg.GHClient, repo string) syncpkg.RepoProbe {
+	ctx, cancel := context.WithTimeout(context.Background(), preflightTimeout)
+	defer cancel()
+	return gh.CheckRepoAccess(ctx, repo)
 }
 
 // ---- status -----------------------------------------------------------------

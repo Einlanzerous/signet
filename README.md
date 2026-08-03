@@ -18,6 +18,7 @@ signet target add --secret construct-server/RELEASE_BOT_PRIVATE_KEY \
 signet target list [--secret <p>/<NAME>] [--project <p>]
 signet target add-key --project <p> --path </path/.env> --name NAME
 signet target rm --secret <p>/<NAME> --gh-repo owner/name   # detach only
+signet sync --check                                  # can the PAT reach every repo?
 signet sync                                          # seal & push to GitHub Actions
 signet render --project lyceum --check               # drift-check the env file
 signet render --project lyceum                       # write it
@@ -117,8 +118,62 @@ line to get it there. The fallback decrypts a credential, so it is recorded in
 the ledger as a `secret_reveal` and printed on stderr rather than happening
 silently, and a PAT whose expiry day has passed is refused at this seam, with
 the date — a dead PAT otherwise arrives as a bare 401 from GitHub. Only
-`sync` reads the vault this way; `serve` still takes its token from the
-environment.
+`sync` and the `target add` preflight below read the vault this way; `serve`
+still takes its token from the environment. Each read is a `secret_reveal`
+entry that states which of the two it was, so an audit of the root credential
+can tell a push from a check.
+
+### The repository grant is a manual step, so signet checks it early
+
+The PAT is fine-grained: every new repo must be added to its **repository list**
+with *Secrets: read and write* before a push can work. Signet cannot widen its
+own grant — that is human-in-the-loop by design — so the most it can do is find
+out early and say what to do.
+
+`target add` probes the destination's Actions public key (a read of public
+material; no secret is sent or returned) and warns if the credential cannot
+reach it. **The target is still added**: attaching a destination and widening
+the PAT are two steps in either order, and the check is skippable with
+`--no-preflight` or when no credential resolves. `sync --check` does the same
+across every destination at once, one probe per repository rather than per
+secret. The mirror's `add-target` reports the same thing as a `preflight` state
+plus a `warning` on its success response.
+
+**What a pass proves, and what it does not.** The sealing key needs fine-grained
+*Secrets: read*; the PUT that delivers a secret needs *read and write*, and
+GitHub offers no way to test a write without performing one. So a repository
+granted read-only passes the probe and still fails at push. That is a narrower
+mistake than the one this catches — a repository never added at all — and its
+403 arrives explained, but the check is not a guarantee the push will work.
+
+Adding many destinations at once is better served by `--no-preflight` followed
+by one `sync --check`: each add otherwise decrypts the root PAT and writes a
+`secret_reveal` entry of its own, and the run-wide check resolves it once.
+
+When a push does fail, the cause leads and the response follows:
+
+```
+✗ construct-server/ANTHROPIC_API_KEY → Einlanzerous/argosy: the GitHub credential
+  cannot reach Actions Secrets on Einlanzerous/argosy — usually the repository is
+  missing from the fine-grained PAT's repository list (Secrets: read and write);
+  an archived repo, disabled Actions, or an org SAML/IP policy answers the same 403
+  GitHub said: GET /repos/…/actions/secrets/public-key: 403 Forbidden: {"message":…}
+```
+
+A 403's own prose ("Resource not accessible by personal access token") is true
+and leads nowhere, so it does not lead — but it is never suppressed either, on
+the terminal or in the `sync.push.failed` ledger entry, because the grant list
+is only the *likeliest* cause of a 403 and someone told to edit a PAT that is
+already correct needs the response to work that out.
+
+Throttling is told apart from denial: GitHub answers a secondary rate limit with
+403, a non-zero remaining count, and often no `Retry-After`, so the headers are
+checked first and the message consulted as a fallback. That fallback can only
+downgrade a denial to "inconclusive, retry" — never the reverse — so GitHub
+rewording it costs precision, not correctness. Anything inconclusive (rate
+limit, 5xx, timeout) is reported as `?` and never fails `sync --check`: it is
+not evidence against a grant, and failing on it would make an unrelated GitHub
+hiccup indistinguishable from a misconfigured PAT.
 
 ## HTTP API (Switchyard mirror contract)
 
@@ -176,7 +231,7 @@ half the clients are turned away. List `127.0.0.1:4010,[::1]:4010` to get both.
 | `GET /v1/mirror/audit?limit=n` | newest audit entries + chain verification |
 | `POST /v1/commands/sync` | `{project, name}` — seal & push that secret's gh targets |
 | `POST /v1/commands/rotate` | `{project, name}` — new version for generated secrets (409 otherwise), then fan-out |
-| `POST /v1/commands/add-target` | `{project, name, repo, secret_name?}` — attach a gh-actions target (validated, deduped; run `sync` to push) |
+| `POST /v1/commands/add-target` | `{project, name, repo, secret_name?}` — attach a gh-actions target (validated, deduped; run `sync` to push). Reports the grant probe as `preflight` (`ok`/`denied`/`missing`/`rejected`/`unknown`) plus a `warning` when it did not pass |
 | `POST /v1/commands/remove-target` | `{project, name, repo, secret_name?}` — detach a gh-actions target; the destination Actions secret is left in place |
 | `POST /v1/commands/set-expiry` | `{project, name, expires_at}` — set/clear expiry (`YYYY-MM-DD`, empty clears) |
 

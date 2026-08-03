@@ -12,6 +12,7 @@ import (
 
 	"github.com/Einlanzerous/signet/internal/ops"
 	"github.com/Einlanzerous/signet/internal/store"
+	syncpkg "github.com/Einlanzerous/signet/internal/sync"
 	"github.com/Einlanzerous/signet/internal/vault"
 )
 
@@ -238,6 +239,81 @@ func TestAddTarget(t *testing.T) {
 	// Unknown secret.
 	if rec := postCmd(t, h, "/v1/commands/add-target", `{"project":"proj","name":"NOPE","repo":"acme/widgets"}`); rec.Code != http.StatusNotFound {
 		t.Fatalf("unknown secret should 404, got %d — %s", rec.Code, rec.Body)
+	}
+}
+
+// A destination the root PAT was never granted is still attached — the grant
+// is added by a person, afterwards — but the answer has to say so, or the
+// mistake waits until the next sync to surface as a 403 on another secret.
+func TestAddTargetWarnsWhenThePATCannotReachTheRepo(t *testing.T) {
+	srv, st, _, _ := testServer(t)
+	seedSecret(t, st, "proj", "TOKEN", true)
+	gh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(`{"message":"Resource not accessible by personal access token"}`))
+	}))
+	defer gh.Close()
+	srv.gh = syncpkg.NewGHClient("tok")
+	srv.gh.BaseURL = gh.URL
+
+	rec := postCmd(t, srv.Handler(), "/v1/commands/add-target", `{"project":"proj","name":"TOKEN","repo":"acme/widgets"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("add-target: %d — %s", rec.Code, rec.Body)
+	}
+	var body struct {
+		Added     bool   `json:"added"`
+		Warning   string `json:"warning"`
+		Preflight string `json:"preflight"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if !body.Added {
+		t.Fatal("a repo the PAT cannot reach should still be attached")
+	}
+	if !strings.Contains(body.Warning, "repository list") {
+		t.Fatalf("warning does not name the fix: %q", body.Warning)
+	}
+	if body.Preflight != string(syncpkg.AccessDenied) {
+		t.Fatalf("preflight state = %q, want %q", body.Preflight, syncpkg.AccessDenied)
+	}
+}
+
+// A probe that never completed must not read as one that passed. Without the
+// state on the response the mirror cannot tell "the PAT can reach this repo"
+// from "GitHub did not answer in time", and would show the target as verified
+// on the strength of a request that failed.
+func TestAddTargetReportsAnInconclusivePreflight(t *testing.T) {
+	srv, st, _, _ := testServer(t)
+	seedSecret(t, st, "proj", "TOKEN", true)
+	gh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer gh.Close()
+	srv.gh = syncpkg.NewGHClient("tok")
+	srv.gh.BaseURL = gh.URL
+
+	rec := postCmd(t, srv.Handler(), "/v1/commands/add-target", `{"project":"proj","name":"TOKEN","repo":"acme/widgets"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("add-target: %d — %s", rec.Code, rec.Body)
+	}
+	var body struct {
+		Added     bool   `json:"added"`
+		Warning   string `json:"warning"`
+		Preflight string `json:"preflight"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if !body.Added {
+		t.Fatal("an inconclusive probe must not fail the add")
+	}
+	if body.Preflight != string(syncpkg.AccessUnknown) {
+		t.Fatalf("preflight state = %q, want %q", body.Preflight, syncpkg.AccessUnknown)
+	}
+	// Unattributable, so there is no hint — but the failure still has to surface.
+	if body.Warning == "" {
+		t.Fatal("an inconclusive probe was dropped entirely")
 	}
 }
 
