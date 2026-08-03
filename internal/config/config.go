@@ -45,7 +45,7 @@ func Load() Config {
 	return Config{
 		DBPath:        envOr("SIGNET_DB", filepath.Join(home, ".local", "share", "signet", "signet.db")),
 		MasterKeyFile: envOr("SIGNET_MASTER_KEY_FILE", filepath.Join(home, ".config", "signet", "master.key")),
-		GitHubToken:   envOr("SIGNET_GITHUB_TOKEN", os.Getenv("SIGNET_PAT")),
+		GitHubToken:   envOr("SIGNET_GITHUB_TOKEN", envOr("SIGNET_PAT", "")),
 		APIToken:      os.Getenv("SIGNET_API_TOKEN"),
 		Addrs:         parseAddrs(envOr("SIGNET_ADDR", defaultAddr)),
 	}
@@ -95,8 +95,20 @@ func ephemeralPort(addr string) bool {
 	return err == nil && port == "0"
 }
 
+// envOr returns the environment's value for key, or def when it supplies none.
+//
+// A variable holding only whitespace supplies none. This is where that has to
+// be decided, because this is where the fallback chain is: SIGNET_GITHUB_TOKEN
+// collapses onto SIGNET_PAT here, so a whitespace-only value judged non-empty
+// wins the collapse and discards a perfectly good SIGNET_PAT behind it. Trimming
+// further down — at the point the token is used — is too late to help; by then
+// the second variable has already been dropped.
+//
+// The value is returned trimmed, not merely tested that way: every consumer
+// here is a path, an address, or a credential, and none of them wants the
+// trailing \r a CRLF .env file leaves on the end.
 func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 		return v
 	}
 	return def

@@ -279,6 +279,25 @@ func TestAddTargetWarnsWhenThePATCannotReachTheRepo(t *testing.T) {
 	}
 }
 
+// serve reads SIGNET_PAT as readily as SIGNET_GITHUB_TOKEN, so the message it
+// gives when neither is configured has to name both — the daemon is the
+// component actually fed from an env file, and its operator is the likeliest
+// person to have set the one the old message never mentioned.
+func TestSyncDisabledNamesEveryEnvVar(t *testing.T) {
+	srv, st, _, _ := testServer(t) // built with gh == nil
+	seedSecret(t, st, "proj", "TOKEN", true)
+
+	rec := postCmd(t, srv.Handler(), "/v1/commands/sync", `{"project":"proj","name":"TOKEN"}`)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("want 503 with no GitHub client, got %d — %s", rec.Code, rec.Body)
+	}
+	for _, name := range []string{"SIGNET_GITHUB_TOKEN", "SIGNET_PAT"} {
+		if !strings.Contains(rec.Body.String(), name) {
+			t.Fatalf("sync-disabled message omits %s: %s", name, rec.Body)
+		}
+	}
+}
+
 // A probe that never completed must not read as one that passed. Without the
 // state on the response the mirror cannot tell "the PAT can reach this repo"
 // from "GitHub did not answer in time", and would show the target as verified

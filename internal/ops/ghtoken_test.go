@@ -235,9 +235,21 @@ func TestResolveGHTokenFailuresNameEveryLookupPath(t *testing.T) {
 			if err == nil {
 				t.Fatal("resolved a token it should have refused")
 			}
-			for _, path := range []string{"SIGNET_GITHUB_TOKEN", "SIGNET_PAT", GHTokenProject + "/" + GHTokenName} {
-				if !strings.Contains(err.Error(), path) {
-					t.Fatalf("error omits the %s lookup path: %v", path, err)
+			msg := err.Error()
+			if !strings.Contains(msg, GHTokenProject+"/"+GHTokenName) {
+				t.Fatalf("error omits the vault lookup path: %v", err)
+			}
+			// The environment half is asserted against what is left once the two
+			// places that legitimately spell SIGNET_PAT without being the variable
+			// are removed: the vault ref (signet/SIGNET_PAT) and the remediation
+			// command (--name SIGNET_PAT). Searching the whole message for
+			// "SIGNET_PAT" passes on a message that never mentions the environment
+			// at all, which is exactly the regression this guards.
+			env := strings.ReplaceAll(msg, ghTokenFix, "")
+			env = strings.ReplaceAll(env, GHTokenProject+"/"+GHTokenName, "")
+			for _, name := range []string{"SIGNET_GITHUB_TOKEN", "SIGNET_PAT"} {
+				if !strings.Contains(env, name) {
+					t.Fatalf("error does not name the %s environment lookup: %v", name, err)
 				}
 			}
 		})

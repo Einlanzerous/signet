@@ -111,14 +111,17 @@ blind, and its expiry should be tracked in the vault like anything else.
 3. `signet/SIGNET_PAT` from the vault
 4. otherwise it fails, naming all three by name
 
-A variable holding only whitespace counts as unset and falls through to the
-next step — a CRLF-terminated line exported from a `.env` file is not a
-credential, and letting it shadow the vault would spend the run on a 401 that
-names neither the variable nor the whitespace in it. Step 4 recites the whole
-chain because config collapses the two environment variables into one value
-before `sync` sees it: by the time a resolve fails, signet genuinely cannot
-tell which was consulted, so naming only the first would misdirect whoever
-exported the second.
+A variable holding only whitespace carries no credential and falls through to
+the next step, including from step 1 to step 2 — a CRLF-terminated line
+exported from a `.env` file is not a token, and letting one shadow either the
+`SIGNET_PAT` behind it or the vault would spend the run on a 401 that names
+neither the variable nor the whitespace in it. This is decided in `config`,
+where the two variables collapse into one value, so it holds for `serve` as
+much as for `sync`: the daemon is the component actually fed from an env file.
+
+That same collapse is why step 4 recites the whole chain. By the time a resolve
+fails, signet genuinely cannot tell which variable was consulted, so naming
+only the first would misdirect whoever exported the second.
 
 Step 3 is what keeps the root credential out of the caller's hands: the vault
 holds its own PAT like any other secret, so `signet sync` needs no wrapper

@@ -54,6 +54,17 @@ func TestGitHubTokenResolution(t *testing.T) {
 		{name: "pat fallback", ghToken: "", pat: "pat-tok", wantToken: "pat-tok"},
 		{name: "canonical wins over pat", ghToken: "gh-tok", pat: "pat-tok", wantToken: "gh-tok"},
 		{name: "neither set", ghToken: "", pat: "", wantToken: ""},
+		// A variable holding only whitespace supplies no credential, so it must
+		// not win the collapse. Judging it non-empty here discards the SIGNET_PAT
+		// behind it — and no amount of trimming further down can get it back,
+		// because by then the second variable has already been dropped.
+		{name: "blank canonical yields to pat", ghToken: "   ", pat: "pat-tok", wantToken: "pat-tok"},
+		{name: "crlf canonical yields to pat", ghToken: "\r\n", pat: "pat-tok", wantToken: "pat-tok"},
+		{name: "both blank resolve to nothing", ghToken: " ", pat: "\t", wantToken: ""},
+		// Values that do carry a credential arrive usable: this one goes
+		// straight into an Authorization header.
+		{name: "surrounding whitespace trimmed", ghToken: " gh-tok\r\n", pat: "", wantToken: "gh-tok"},
+		{name: "pat fallback trimmed", ghToken: "", pat: "\tpat-tok\n", wantToken: "pat-tok"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
