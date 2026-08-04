@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.5.0](https://github.com/Einlanzerous/signet/compare/v1.4.1...v1.5.0) (2026-08-04)
+
+
+### Features
+
+* **sync:** preflight the PAT's repo grant (SGNT-10) ([#18](https://github.com/Einlanzerous/signet/issues/18)) ([6e33f81](https://github.com/Einlanzerous/signet/commit/6e33f8128ea4f87a27f1ebad5163b3fa9b8a7402))
+
+
+### Bug Fixes
+
+* **sync:** name every credential lookup path when none resolves (SGNT-9) ([#20](https://github.com/Einlanzerous/signet/issues/20)) ([508e1b9](https://github.com/Einlanzerous/signet/commit/508e1b9d504b878e997514fc422d7a4b6eb9cbd8))
+
 ## [1.4.1](https://github.com/Einlanzerous/signet/compare/v1.4.0...v1.4.1) (2026-08-02)
 
 
