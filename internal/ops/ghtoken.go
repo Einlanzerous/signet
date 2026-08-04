@@ -25,6 +25,21 @@ const (
 const ghTokenFix = "`signet set --project " + GHTokenProject + " --name " + GHTokenName +
 	" --expires YYYY-MM-DD`, with the PAT on stdin"
 
+// GHTokenEnvNone names the environment half of the lookup chain, in full,
+// wherever signet reports that it found nothing there.
+//
+// Config collapses SIGNET_GITHUB_TOKEN and SIGNET_PAT into one value before it
+// reaches this package, so by the time a resolve fails there is no way to know
+// which of the two was consulted — which is exactly why both have to be named.
+// A message that mentions only SIGNET_GITHUB_TOKEN misdirects the one person
+// most likely to read it: whoever exported SIGNET_PAT with a typo or an empty
+// value, and is now being told to go and look at a variable they never used.
+//
+// "No credential in", not "unset": a variable holding only whitespace is also
+// no credential, and telling someone who exported one that it is unset would
+// be the same misdirection in a narrower form.
+const GHTokenEnvNone = "no credential in SIGNET_GITHUB_TOKEN or SIGNET_PAT"
+
 // ActionSecretRead is the ledger verb for signet reading a secret in order to
 // use it itself, as distinct from `secret.reveal`, which is plaintext handed to
 // a person. Both are KindSecretReveal — a decrypt is a decrypt, and neither
@@ -86,7 +101,13 @@ func ResolveGHToken(st *store.Store, key []byte, envToken, actor string, role st
 // ResolveGHTokenFor is ResolveGHToken with the ledger entry's stated purpose
 // named by the caller, for reads that are not a push.
 func ResolveGHTokenFor(st *store.Store, key []byte, envToken, actor string, role store.ActorRole, purpose TokenPurpose) (GHToken, error) {
-	if envToken != "" {
+	// Trimmed before it is judged present, and for the reason the vault's own
+	// value is trimmed below: this goes straight into an Authorization header.
+	// An env var holding only whitespace — a CRLF-terminated line exported from
+	// a .env file, a quoted trailing space — is not a credential, and treating
+	// it as one would skip the vault fallback and hand GitHub a header it
+	// answers with a 401 that names neither the variable nor the whitespace.
+	if envToken = strings.TrimSpace(envToken); envToken != "" {
 		return GHToken{Value: envToken, Source: TokenFromEnv}, nil
 	}
 	ref := GHTokenProject + "/" + GHTokenName
@@ -95,8 +116,8 @@ func ResolveGHTokenFor(st *store.Store, key []byte, envToken, actor string, role
 		return GHToken{}, err
 	}
 	if sec == nil {
-		return GHToken{}, fmt.Errorf("SIGNET_GITHUB_TOKEN is not set and the vault has no %s — cannot push to GitHub Actions; store the PAT with %s",
-			ref, ghTokenFix)
+		return GHToken{}, fmt.Errorf("%s, and the vault has no %s — cannot push to GitHub Actions; store the PAT with %s",
+			GHTokenEnvNone, ref, ghTokenFix)
 	}
 	// Checked before the decrypt, and reported as itself: an expired PAT
 	// otherwise surfaces as a 401 from the GitHub API, which names neither the
@@ -113,8 +134,8 @@ func ResolveGHTokenFor(st *store.Store, key []byte, envToken, actor string, role
 	// broken vault, so it gets the same one-command fix as an absent one rather
 	// than a bare statement of the fact.
 	if cur == nil {
-		return GHToken{}, fmt.Errorf("SIGNET_GITHUB_TOKEN is not set and %s has no value stored — cannot push to GitHub Actions; store the PAT with %s",
-			ref, ghTokenFix)
+		return GHToken{}, fmt.Errorf("%s, and %s has no value stored — cannot push to GitHub Actions; store the PAT with %s",
+			GHTokenEnvNone, ref, ghTokenFix)
 	}
 	plain, err := vault.Decrypt(key, cur.Nonce, cur.Ciphertext)
 	if err != nil {
@@ -130,8 +151,8 @@ func ResolveGHTokenFor(st *store.Store, key []byte, envToken, actor string, role
 	}
 	if _, err := st.AppendAudit(store.AuditRecord{
 		Actor: actor, Action: ActionSecretRead, SecretID: sec.ID,
-		Details: fmt.Sprintf("read %s version %d #%s to %s (SIGNET_GITHUB_TOKEN unset)",
-			ref, cur.VersionNo, cur.VHash, purpose),
+		Details: fmt.Sprintf("read %s version %d #%s to %s (%s)",
+			ref, cur.VersionNo, cur.VHash, purpose, GHTokenEnvNone),
 		EventKind: store.KindSecretReveal, ActorRole: role,
 		Status: &store.AuditStatus{Outcome: store.OutcomeDelivered},
 	}); err != nil {

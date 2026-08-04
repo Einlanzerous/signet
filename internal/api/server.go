@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Einlanzerous/signet/internal/ops"
 	"github.com/Einlanzerous/signet/internal/store"
 	syncpkg "github.com/Einlanzerous/signet/internal/sync"
 	"github.com/Einlanzerous/signet/internal/vault"
@@ -413,7 +414,10 @@ func (s *Server) handleCommandSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.gh == nil {
-		writeErr(w, http.StatusServiceUnavailable, "gh-actions sync disabled: SIGNET_GITHUB_TOKEN not configured")
+		// Named in full: serve reads SIGNET_PAT as readily as SIGNET_GITHUB_TOKEN,
+		// so citing only the latter sends whoever configured the daemon to check
+		// a variable they may never have used.
+		writeErr(w, http.StatusServiceUnavailable, "gh-actions sync disabled: %s", ops.GHTokenEnvNone)
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)

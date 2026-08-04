@@ -210,6 +210,77 @@ func TestResolveGHTokenTrimsWhitespace(t *testing.T) {
 	}
 }
 
+// The environment is consulted twice — SIGNET_GITHUB_TOKEN, then SIGNET_PAT —
+// and config collapses both into one value before this package sees it. A
+// message naming only the first sends whoever exported the second to check a
+// variable they never used.
+func TestResolveGHTokenFailuresNameEveryLookupPath(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(t *testing.T, st *store.Store, key []byte)
+	}{
+		// The two states in which nothing was found anywhere. The expired and
+		// empty cases below are excluded on purpose: there the credential was
+		// located, so reciting the search would say nothing useful.
+		{"nothing in the vault", func(*testing.T, *store.Store, []byte) {}},
+		{"registered with no value", func(t *testing.T, st *store.Store, key []byte) {
+			mustCreateBare(t, st)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st, key := newVault(t)
+			tc.setup(t, st, key)
+			_, err := ResolveGHToken(st, key, "", "test", store.RoleHuman)
+			if err == nil {
+				t.Fatal("resolved a token it should have refused")
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, GHTokenProject+"/"+GHTokenName) {
+				t.Fatalf("error omits the vault lookup path: %v", err)
+			}
+			// The environment half is asserted against what is left once the two
+			// places that legitimately spell SIGNET_PAT without being the variable
+			// are removed: the vault ref (signet/SIGNET_PAT) and the remediation
+			// command (--name SIGNET_PAT). Searching the whole message for
+			// "SIGNET_PAT" passes on a message that never mentions the environment
+			// at all, which is exactly the regression this guards.
+			env := strings.ReplaceAll(msg, ghTokenFix, "")
+			env = strings.ReplaceAll(env, GHTokenProject+"/"+GHTokenName, "")
+			for _, name := range []string{"SIGNET_GITHUB_TOKEN", "SIGNET_PAT"} {
+				if !strings.Contains(env, name) {
+					t.Fatalf("error does not name the %s environment lookup: %v", name, err)
+				}
+			}
+		})
+	}
+}
+
+// An env var holding only whitespace is not a credential. Treating it as one
+// skips the vault that does hold the PAT, and spends the run on a 401 naming
+// neither the variable nor the whitespace in it.
+func TestResolveGHTokenIgnoresWhitespaceOnlyEnvToken(t *testing.T) {
+	st, key := newVault(t)
+	putSecret(t, st, key, GHTokenProject, GHTokenName, "ghp_vaulted", "")
+
+	tok, err := ResolveGHToken(st, key, " \r\n\t ", "test", store.RoleHuman)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.Source != TokenFromVault || tok.Value != "ghp_vaulted" {
+		t.Fatalf("whitespace env token shadowed the vault: %+v", tok)
+	}
+
+	// A real value keeps arriving from the environment, trimmed.
+	tok, err = ResolveGHToken(st, key, " ghp_from_env\n", "test", store.RoleHuman)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.Source != TokenFromEnv || tok.Value != "ghp_from_env" {
+		t.Fatalf("env token not used or not trimmed: %+v", tok)
+	}
+}
+
 // Each of these messages is read at the moment a sync stopped working, so each
 // has to carry the command that fixes it.
 func TestResolveGHTokenFailuresNameTheFix(t *testing.T) {
