@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/Einlanzerous/signet/internal/derive"
 )
 
 // Secret is a vault entry's metadata. Values live in secret_versions.
@@ -18,7 +20,15 @@ type Secret struct {
 	ExpiresAt string // RFC3339 date or empty
 	CreatedAt string
 	UpdatedAt string
+	// Derivation is a template naming the secrets this value is composed from,
+	// empty for an ordinary secret. A derived secret has no secret_versions row:
+	// its value is expanded at read time, which is what stops a composed value
+	// from drifting out of step with its inputs. See internal/derive.
+	Derivation string
 }
+
+// Derived reports whether this secret's value is computed rather than stored.
+func (s Secret) Derived() bool { return s.Derivation != "" }
 
 // Version is one encrypted value of a secret.
 type Version struct {
@@ -39,7 +49,7 @@ func (s *Store) GetSecret(project, name string) (*Secret, error) {
 	ctx, cancel := pooled()
 	defer cancel()
 	row := s.db.QueryRowContext(ctx, `
-        SELECT id, project, name, scope, status, generated, COALESCE(expires_at, ''), created_at, updated_at
+        SELECT id, project, name, scope, status, generated, COALESCE(expires_at, ''), created_at, updated_at, derivation
         FROM secrets WHERE project = ? AND name = ?`, project, name)
 	return scanSecret(row)
 }
@@ -49,7 +59,7 @@ func (s *Store) GetSecretByID(id string) (*Secret, error) {
 	ctx, cancel := pooled()
 	defer cancel()
 	row := s.db.QueryRowContext(ctx, `
-        SELECT id, project, name, scope, status, generated, COALESCE(expires_at, ''), created_at, updated_at
+        SELECT id, project, name, scope, status, generated, COALESCE(expires_at, ''), created_at, updated_at, derivation
         FROM secrets WHERE id = ?`, id)
 	return scanSecret(row)
 }
@@ -57,7 +67,7 @@ func (s *Store) GetSecretByID(id string) (*Secret, error) {
 func scanSecret(row *sql.Row) (*Secret, error) {
 	var sec Secret
 	var generated int
-	err := row.Scan(&sec.ID, &sec.Project, &sec.Name, &sec.Scope, &sec.Status, &generated, &sec.ExpiresAt, &sec.CreatedAt, &sec.UpdatedAt)
+	err := row.Scan(&sec.ID, &sec.Project, &sec.Name, &sec.Scope, &sec.Status, &generated, &sec.ExpiresAt, &sec.CreatedAt, &sec.UpdatedAt, &sec.Derivation)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -100,12 +110,67 @@ func (m *Mutation) SetExpiry(secretID, expiresAt string) error {
 	return nil
 }
 
+// SetDerivation makes a secret derived, or clears it back to an ordinary one
+// with the empty string. The caller validates the template; the store only
+// records it.
+func (m *Mutation) SetDerivation(secretID, derivation string) error {
+	if _, err := m.tx.Exec(
+		`UPDATE secrets SET derivation = ?, updated_at = ? WHERE id = ?`,
+		derivation, now(), secretID); err != nil {
+		return fmt.Errorf("set derivation: %w", err)
+	}
+	return nil
+}
+
+// DependentsOf returns every derived secret whose template names (project,
+// name), directly. It exists so a rotation can say what else it is about to
+// change before it writes: a value composed from this one is rewritten by the
+// next render, and discovering that afterwards — across four env files — is
+// the failure this feature is meant to remove, not relocate.
+//
+// Matching is done by parsing each template rather than by SQL LIKE, because a
+// bare {{NAME}} reference means "the deriving secret's own project" and a text
+// match cannot know that. Indirect dependents (a derived secret built from a
+// derived secret) are deliberately not followed here; callers wanting the full
+// closure iterate.
+func (s *Store) DependentsOf(project, name string) ([]Secret, error) {
+	all, err := s.ListSecrets()
+	if err != nil {
+		return nil, err
+	}
+	var out []Secret
+	for _, sec := range all {
+		if !sec.Derived() {
+			continue
+		}
+		t, err := derive.Parse(sec.Derivation)
+		if err != nil {
+			// A template that no longer parses is worth surfacing here rather
+			// than swallowing: it means this secret cannot render at all, which
+			// the operator is better off learning during a rotation than during
+			// the deploy that follows it.
+			return nil, fmt.Errorf("%s/%s has an invalid derivation: %w", sec.Project, sec.Name, err)
+		}
+		for _, ref := range t.Refs() {
+			p := ref.Project
+			if p == "" {
+				p = sec.Project
+			}
+			if p == project && ref.Name == name {
+				out = append(out, sec)
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
 // ListSecrets returns every secret ordered by project then name.
 func (s *Store) ListSecrets() ([]Secret, error) {
 	ctx, cancel := pooled()
 	defer cancel()
 	rows, err := s.db.QueryContext(ctx, `
-        SELECT id, project, name, scope, status, generated, COALESCE(expires_at, ''), created_at, updated_at
+        SELECT id, project, name, scope, status, generated, COALESCE(expires_at, ''), created_at, updated_at, derivation
         FROM secrets ORDER BY project, name`)
 	if err != nil {
 		return nil, fmt.Errorf("list secrets: %w", err)
@@ -115,7 +180,7 @@ func (s *Store) ListSecrets() ([]Secret, error) {
 	for rows.Next() {
 		var sec Secret
 		var generated int
-		if err := rows.Scan(&sec.ID, &sec.Project, &sec.Name, &sec.Scope, &sec.Status, &generated, &sec.ExpiresAt, &sec.CreatedAt, &sec.UpdatedAt); err != nil {
+		if err := rows.Scan(&sec.ID, &sec.Project, &sec.Name, &sec.Scope, &sec.Status, &generated, &sec.ExpiresAt, &sec.CreatedAt, &sec.UpdatedAt, &sec.Derivation); err != nil {
 			return nil, fmt.Errorf("list secrets: %w", err)
 		}
 		sec.Generated = generated != 0

@@ -260,6 +260,22 @@ ALTER TABLE audit_log ADD COLUMN hash_version INTEGER NOT NULL DEFAULT 1;
 
 CREATE INDEX idx_audit_kind_ts ON audit_log(event_kind, ts);
 `,
+	// 003 — derived secrets. A non-empty derivation means the value is composed
+	// from other secrets at read time and this entry has no secret_versions row
+	// of its own; see internal/derive. Defaulting to '' leaves every existing
+	// secret plainly non-derived, so nothing needs backfilling.
+	//
+	// The template is stored in the clear, unlike every value in this database.
+	// That is deliberate: a derivation is a *relationship* between entries, and
+	// the blind registry already exposes relationships — projects, names,
+	// targets — so that drift can be reasoned about without the master key. It
+	// does mean the literal text around the references (a host, a username, a
+	// scheme) is readable from the database alone, which is why `derive` refuses
+	// a template with no references: that is the shape that would smuggle a
+	// credential into a metadata column.
+	`
+ALTER TABLE secrets ADD COLUMN derivation TEXT NOT NULL DEFAULT '';
+`,
 }
 
 func (s *Store) migrate() error {

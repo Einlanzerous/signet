@@ -69,6 +69,50 @@ invisible until someone runs `render --check` by hand.
 | **Managed, not blind** | `~/projects/*/.env` dev files | Signet is the registry + renderer + drift detector. The human (and their agents) can read these files — pretending otherwise would be blindness theater. |
 | **Blind (future)** | `.env.vault` for the compose stack | Daemon-owned file, mode 0600, separate system user; agents never get read access to a valid injection destination. Lands with the Phase-2 watcher/healer work. |
 
+## Derived secrets
+
+A secret whose value is **composed from other secrets** holds a template instead
+of a value:
+
+```
+signet derive --project drydock --name DRYDOCK_DATABASE_URL \
+  --from 'postgres://drydock_user:{{construct-server/DRYDOCK_DB_PASSWORD}}@127.0.0.1:5432/drydock'
+```
+
+`{{NAME}}` refers to the deriving secret's own project; `{{project/NAME}}`
+crosses projects, which the motivating case requires — the password lives in
+`construct-server` and the DSN in `drydock`.
+
+**Nothing is stored.** The value is expanded on every render, reveal and sync,
+which is the whole point: a composed value that is written down can fall out of
+step with what it was composed from. Before this existed, rotating the password
+left the DSN silently wrong *and* `render --check` reported both files in sync,
+because each entry individually matched what the vault held. The one tool whose
+job is noticing divergence structurally could not notice it.
+
+Consequences worth knowing:
+
+- **A derived secret cannot be `set` or rotated.** It has no value of its own.
+  Rotate one of its inputs, or change the template with `derive --from`.
+- **Setting an input names what else just changed**, including across projects,
+  and which renders to run.
+- **`reveal` prints the value on stdout and its provenance on stderr**, so it
+  stays pipeable while still answering "where did this come from".
+- **Converting an existing stored secret needs `--replace`.** Its stored value
+  may be live somewhere signet cannot see, so discarding it is deliberate. The
+  old versions stay in history and stop being read.
+- **A derivation naming no secrets is refused.** That is a constant, which is
+  what an ordinary secret already is.
+- **Cycles are refused** with the chain that forms them.
+- **The template is stored unencrypted**, unlike every value in this database. It
+  is a relationship between entries — the same class of metadata as projects,
+  names and targets, which the blind mirror already exposes so drift can be
+  reasoned about without the master key. Do not put credential material in the
+  literal text around the references.
+
+Hashing transforms (`scrypt`, `bcrypt`, `base64`) are **not** implemented;
+`derive` composes only. See SGNT-18.
+
 ## Boundary
 
 - **The HTTP API never returns plaintext.** It serves metadata, version hashes

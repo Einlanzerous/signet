@@ -439,6 +439,16 @@ func (s *Server) handleCommandRotate(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// Checked before the Generated test, which would otherwise catch a derived
+	// secret and tell the caller to rotate it "at the issuer" — advice that
+	// makes no sense for a value with no issuer and no stored form. A derived
+	// secret rotates when its inputs do.
+	if sec.Derived() {
+		writeErr(w, http.StatusConflict,
+			"secret %s/%s is derived from %s — it has no value of its own to rotate; rotate one of its inputs instead",
+			sec.Project, sec.Name, sec.Derivation)
+		return
+	}
 	if !sec.Generated {
 		writeErr(w, http.StatusConflict,
 			"secret %s/%s is externally issued — signet can fan out a new value but cannot mint one; rotate it at the issuer, then `signet set`", sec.Project, sec.Name)
