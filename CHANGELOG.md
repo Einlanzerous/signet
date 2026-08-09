@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.5.1](https://github.com/Einlanzerous/signet/compare/v1.5.0...v1.5.1) (2026-08-09)
+
+
+### Bug Fixes
+
+* **serve:** say which signal stopped the daemon, and that it stopped (SGNT-19) ([#21](https://github.com/Einlanzerous/signet/issues/21)) ([3fc341f](https://github.com/Einlanzerous/signet/commit/3fc341fc268d01e28d3a7e4723f5f7be6cae7d09))
+
 ## [1.5.0](https://github.com/Einlanzerous/signet/compare/v1.4.1...v1.5.0) (2026-08-04)
 
 
