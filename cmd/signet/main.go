@@ -1578,7 +1578,66 @@ func runServe() error {
 	if err != nil {
 		return err
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signalContext(os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	return api.Serve(ctx, a.cfg.Addrs, srv)
+}
+
+// signalContext returns a context cancelled by the first of sigs to arrive,
+// having logged which one it was on the way.
+//
+// signal.NotifyContext knows the same fact and does not throw it away: it
+// cancels with a cause, and context.Cause reports "terminated signal received".
+// Two things make it worth hand-rolling anyway, and neither is that the
+// standard library loses the signal.
+//
+// The cause is only readable once Serve has returned, which puts the line after
+// the shutdown it explains — "api stopped", then "received SIGTERM", in that
+// order. Logging on arrival keeps the journal in the order the events actually
+// happened: listening, received, stopped.
+//
+// And a cause spells the signal the way Signal.String does, as "terminated".
+// Whoever reads this line is working out what stopped the vault, and will be
+// searching for SIGTERM.
+//
+// Why the line has to exist at all: the daemon twice ended with nothing in the
+// journal but systemd's "Deactivated successfully" and status=0/SUCCESS, days
+// apart, staying down until someone noticed by hand — a record that cannot
+// distinguish being told to stop from stopping on its own. It can only be the
+// former: main sends every non-nil error to log.Fatal, so any failure exits 1
+// and says why, and a listener that dies on its own returns non-nil. A silent
+// exit 0 is reachable only through this context being cancelled. Because
+// systemd announces its own stops as "Stopping signet.service...", a line here
+// with no such announcement above it is an outside sender by elimination.
+func signalContext(sigs ...os.Signal) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	// Buffered so the notify runtime never blocks handing the signal over, and
+	// stopped by the returned func so the goroutine cannot outlive the caller.
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, sigs...)
+	go func() {
+		select {
+		case sig := <-ch:
+			log.Printf("received %s — shutting down", signalName(sig))
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, func() {
+		signal.Stop(ch)
+		cancel()
+	}
+}
+
+// signalName prefers the mnemonic over what Signal.String reports, because the
+// journal line is read by whoever is working out who stopped the vault and
+// "terminated" is not what they will be grepping for.
+func signalName(sig os.Signal) string {
+	switch sig {
+	case syscall.SIGTERM:
+		return "SIGTERM"
+	case os.Interrupt:
+		return "SIGINT"
+	}
+	return sig.String()
 }

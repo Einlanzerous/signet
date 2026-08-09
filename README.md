@@ -209,6 +209,21 @@ failure worth preventing: it answers `/healthz` from the host while refusing
 every container, so it looks healthy from the one place that isn't broken. The
 startup log states the addresses as actually bound.
 
+`serve` brackets its own lifetime, so the journal can always answer why the
+daemon is not running:
+
+```
+signet: api listening on 127.0.0.1:4010, 172.17.0.1:4010
+signet: received SIGTERM — shutting down
+signet: api stopped, released 127.0.0.1:4010, 172.17.0.1:4010
+```
+
+Every other way out returns an error, which exits non-zero and says what
+happened. A signal exits **0**, deliberately — a deliberate `systemctl stop` is
+not a failure — so these two lines are the only record that one arrived. If the
+journal shows them with no `Stopping signet.service...` from systemd above them,
+something other than systemd signalled the vault.
+
 Hosts must be IP literals. A name is refused, because `net.Listen` resolves it
 and binds exactly one of the answers — `localhost:4010` on a dual-stack host
 listens on `127.0.0.1` **or** `::1`, so "all of them or none" would hold while
@@ -226,9 +241,14 @@ half the clients are turned away. List `127.0.0.1:4010,[::1]:4010` to get both.
 > After=docker.service
 >
 > [Service]
-> Restart=on-failure
+> Restart=always
 > RestartSec=5
 > ```
+>
+> `Restart=always`, not `on-failure`: a signalled daemon exits **0**, which
+> `on-failure` does not cover, so anything that stops it other than systemd
+> leaves it down until a human notices. That is not hypothetical — it is how
+> this daemon spent two multi-day windows offline (SGNT-19).
 >
 > This is the deliberate trade: a vault that is reachable on some interfaces
 > and silently not on others is worse than one that is honestly down. Only list
