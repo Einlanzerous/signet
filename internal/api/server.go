@@ -853,16 +853,30 @@ func serveListeners(ctx context.Context, listeners []net.Listener, h http.Handle
 		// already arrived would miss the one that died moments before the
 		// signal, whose error is still in flight — which is precisely the case
 		// where the two events look alike and the wrong one wins the select.
-		stopErr := shutdownAll(servers)
+		stopErr := shutdownAll(servers, bound)
 		if lost := awaitStopped(errCh, len(servers)); lost != nil {
 			return lost
 		}
-		return stopErr
+		if stopErr != nil {
+			return stopErr
+		}
+		// The one exit that would otherwise be silent. Every other path back to
+		// main returns an error, and main sends those to log.Fatal — so they
+		// already announce themselves and exit non-zero. A clean stop is the
+		// case that reached the journal as nothing at all, which is how two
+		// multi-day outages went unnoticed (SGNT-19).
+		//
+		// It names the addresses rather than counting them so the line can be
+		// read against the startup line above it. A count here could only ever
+		// be len(servers), which is fixed at bind time and so would report what
+		// was opened while claiming to describe what was closed.
+		log.Printf("api stopped, released %s", strings.Join(bound, ", "))
+		return nil
 	case err := <-errCh:
 		// One listener stopped on its own while the others keep accepting — the
 		// half-listening state again, arrived at from the other direction. Take
 		// them all down and report what actually happened.
-		if stopErr := shutdownAll(servers); stopErr != nil {
+		if stopErr := shutdownAll(servers, bound); stopErr != nil {
 			log.Printf("api: draining the remaining listeners after %v: %v", err, stopErr)
 		}
 		return err
@@ -895,7 +909,11 @@ func awaitStopped(errCh chan error, n int) error {
 // and keeping only one would hide the others behind it. Sequentially, the
 // first server could spend the entire grace period and leave the rest none,
 // cutting the connections the deadline exists to protect.
-func shutdownAll(servers []*http.Server) error {
+// bound[i] names servers[i], so a failure says which listener did not drain.
+// Without it the operator gets a bare "context deadline exceeded" for a daemon
+// that may have several addresses — naming neither the interface that hung nor
+// what was being attempted, on the one path where that is the whole question.
+func shutdownAll(servers []*http.Server, bound []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	errs := make([]error, len(servers))
@@ -904,7 +922,9 @@ func shutdownAll(servers []*http.Server) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			errs[i] = srv.Shutdown(ctx)
+			if err := srv.Shutdown(ctx); err != nil {
+				errs[i] = fmt.Errorf("serve: draining %s: %w", bound[i], err)
+			}
 		}()
 	}
 	wg.Wait()

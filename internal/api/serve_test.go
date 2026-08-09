@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Einlanzerous/signet/internal/logtest"
 )
 
 // listenLoopback returns bound listeners on n ephemeral loopback ports, and
@@ -213,6 +215,46 @@ func TestServeReportsALostListener(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("serveListeners did not return")
+	}
+}
+
+// A clean stop is the one exit that returns nil, so it is the one exit whose
+// only trace is whatever it logged. It logged nothing until SGNT-19, and the
+// gap is what let the daemon vanish twice for days with the journal showing an
+// ordinary shutdown. Asserting on the line is asserting the outage is visible.
+func TestServeLogsACleanStop(t *testing.T) {
+	srv, _, _, _ := testServer(t)
+	listeners, addrs := listenLoopback(t, 2)
+
+	logged := logtest.Capture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- serveListeners(ctx, listeners, srv.Handler()) }()
+	waitReady(t, addrs)
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("clean stop reported an error: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("serveListeners did not return")
+	}
+
+	out := logged()
+	if !strings.Contains(out, "api stopped") {
+		t.Errorf("a clean stop left no record of stopping; log was %q", out)
+	}
+	// Naming the addresses is what lets an operator line the stop up against
+	// the startup line. This asserts they are all named — not that each was
+	// individually confirmed closed, which the line does not claim and this
+	// test could not check.
+	for _, addr := range addrs {
+		if !strings.Contains(out, addr) {
+			t.Errorf("stop line omits %s; log was %q", addr, out)
+		}
 	}
 }
 
