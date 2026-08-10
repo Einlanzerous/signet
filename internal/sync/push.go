@@ -75,9 +75,10 @@ func PushSecret(ctx context.Context, st *store.Store, key []byte, gh *GHClient, 
 	// vhash beside it in the log while meaning something else entirely (that
 	// one is over ciphertext, which is nonce-randomized and not comparable
 	// across encryptions), and two hashes wearing one label is a trap.
-	// resolve.Value is the authority on whether a version exists: nil means the
-	// secret is derived and has none. Re-querying here to find out was both a
-	// second round-trip and an unchecked dereference away from a crash.
+	// resolve.Current is the authority on whether a version exists: a nil
+	// Version means the secret is derived and has none. Re-querying here to
+	// find out was both a second round-trip and an unchecked dereference away
+	// from a crash.
 	prov := store.PushProvenance{Digest: r.Digest}
 	provenance := ""
 	if r.Version != nil {

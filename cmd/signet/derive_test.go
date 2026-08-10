@@ -176,9 +176,9 @@ func TestDeriveRejectsAnUnresolvableTemplate(t *testing.T) {
 	}
 }
 
-// DependentsOf is what makes a rotation able to say what else it changed. The
-// bare-reference case is the one a SQL LIKE would get wrong.
-func TestDependentsOfResolvesBareAndCrossProjectRefs(t *testing.T) {
+// resolve.Dependents is what makes a rotation able to say what else it changed.
+// The bare-reference case is the one a SQL LIKE would get wrong.
+func TestDependentsResolvesBareAndCrossProjectRefs(t *testing.T) {
 	st := newCLIVault(t)
 	setValue(t, "construct-server", "PW", "x")
 	setValue(t, "drydock", "PW", "y")
