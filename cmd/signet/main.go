@@ -21,6 +21,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -761,17 +762,13 @@ func (a *app) projectValues(project string) (map[string]string, map[string]error
 		if sec.Project != project {
 			continue
 		}
-		// A secret with nothing to resolve is absent, not broken — the state
-		// every secret passes through between creation and its first value.
-		ok, err := resolve.HasValue(a.st, &sec)
-		if err != nil {
-			return nil, nil, err
-		}
-		if !ok {
-			continue
-		}
 		v, _, err := resolve.Value(a.st, a.key, &sec)
-		if err != nil {
+		switch {
+		case errors.Is(err, resolve.ErrNoVersion):
+			// Absent, not broken — the state every secret passes through
+			// between creation and its first value.
+			continue
+		case err != nil:
 			problems[sec.Name] = err
 			continue
 		}
@@ -790,14 +787,7 @@ func (a *app) projectValues(project string) (map[string]string, map[string]error
 // sync" — the most confident possible answer about the one secret nobody can
 // currently compute.
 func (a *app) ghDrift(sec *store.Secret) (*store.Version, string, error) {
-	v, cur, err := resolve.Value(a.st, a.key, sec)
-	if err != nil {
-		return nil, "", err
-	}
-	if sec.Derived() {
-		return nil, vault.ValueDigest(a.key, v), nil
-	}
-	return cur, "", nil
+	return resolve.Drift(a.st, a.key, sec)
 }
 
 // projectValuesStrict is projectValues for callers that must not proceed on a

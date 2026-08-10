@@ -11,6 +11,7 @@
 package resolve
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/Einlanzerous/signet/internal/derive"
@@ -18,16 +19,22 @@ import (
 	"github.com/Einlanzerous/signet/internal/vault"
 )
 
+// ErrNoVersion reports a stored secret that has no value yet — the state every
+// secret passes through between creation and its first write.
+//
+// It is a sentinel rather than a boolean return because callers divide on it:
+// render and status skip such a secret, while reveal and push must fail. A
+// separate "does it have one?" query answered the same question a second time
+// and cost every caller an extra round-trip per secret.
+var ErrNoVersion = errors.New("no versions")
+
 // Value returns sec's plaintext, expanding it if it is derived, together with
 // the version the value came from.
 //
 // The version is nil for a derived secret — it has none, by construction — and
-// callers must treat it as the authority on that rather than re-querying. It is
-// returned rather than left to the caller because every caller needed it and
-// every caller fetched it again: once to decide whether the secret had a value,
-// once inside here, and a third time to cite a version number in an audit
-// entry. That third fetch was also a nil dereference waiting to happen, guarded
-// only by this function having looked a moment earlier.
+// callers must treat it as the authority on that rather than re-querying.
+// Callers that tolerate a valueless secret check errors.Is(err, ErrNoVersion);
+// every other error is a real failure.
 func Value(st *store.Store, key []byte, sec *store.Secret) (string, *store.Version, error) {
 	if sec.Derived() {
 		origin := derive.Ref{Project: sec.Project, Name: sec.Name}
@@ -39,7 +46,7 @@ func Value(st *store.Store, key []byte, sec *store.Secret) (string, *store.Versi
 		return "", nil, err
 	}
 	if cur == nil {
-		return "", nil, fmt.Errorf("secret %s/%s has no versions", sec.Project, sec.Name)
+		return "", nil, fmt.Errorf("secret %s/%s: %w", sec.Project, sec.Name, ErrNoVersion)
 	}
 	plain, err := vault.Decrypt(key, cur.Nonce, cur.Ciphertext)
 	if err != nil {
@@ -48,22 +55,27 @@ func Value(st *store.Store, key []byte, sec *store.Secret) (string, *store.Versi
 	return string(plain), cur, nil
 }
 
-// HasValue reports whether sec can be resolved to anything at all: a derived
-// secret always can be attempted, a stored one needs a version.
+// Drift returns what store.Target.GHState needs in order to judge a
+// destination: the current version for a stored secret, or the digest of the
+// resolved value for a derived one, which has no version to compare.
 //
-// Callers use it to skip valueless secrets without treating "no version yet" as
-// an error — the distinction Value cannot make for them, because for a derived
-// secret the absence of a version is normal and for a stored one it is the
-// whole answer.
-func HasValue(st *store.Store, sec *store.Secret) (bool, error) {
-	if sec.Derived() {
-		return true, nil
-	}
-	cur, err := st.CurrentVersion(sec.ID)
+// Every view that reports target state goes through this one function, because
+// getting it wrong is silent and confident. GHState reads an empty digest as
+// "not derived" and falls through to the version comparison; a derived secret
+// whose derivation cannot resolve has neither, so passing both as empty makes
+// GHState answer "in sync" about the one secret nobody can currently compute.
+// The CLI and the mirror each reached that state independently — the mirror by
+// way of a branch added to fix it elsewhere — which is what moved this out of
+// both of them and into here.
+func Drift(st *store.Store, key []byte, sec *store.Secret) (*store.Version, string, error) {
+	v, cur, err := Value(st, key, sec)
 	if err != nil {
-		return false, err
+		return nil, "", err
 	}
-	return cur != nil, nil
+	if sec.Derived() {
+		return nil, vault.ValueDigest(key, v), nil
+	}
+	return cur, "", nil
 }
 
 // Lookup adapts the store to derive's resolver.
