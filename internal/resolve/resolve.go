@@ -1,13 +1,19 @@
 // Package resolve answers one question for the whole codebase: what is this
-// secret's plaintext?
+// secret's current value, and what is known about it?
 //
-// It exists as a single function because the answer stopped being "decrypt its
-// current version" when derived secrets arrived. Every reader — render, reveal,
-// the GitHub push, the mirror API — has to expand a derivation the same way, and
-// a reader that forgot would either fail on a secret with no versions or, worse,
-// push an empty value. Having one implementation is what makes "a derived value
-// cannot drift from its inputs" true everywhere rather than in the paths someone
-// remembered to update.
+// The answer stopped being "decrypt its current version" when derived secrets
+// arrived. Every reader — render, reveal, status, the GitHub push, the token
+// lookup, the mirror API — has to expand a derivation the same way, and a
+// reader that does it independently gets it wrong: first by never expanding at
+// all, then by recomputing the drift inputs and reporting a secret it could not
+// resolve as healthy.
+//
+// So Current returns everything at once and readers take what they need. The
+// point is not convenience: it is that a reader cannot reach a different answer
+// from the reader beside it, which is what makes "a derived value cannot drift
+// from its inputs" a property of the system rather than of the paths someone
+// remembered to update. If you find yourself computing a digest or fetching a
+// version outside this package, that is the bug this package exists to prevent.
 package resolve
 
 import (
@@ -28,54 +34,56 @@ import (
 // and cost every caller an extra round-trip per secret.
 var ErrNoVersion = errors.New("no versions")
 
-// Value returns sec's plaintext, expanding it if it is derived, together with
-// the version the value came from.
+// Resolved is everything a reader can need about a secret's current value.
 //
-// The version is nil for a derived secret — it has none, by construction — and
-// callers must treat it as the authority on that rather than re-querying.
-// Callers that tolerate a valueless secret check errors.Is(err, ErrNoVersion);
-// every other error is a real failure.
-func Value(st *store.Store, key []byte, sec *store.Secret) (string, *store.Version, error) {
+// It is one struct rather than several functions because every previous attempt
+// to serve readers separately produced two implementations of one decision, and
+// each time the second was wrong: first three readers that never expanded a
+// derivation at all, then a mirror that recomputed the drift inputs itself and
+// answered "in sync" for a secret it could not resolve. Returning everything at
+// once means a reader takes the fields it needs and cannot arrive at a
+// different answer from the reader beside it.
+type Resolved struct {
+	// Value is the plaintext, expanded if the secret is derived.
+	Value string
+	// Version is the row the value came from, nil for a derived secret — which
+	// has none, by construction. Callers must treat this as the authority
+	// rather than re-querying.
+	Version *store.Version
+	// Digest fingerprints a derived secret's resolved value, and is empty for a
+	// stored one, whose currency is answered by Version. Exactly one of the two
+	// is meaningful, which is the distinction store.Target.GHState reads.
+	Digest string
+}
+
+// Current resolves a secret: the single read path for the whole codebase.
+//
+// Callers that tolerate a secret with no value yet check
+// errors.Is(err, ErrNoVersion); every other error is a real failure. In
+// particular a derivation that cannot be expanded never reports ErrNoVersion —
+// derive names the missing input in its own message without wrapping, so a
+// broken derivation cannot be mistaken for an unwritten secret and skipped.
+func Current(st *store.Store, key []byte, sec *store.Secret) (Resolved, error) {
 	if sec.Derived() {
 		origin := derive.Ref{Project: sec.Project, Name: sec.Name}
 		v, err := derive.Resolve(origin, sec.Derivation, Lookup(st, key))
-		return v, nil, err
+		if err != nil {
+			return Resolved{}, err
+		}
+		return Resolved{Value: v, Digest: vault.ValueDigest(key, v)}, nil
 	}
 	cur, err := st.CurrentVersion(sec.ID)
 	if err != nil {
-		return "", nil, err
+		return Resolved{}, err
 	}
 	if cur == nil {
-		return "", nil, fmt.Errorf("secret %s/%s: %w", sec.Project, sec.Name, ErrNoVersion)
+		return Resolved{}, fmt.Errorf("secret %s/%s: %w", sec.Project, sec.Name, ErrNoVersion)
 	}
 	plain, err := vault.Decrypt(key, cur.Nonce, cur.Ciphertext)
 	if err != nil {
-		return "", nil, fmt.Errorf("secret %s/%s: %w", sec.Project, sec.Name, err)
+		return Resolved{}, fmt.Errorf("secret %s/%s: %w", sec.Project, sec.Name, err)
 	}
-	return string(plain), cur, nil
-}
-
-// Drift returns what store.Target.GHState needs in order to judge a
-// destination: the current version for a stored secret, or the digest of the
-// resolved value for a derived one, which has no version to compare.
-//
-// Every view that reports target state goes through this one function, because
-// getting it wrong is silent and confident. GHState reads an empty digest as
-// "not derived" and falls through to the version comparison; a derived secret
-// whose derivation cannot resolve has neither, so passing both as empty makes
-// GHState answer "in sync" about the one secret nobody can currently compute.
-// The CLI and the mirror each reached that state independently — the mirror by
-// way of a branch added to fix it elsewhere — which is what moved this out of
-// both of them and into here.
-func Drift(st *store.Store, key []byte, sec *store.Secret) (*store.Version, string, error) {
-	v, cur, err := Value(st, key, sec)
-	if err != nil {
-		return nil, "", err
-	}
-	if sec.Derived() {
-		return nil, vault.ValueDigest(key, v), nil
-	}
-	return cur, "", nil
+	return Resolved{Value: string(plain), Version: cur}, nil
 }
 
 // Lookup adapts the store to derive's resolver.

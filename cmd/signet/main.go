@@ -430,10 +430,11 @@ func runReveal(args []string) error {
 	if sec == nil {
 		return fmt.Errorf("no secret %s/%s", *project, *name)
 	}
-	plain, cur, err := resolve.Value(a.st, a.key, sec)
+	r, err := resolve.Current(a.st, a.key, sec)
 	if err != nil {
 		return err
 	}
+	plain := r.Value
 
 	// What the ledger records has to distinguish the two cases. A derived
 	// secret has no version to cite, and an entry naming one would be a
@@ -444,7 +445,7 @@ func runReveal(args []string) error {
 	if sec.Derived() {
 		details = fmt.Sprintf("revealed %s/%s (derived: %s) to stdout", *project, *name, sec.Derivation)
 	} else {
-		details = fmt.Sprintf("revealed %s/%s version %d #%s to stdout", *project, *name, cur.VersionNo, cur.VHash)
+		details = fmt.Sprintf("revealed %s/%s version %d #%s to stdout", *project, *name, r.Version.VersionNo, r.Version.VHash)
 	}
 	if _, err := a.st.AppendAudit(store.AuditRecord{
 		Actor: cliActor(), Action: "secret.reveal", SecretID: sec.ID,
@@ -616,6 +617,11 @@ func (a *app) clearDerivation(sec *store.Secret, project, name string) error {
 	if !sec.Derived() {
 		return fmt.Errorf("%s/%s is not derived", project, name)
 	}
+	// The one deliberate read that does not go through resolve, and the reason
+	// is the point: this asks what is *behind* the derivation, which resolve
+	// will never answer — Current short-circuits on Derived() and reports the
+	// computed value. Reading the version directly is the only way to know
+	// whether clearing the derivation leaves anything at all.
 	cur, err := a.st.CurrentVersion(sec.ID)
 	if err != nil {
 		return err
@@ -762,7 +768,7 @@ func (a *app) projectValues(project string) (map[string]string, map[string]error
 		if sec.Project != project {
 			continue
 		}
-		v, _, err := resolve.Value(a.st, a.key, &sec)
+		r, err := resolve.Current(a.st, a.key, &sec)
 		switch {
 		case errors.Is(err, resolve.ErrNoVersion):
 			// Absent, not broken — the state every secret passes through
@@ -772,7 +778,7 @@ func (a *app) projectValues(project string) (map[string]string, map[string]error
 			problems[sec.Name] = err
 			continue
 		}
-		want[sec.Name] = v
+		want[sec.Name] = r.Value
 	}
 	return want, problems, nil
 }
@@ -787,7 +793,11 @@ func (a *app) projectValues(project string) (map[string]string, map[string]error
 // sync" — the most confident possible answer about the one secret nobody can
 // currently compute.
 func (a *app) ghDrift(sec *store.Secret) (*store.Version, string, error) {
-	return resolve.Drift(a.st, a.key, sec)
+	r, err := resolve.Current(a.st, a.key, sec)
+	if err != nil {
+		return nil, "", err
+	}
+	return r.Version, r.Digest, nil
 }
 
 // projectValuesStrict is projectValues for callers that must not proceed on a

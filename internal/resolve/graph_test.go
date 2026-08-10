@@ -167,22 +167,29 @@ func TestValueReportsNoVersionForDerivedSecrets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	v, cur, err := Value(st, key, sec)
+	r, err := Current(st, key, sec)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v != "u:hunter2@h" {
-		t.Errorf("got %q", v)
+	if r.Value != "u:hunter2@h" {
+		t.Errorf("got %q", r.Value)
 	}
-	if cur != nil {
+	if r.Version != nil {
 		t.Error("a derived secret reported a version; callers treat non-nil as a stored value")
+	}
+	if r.Digest == "" {
+		t.Error("a derived secret reported no digest; GHState reads an empty digest as 'not derived'")
 	}
 
 	stored, err := st.GetSecret("p", "PW")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, cur, err = Value(st, key, stored); err != nil || cur == nil {
-		t.Errorf("a stored secret must report its version: cur=%v err=%v", cur, err)
+	sr, err := Current(st, key, stored)
+	if err != nil || sr.Version == nil {
+		t.Errorf("a stored secret must report its version: cur=%v err=%v", sr.Version, err)
+	}
+	if sr.Digest != "" {
+		t.Error("a stored secret reported a digest; exactly one of Version/Digest is meaningful")
 	}
 }

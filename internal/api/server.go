@@ -201,7 +201,7 @@ func (s *Server) buildViews() ([]ProjectView, error) {
 		unresolved := map[string]string{}
 		for i := range secs {
 			name := secs[i].Name
-			plain, cur, err := resolve.Value(s.st, s.key, &secs[i])
+			r, err := resolve.Current(s.st, s.key, &secs[i])
 			switch {
 			case errors.Is(err, resolve.ErrNoVersion):
 				// Created but never written. Not a failure — every secret
@@ -217,11 +217,9 @@ func (s *Server) buildViews() ([]ProjectView, error) {
 				current[name] = nil
 				unresolved[name] = err.Error()
 			default:
-				current[name] = cur
-				want[name] = plain
-				if secs[i].Derived() {
-					digests[name] = vault.ValueDigest(s.key, plain)
-				}
+				current[name] = r.Version
+				want[name] = r.Value
+				digests[name] = r.Digest
 			}
 		}
 

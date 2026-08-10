@@ -8,7 +8,6 @@ import (
 
 	"github.com/Einlanzerous/signet/internal/resolve"
 	"github.com/Einlanzerous/signet/internal/store"
-	"github.com/Einlanzerous/signet/internal/vault"
 )
 
 // PushResult records the outcome of pushing one gh-actions target.
@@ -62,11 +61,11 @@ func PushSecret(ctx context.Context, st *store.Store, key []byte, gh *GHClient, 
 	// composed value pushed to GitHub is computed from the same inputs the local
 	// render used. Going through resolve is what keeps those two answers from
 	// being produced by two different pieces of code.
-	plaintextStr, cur, err := resolve.Value(st, key, sec)
+	r, err := resolve.Current(st, key, sec)
 	if err != nil {
 		return nil, err
 	}
-	plaintext := []byte(plaintextStr)
+	plaintext := []byte(r.Value)
 
 	// What the ledger cites, and what the target records as pushed.
 	//
@@ -79,17 +78,16 @@ func PushSecret(ctx context.Context, st *store.Store, key []byte, gh *GHClient, 
 	// resolve.Value is the authority on whether a version exists: nil means the
 	// secret is derived and has none. Re-querying here to find out was both a
 	// second round-trip and an unchecked dereference away from a crash.
-	prov := store.PushProvenance{}
+	prov := store.PushProvenance{Digest: r.Digest}
 	provenance := ""
-	if cur != nil {
-		prov.VersionID = cur.ID
-		provenance = "version #" + cur.VHash
+	if r.Version != nil {
+		prov.VersionID = r.Version.ID
+		provenance = "version #" + r.Version.VHash
 	} else {
 		// A derived secret's currency is the digest of what was delivered.
 		// Without recording it the target has nothing to compare and GHState
 		// reports "in sync" forever, however far the inputs travel.
-		prov.Digest = vault.ValueDigest(key, plaintextStr)
-		provenance = "derived from " + sec.Derivation + " · #" + prov.Digest
+		provenance = "derived from " + sec.Derivation + " · #" + r.Digest
 	}
 	targets, err := st.TargetsForSecret(sec.ID)
 	if err != nil {

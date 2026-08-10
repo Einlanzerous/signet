@@ -2,9 +2,11 @@
 package ops
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/Einlanzerous/signet/internal/envfile"
+	"github.com/Einlanzerous/signet/internal/resolve"
 	"github.com/Einlanzerous/signet/internal/store"
 	"github.com/Einlanzerous/signet/internal/vault"
 )
@@ -55,19 +57,21 @@ func ImportEnv(st *store.Store, key []byte, project, scope, path, actor string, 
 			continue
 		}
 		if !create {
-			cur, err := st.CurrentVersion(sec.ID)
-			if err != nil {
+			// Through resolve rather than reading the version directly. The
+			// derived skip above already makes this unreachable for a derived
+			// secret, but that is correctness by statement ordering — going
+			// through the one read path means reordering these blocks cannot
+			// silently turn this into a comparison against a value that is
+			// computed rather than stored.
+			r, err := resolve.Current(st, key, sec)
+			switch {
+			case errors.Is(err, resolve.ErrNoVersion):
+				// Registered but never written; the file supplies its first value.
+			case err != nil:
 				return res, err
-			}
-			if cur != nil {
-				plain, err := vault.Decrypt(key, cur.Nonce, cur.Ciphertext)
-				if err != nil {
-					return res, err
-				}
-				if string(plain) == p.Value {
-					res.Unchanged++
-					continue
-				}
+			case r.Value == p.Value:
+				res.Unchanged++
+				continue
 			}
 			outcome = store.OutcomeUpdated
 		}

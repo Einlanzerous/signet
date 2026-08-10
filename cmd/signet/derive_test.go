@@ -295,11 +295,11 @@ func TestClearDerivationRestoresTheStoredValue(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer a.close()
-	v, _, err := resolve.Value(a.st, a.key, sec)
+	r, err := resolve.Current(a.st, a.key, sec)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v != "hand-written" {
+	if v := r.Value; v != "hand-written" {
 		t.Errorf("cleared secret resolves to %q, want the stored value back", v)
 	}
 }
