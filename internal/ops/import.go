@@ -2,9 +2,11 @@
 package ops
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/Einlanzerous/signet/internal/envfile"
+	"github.com/Einlanzerous/signet/internal/resolve"
 	"github.com/Einlanzerous/signet/internal/store"
 	"github.com/Einlanzerous/signet/internal/vault"
 )
@@ -15,6 +17,11 @@ type ImportResult struct {
 	Updated   int
 	Unchanged int
 	Keys      []string
+	// Skipped names keys the file holds that signet declined to write, because
+	// the vault entry is derived and has no stored value to import into. Named
+	// rather than counted: the operator needs to know *which* key was left
+	// alone to satisfy themselves it was the right one.
+	Skipped []string
 }
 
 // ImportEnv imports every pair of the env file at path into project's secrets,
@@ -35,20 +42,36 @@ func ImportEnv(st *store.Store, key []byte, project, scope, path, actor string, 
 		}
 		outcome := store.OutcomeCreated
 		create := sec == nil
+		// Importing onto a derived secret would write the composed value back
+		// into the vault as a stored version — the exact invariant `set`
+		// refuses to break, reached through a different door. It is also the
+		// likeliest way to hit it: re-importing an env file signet itself
+		// rendered, which by construction contains the resolved value.
+		//
+		// Skipped rather than fatal. An import is a whole file, and failing the
+		// run would strand every other key over one that is managed correctly
+		// already; the count reports it so the operator is not left wondering
+		// why a key they can see was not created.
+		if !create && sec.Derived() {
+			res.Skipped = append(res.Skipped, p.Key)
+			continue
+		}
 		if !create {
-			cur, err := st.CurrentVersion(sec.ID)
-			if err != nil {
+			// Through resolve rather than reading the version directly. The
+			// derived skip above already makes this unreachable for a derived
+			// secret, but that is correctness by statement ordering — going
+			// through the one read path means reordering these blocks cannot
+			// silently turn this into a comparison against a value that is
+			// computed rather than stored.
+			r, err := resolve.Current(st, key, sec)
+			switch {
+			case errors.Is(err, resolve.ErrNoVersion):
+				// Registered but never written; the file supplies its first value.
+			case err != nil:
 				return res, err
-			}
-			if cur != nil {
-				plain, err := vault.Decrypt(key, cur.Nonce, cur.Ciphertext)
-				if err != nil {
-					return res, err
-				}
-				if string(plain) == p.Value {
-					res.Unchanged++
-					continue
-				}
+			case r.Value == p.Value:
+				res.Unchanged++
+				continue
 			}
 			outcome = store.OutcomeUpdated
 		}

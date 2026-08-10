@@ -6,8 +6,8 @@ import (
 	"log"
 	"time"
 
+	"github.com/Einlanzerous/signet/internal/resolve"
 	"github.com/Einlanzerous/signet/internal/store"
-	"github.com/Einlanzerous/signet/internal/vault"
 )
 
 // PushResult records the outcome of pushing one gh-actions target.
@@ -40,8 +40,8 @@ type PushResult struct {
 // compares against to decide whether a destination has drifted, so a silent
 // failure here leaves the target reading "in sync" against a version it no
 // longer holds, and nothing later corrects it.
-func recordPush(st *store.Store, res *PushResult, rec store.AuditRecord, state, lastErr, versionID, pushedAt string) {
-	if err := st.UpdateTargetPush(res.TargetID, state, lastErr, versionID, pushedAt); err != nil {
+func recordPush(st *store.Store, res *PushResult, rec store.AuditRecord, state, lastErr string, prov *store.PushProvenance, pushedAt string) {
+	if err := st.UpdateTargetPush(res.TargetID, state, lastErr, prov, pushedAt); err != nil {
 		res.StateErr = err.Error()
 		log.Printf("target state write failed for %s: %v — the push happened but %s still reads as its previous state",
 			res.Repo, err, res.TargetID)
@@ -57,16 +57,38 @@ func recordPush(st *store.Store, res *PushResult, rec store.AuditRecord, state, 
 // gh-actions target attached to it, recording state and audit entries. role is
 // the normalized identity behind actor, carried into the audit chain.
 func PushSecret(ctx context.Context, st *store.Store, key []byte, gh *GHClient, sec *store.Secret, actor string, role store.ActorRole) ([]PushResult, error) {
-	cur, err := st.CurrentVersion(sec.ID)
+	// Derived secrets are expanded here rather than read from a version, so a
+	// composed value pushed to GitHub is computed from the same inputs the local
+	// render used. Going through resolve is what keeps those two answers from
+	// being produced by two different pieces of code.
+	r, err := resolve.Current(st, key, sec)
 	if err != nil {
 		return nil, err
 	}
-	if cur == nil {
-		return nil, fmt.Errorf("secret %s/%s has no versions", sec.Project, sec.Name)
-	}
-	plaintext, err := vault.Decrypt(key, cur.Nonce, cur.Ciphertext)
-	if err != nil {
-		return nil, fmt.Errorf("secret %s/%s: %w", sec.Project, sec.Name, err)
+	plaintext := []byte(r.Value)
+
+	// What the ledger cites, and what the target records as pushed.
+	//
+	// A derived secret has no version row, so there is no id to record and no
+	// vhash to quote. Rather than synthesize one, the entry names the
+	// provenance instead — a hash over the resolved value would look like the
+	// vhash beside it in the log while meaning something else entirely (that
+	// one is over ciphertext, which is nonce-randomized and not comparable
+	// across encryptions), and two hashes wearing one label is a trap.
+	// resolve.Current is the authority on whether a version exists: a nil
+	// Version means the secret is derived and has none. Re-querying here to
+	// find out was both a second round-trip and an unchecked dereference away
+	// from a crash.
+	prov := store.PushProvenance{Digest: r.Digest}
+	provenance := ""
+	if r.Version != nil {
+		prov.VersionID = r.Version.ID
+		provenance = "version #" + r.Version.VHash
+	} else {
+		// A derived secret's currency is the digest of what was delivered.
+		// Without recording it the target has nothing to compare and GHState
+		// reports "in sync" forever, however far the inputs travel.
+		provenance = "derived from " + sec.Derivation + " · #" + r.Digest
 	}
 	targets, err := st.TargetsForSecret(sec.ID)
 	if err != nil {
@@ -112,18 +134,18 @@ func PushSecret(ctx context.Context, st *store.Store, key []byte, gh *GHClient, 
 				Actor: actor, Action: "sync.push.failed", SecretID: sec.ID, TargetID: t.ID,
 				Details:   fmt.Sprintf("%s → %s/%s: %s", sec.Name, cfg.Repo, cfg.SecretName, err),
 				EventKind: kind, ActorRole: role, Status: status,
-			}, "error", err.Error(), "", "")
+			}, "error", err.Error(), nil, "")
 		} else {
 			res.State = "in sync"
 			status.Outcome = store.OutcomeDelivered
-			detail := fmt.Sprintf("sealed & pushed %s → %s · Actions secret %s · version #%s", sec.Name, cfg.Repo, cfg.SecretName, cur.VHash)
+			detail := fmt.Sprintf("sealed & pushed %s → %s · Actions secret %s · %s", sec.Name, cfg.Repo, cfg.SecretName, provenance)
 			if res.Note != "" {
 				detail += " (" + res.Note + ")"
 			}
 			recordPush(st, &res, store.AuditRecord{
 				Actor: actor, Action: "sync.push", SecretID: sec.ID, TargetID: t.ID,
 				Details: detail, EventKind: kind, ActorRole: role, Status: status,
-			}, "in sync", "", cur.ID, nowRFC3339())
+			}, "in sync", "", &prov, nowRFC3339())
 		}
 		results = append(results, res)
 	}

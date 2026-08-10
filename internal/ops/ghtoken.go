@@ -1,12 +1,13 @@
 package ops
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/Einlanzerous/signet/internal/resolve"
 	"github.com/Einlanzerous/signet/internal/store"
-	"github.com/Einlanzerous/signet/internal/vault"
 )
 
 // The vault's own GitHub credential. sync reads it when the environment
@@ -126,33 +127,35 @@ func ResolveGHTokenFor(st *store.Store, key []byte, envToken, actor string, role
 		return GHToken{}, fmt.Errorf("%s expired on %s — cannot push to GitHub Actions; issue a new PAT, then %s",
 			ref, on, ghTokenFix)
 	}
-	cur, err := st.CurrentVersion(sec.ID)
-	if err != nil {
-		return GHToken{}, err
-	}
+	// Through resolve like every other reader, so a derived PAT resolves
+	// instead of reporting no value and recommending `signet set` — which
+	// refuses derived secrets, leaving an instruction that cannot be followed.
+	r, err := resolve.Current(st, key, sec)
+	switch {
 	// A registered secret with nothing in it is a half-finished `set`, not a
 	// broken vault, so it gets the same one-command fix as an absent one rather
 	// than a bare statement of the fact.
-	if cur == nil {
+	case errors.Is(err, resolve.ErrNoVersion):
 		return GHToken{}, fmt.Errorf("%s, and %s has no value stored — cannot push to GitHub Actions; store the PAT with %s",
 			GHTokenEnvNone, ref, ghTokenFix)
+	// A derivation that will not expand names its own cause — a missing input,
+	// a cycle — and that is more use here than a generic failure to read.
+	case err != nil:
+		return GHToken{}, fmt.Errorf("%s cannot be resolved — cannot push to GitHub Actions: %w", ref, err)
 	}
-	plain, err := vault.Decrypt(key, cur.Nonce, cur.Ciphertext)
-	if err != nil {
-		return GHToken{}, fmt.Errorf("%s: %w", ref, err)
-	}
+	plain := r.Value
 	// Trimmed at the point of use. The value goes straight into an Authorization
 	// header, and a trailing newline from `printf | signet set` or a \r carried
 	// in from a CRLF env file is refused by the transport with an error that
 	// names neither the credential nor the whitespace that broke it.
-	token := strings.TrimSpace(string(plain))
+	token := strings.TrimSpace(plain)
 	if token == "" {
 		return GHToken{}, fmt.Errorf("%s is empty — cannot push to GitHub Actions; store the PAT with %s", ref, ghTokenFix)
 	}
 	if _, err := st.AppendAudit(store.AuditRecord{
 		Actor: actor, Action: ActionSecretRead, SecretID: sec.ID,
-		Details: fmt.Sprintf("read %s version %d #%s to %s (%s)",
-			ref, cur.VersionNo, cur.VHash, purpose, GHTokenEnvNone),
+		Details: fmt.Sprintf("read %s %s to %s (%s)",
+			ref, provenanceOf(r), purpose, GHTokenEnvNone),
 		EventKind: store.KindSecretReveal, ActorRole: role,
 		Status: &store.AuditStatus{Outcome: store.OutcomeDelivered},
 	}); err != nil {
@@ -182,4 +185,14 @@ func expiredOn(expiresAt string) (bool, string) {
 		return false, ""
 	}
 	return true, t.Format("2006-01-02")
+}
+
+// provenanceOf names what the ledger should cite for a value that was read: the
+// version a stored secret came from, or the fingerprint of a derived one, which
+// has no version to name.
+func provenanceOf(r resolve.Resolved) string {
+	if r.Version != nil {
+		return fmt.Sprintf("version %d #%s", r.Version.VersionNo, r.Version.VHash)
+	}
+	return "derived #" + r.Digest
 }

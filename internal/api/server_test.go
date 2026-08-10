@@ -653,3 +653,64 @@ func TestRemoveTargetCommand(t *testing.T) {
 		t.Fatalf("chain broken: ok=%v badSeq=%d err=%v", ok, badSeq, err)
 	}
 }
+
+// A derived secret whose derivation cannot resolve must never be reported
+// healthy. GHState answers "in sync" when given neither a version nor a digest,
+// so the mirror has to keep an unresolvable secret away from it entirely — this
+// is the bug the first fix for the mirror re-created in its own error branch.
+func TestMirrorNeverReportsAnUnresolvableSecretInSync(t *testing.T) {
+	srv, st, _, _ := testServer(t)
+
+	var secID string
+	if _, err := st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
+		sec, err := m.CreateSecret("drydock", "DSN", "", false, "")
+		if err != nil {
+			return store.AuditRecord{}, err
+		}
+		secID = sec.ID
+		if err := m.SetDerivation(sec.ID, "postgres://u:{{construct-server/MISSING}}@h/db"); err != nil {
+			return store.AuditRecord{}, err
+		}
+		if _, err := m.AddGHTarget(sec.ID, "owner/repo", "DSN"); err != nil {
+			return store.AuditRecord{}, err
+		}
+		return store.AuditRecord{Actor: "test", Action: "seed", SecretID: sec.ID,
+			EventKind: store.KindSecretWrite, ActorRole: store.RoleHuman}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// A prior successful push, so the target is past the "never" state and the
+	// switch actually reaches the comparison being tested.
+	tgts, err := st.TargetsForSecret(secID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateTargetPush(tgts[0].ID, "in sync", "",
+		&store.PushProvenance{Digest: "aaaaaaaaaaaa"}, "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+
+	views, err := srv.buildViews()
+	if err != nil {
+		t.Fatalf("one unresolvable secret blanked the whole mirror: %v", err)
+	}
+	var sv *SecretView
+	for i := range views {
+		for j := range views[i].Secrets {
+			if views[i].Secrets[j].Name == "DSN" {
+				sv = &views[i].Secrets[j]
+			}
+		}
+	}
+	if sv == nil {
+		t.Fatal("mirror dropped the unresolvable secret entirely")
+	}
+	if sv.Unresolved == "" {
+		t.Error("nothing on the view distinguishes an unresolvable secret from a healthy derived one")
+	}
+	for _, tv := range sv.Targets {
+		if tv.State == "in sync" {
+			t.Errorf("target reported %q for a secret that cannot be computed", tv.State)
+		}
+	}
+}

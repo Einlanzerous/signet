@@ -21,6 +21,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -37,8 +38,10 @@ import (
 
 	"github.com/Einlanzerous/signet/internal/api"
 	"github.com/Einlanzerous/signet/internal/config"
+	"github.com/Einlanzerous/signet/internal/derive"
 	"github.com/Einlanzerous/signet/internal/envfile"
 	"github.com/Einlanzerous/signet/internal/ops"
+	"github.com/Einlanzerous/signet/internal/resolve"
 	"github.com/Einlanzerous/signet/internal/store"
 	syncpkg "github.com/Einlanzerous/signet/internal/sync"
 	"github.com/Einlanzerous/signet/internal/vault"
@@ -69,6 +72,8 @@ func main() {
 		err = runRender(args)
 	case "target":
 		err = runTarget(args)
+	case "derive":
+		err = runDerive(args)
 	case "sync":
 		err = runSync(args)
 	case "status":
@@ -92,7 +97,7 @@ func main() {
 }
 
 func usage(w io.Writer) {
-	fmt.Fprintln(w, "commands: init, import, set, reveal, render, target, sync, status, audit, serve, version")
+	fmt.Fprintln(w, "commands: init, import, set, derive, reveal, render, target, sync, status, audit, serve, version")
 }
 
 func isFlag(s string) bool { return len(s) > 0 && s[0] == '-' }
@@ -193,6 +198,10 @@ func runImport(args []string) error {
 	}
 	fmt.Printf("imported %s → project %s: %d created, %d updated, %d unchanged (%d keys)\n",
 		path, *project, res.Created, res.Updated, res.Unchanged, len(res.Keys))
+	if len(res.Skipped) > 0 {
+		fmt.Printf("%d derived, left alone: %s\n", len(res.Skipped), strings.Join(res.Skipped, ", "))
+		fmt.Println("  their values are composed from other secrets; importing would have stored a copy that can drift")
+	}
 	fmt.Printf("file target registered: %s\n", path)
 	return nil
 }
@@ -256,7 +265,27 @@ func runSet(args []string) error {
 	if err != nil {
 		return err
 	}
+	// The core invariant of a derived secret: it has no independently settable
+	// value. Allowing this would recreate the exact bug the feature exists to
+	// remove — a stored copy that can drift from the inputs it was composed
+	// from, with `render --check` reporting both in sync because each matches
+	// what the vault holds.
+	if sec != nil && sec.Derived() {
+		return fmt.Errorf("%s/%s is derived from %s — it has no value of its own to set.\n"+
+			"Set one of its inputs instead, or `signet derive --from` to change how it is composed",
+			*project, *name, sec.Derivation)
+	}
 	nonce, ct, err := vault.Encrypt(a.key, []byte(value))
+	if err != nil {
+		return err
+	}
+
+	// Anything composed from this secret changes the moment this write lands,
+	// and is rewritten by the next render. Saying so before the write is the
+	// difference between a rotation and a rotation plus four surprises — the
+	// motivating case spans projects, so the operator has no reason to be
+	// looking at the affected files.
+	dependents, err := resolve.Dependents(a.st, *project, *name)
 	if err != nil {
 		return err
 	}
@@ -311,8 +340,27 @@ func runSet(args []string) error {
 		return err
 	}
 	fmt.Printf("%s/%s → version %d #%s%s\n", *project, *name, v.VersionNo, v.VHash, expiryNote)
+	reportDependents(dependents, *project, *name)
 	warnUndelivered(a, *project, *name)
 	return nil
+}
+
+// reportDependents names every derived secret this write just changed.
+//
+// It reports rather than asks. The write is already committed by the time this
+// runs, which is the honest ordering: the derived values changed at the same
+// instant, because they are not stored — there is no window in which the
+// operator could have been asked to confirm one but not the other. What is
+// actionable is knowing which renders to run next, and that is what this says.
+func reportDependents(dependents []store.Secret, project, name string) {
+	if len(dependents) == 0 {
+		return
+	}
+	fmt.Printf("%d derived secret(s) now resolve differently:\n", len(dependents))
+	for _, d := range dependents {
+		fmt.Printf("  %s/%s — %s\n", d.Project, d.Name, d.Derivation)
+	}
+	fmt.Println("run `signet render` for their projects to write the new values")
 }
 
 // warnUndelivered reports a value that landed in the vault but that nothing
@@ -382,26 +430,225 @@ func runReveal(args []string) error {
 	if sec == nil {
 		return fmt.Errorf("no secret %s/%s", *project, *name)
 	}
-	cur, err := a.st.CurrentVersion(sec.ID)
+	r, err := resolve.Current(a.st, a.key, sec)
 	if err != nil {
 		return err
 	}
-	if cur == nil {
-		return fmt.Errorf("%s/%s has no versions", *project, *name)
-	}
-	plain, err := vault.Decrypt(a.key, cur.Nonce, cur.Ciphertext)
-	if err != nil {
-		return err
+	plain := r.Value
+
+	// What the ledger records has to distinguish the two cases. A derived
+	// secret has no version to cite, and an entry naming one would be a
+	// fiction; what it has instead is a provenance — the template — and that
+	// is the thing someone auditing the reveal needs in order to explain where
+	// the value came from.
+	details := ""
+	if sec.Derived() {
+		details = fmt.Sprintf("revealed %s/%s (derived: %s) to stdout", *project, *name, sec.Derivation)
+	} else {
+		details = fmt.Sprintf("revealed %s/%s version %d #%s to stdout", *project, *name, r.Version.VersionNo, r.Version.VHash)
 	}
 	if _, err := a.st.AppendAudit(store.AuditRecord{
 		Actor: cliActor(), Action: "secret.reveal", SecretID: sec.ID,
-		Details:   fmt.Sprintf("revealed %s/%s version %d #%s to stdout", *project, *name, cur.VersionNo, cur.VHash),
+		Details:   details,
 		EventKind: store.KindSecretReveal, ActorRole: store.RoleHuman,
 		Status: &store.AuditStatus{Outcome: store.OutcomeDelivered},
 	}); err != nil {
 		return err
 	}
-	fmt.Println(string(plain))
+
+	// Revealing a derived secret prints its inputs' plaintext, so each input's
+	// own ledger has to record that its value was disclosed. Without this the
+	// entry above is the only trace, and `signet audit --secret <input>` shows
+	// nothing — a read channel that crosses projects and leaves no mark on the
+	// credential actually exposed. The vault's premise is that plaintext leaves
+	// only in audited ways; "audited" has to mean audited where someone
+	// investigating that credential would look.
+	inputs, err := resolve.Inputs(a.st, sec)
+	if err != nil {
+		return err
+	}
+	for _, in := range inputs {
+		if _, err := a.st.AppendAudit(store.AuditRecord{
+			Actor: cliActor(), Action: "secret.reveal", SecretID: in.ID,
+			Details: fmt.Sprintf("value disclosed via reveal of %s/%s, which derives from it",
+				*project, *name),
+			EventKind: store.KindSecretReveal, ActorRole: store.RoleHuman,
+			Status: &store.AuditStatus{Outcome: store.OutcomeDelivered},
+		}); err != nil {
+			return err
+		}
+	}
+	// The provenance goes to stderr so `reveal` stays pipeable: the value alone
+	// is on stdout, exactly as before, and a reader piping it into a file does
+	// not get an explanation baked into their credential.
+	if sec.Derived() {
+		fmt.Fprintf(os.Stderr, "%s/%s is derived from: %s\n", *project, *name, sec.Derivation)
+	}
+	fmt.Println(plain)
+	return nil
+}
+
+// ---- derive -----------------------------------------------------------------
+
+func runDerive(args []string) error {
+	fs := flag.NewFlagSet("derive", flag.ExitOnError)
+	project := fs.String("project", "", "project (required)")
+	name := fs.String("name", "", "secret name (required)")
+	from := fs.String("from", "", "template, e.g. 'postgres://u:{{other/PW}}@h/db' (required)")
+	scope := fs.String("scope", "", "scope, when creating")
+	replace := fs.Bool("replace", false, "convert an existing stored secret, abandoning its stored value")
+	clear := fs.Bool("clear", false, "stop deriving; the last stored version becomes current again")
+	fs.Parse(args)
+	if *project == "" || *name == "" || (*from == "" && !*clear) {
+		return fmt.Errorf("usage: signet derive --project <p> --name <N> --from '<template>' [--scope s] [--replace]\n" +
+			"       signet derive --project <p> --name <N> --clear\n" +
+			"  {{NAME}} refers to this project; {{other-project/NAME}} crosses projects")
+	}
+	if *clear && *from != "" {
+		return fmt.Errorf("--clear and --from are opposites; pass one")
+	}
+
+	// Parsed before the vault is opened: a malformed template should fail on
+	// the spot, not after a write has been prepared.
+	var tmpl derive.Template
+	if !*clear {
+		var err error
+		tmpl, err = derive.Parse(*from)
+		if err != nil {
+			return err
+		}
+	}
+
+	a, err := setup()
+	if err != nil {
+		return err
+	}
+	defer a.close()
+
+	existing, err := a.st.GetSecret(*project, *name)
+	if err != nil {
+		return err
+	}
+
+	if *clear {
+		return a.clearDerivation(existing, *project, *name)
+	}
+	// Converting a stored secret has to be asked for. Its stored value is a
+	// credential that may be live somewhere signet cannot see, and replacing it
+	// with a computed one on the next render is not a conversion — it is a
+	// rotation nobody asked for. --replace is how the operator says they meant
+	// it, which is also the shape the motivating case takes: the DSN is already
+	// in the vault as a hand-composed value, and this is what un-duplicates it.
+	//
+	// The old versions are left in place rather than deleted. Nothing reads them
+	// while the derivation stands, the ledger's history stays intact, and
+	// clearing the derivation restores the last stored value — a destructive
+	// conversion would be the one operation in this vault with no way back.
+	if existing != nil && !existing.Derived() && !*replace {
+		return fmt.Errorf("%s/%s already exists as a stored secret holding a value of its own.\n"+
+			"Re-run with --replace to compose it from other secrets instead; its stored value is kept "+
+			"in history but stops being used", *project, *name)
+	}
+
+	// Resolve before committing. A derivation that cannot expand is a secret
+	// that will fail every render from now on, and the moment the operator can
+	// still fix it cheaply is now, while they are looking at the template.
+	origin := derive.Ref{Project: *project, Name: *name}
+	if _, err := derive.Resolve(origin, *from, resolve.Lookup(a.st, a.key)); err != nil {
+		return fmt.Errorf("%w\n(the derivation was not saved)", err)
+	}
+
+	verb := "derived"
+	switch {
+	case existing != nil && existing.Derived():
+		verb = "re-derived"
+	case existing != nil:
+		verb = "converted to derived"
+	}
+	_, _, err = store.MutateValue(a.st, func(m *store.Mutation) (*store.Secret, store.AuditRecord, error) {
+		sec := existing
+		if sec == nil {
+			created, err := m.CreateSecret(*project, *name, *scope, false, "")
+			if err != nil {
+				return nil, store.AuditRecord{}, err
+			}
+			sec = created
+		}
+		if err := m.SetDerivation(sec.ID, *from); err != nil {
+			return nil, store.AuditRecord{}, err
+		}
+		return sec, store.AuditRecord{
+			Actor: cliActor(), Action: "secret.derive", SecretID: sec.ID,
+			Details:   fmt.Sprintf("%s %s/%s from %s", verb, *project, *name, *from),
+			EventKind: store.KindSecretWrite, ActorRole: store.RoleHuman,
+			Status: &store.AuditStatus{Outcome: store.OutcomeDelivered},
+		}, nil
+	})
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("%s %s/%s\n", verb, *project, *name)
+	for _, ref := range tmpl.Refs() {
+		fmt.Printf("  ← %s\n", ref.QualifiedIn(*project))
+	}
+	fmt.Println("no value is stored; it is expanded on every render, reveal and sync")
+	// Same gap `set` warns about, and easier to fall into here: a newly derived
+	// secret that no file target manages is a value nothing will ever write.
+	warnUndelivered(a, *project, *name)
+	return nil
+}
+
+// clearDerivation turns a derived secret back into an ordinary one.
+//
+// It exists because keeping a converted secret's old versions is only a real
+// safety net if there is a way to get back to them — otherwise "the stored
+// value is kept in history" describes data that can never be read again, which
+// is indistinguishable from having deleted it.
+//
+// A secret converted with --replace returns to its last stored value. One
+// created as derived has none, and is refused rather than left as an entry with
+// no value at all: signet has no way to delete a secret, so that state would be
+// permanent and invisible.
+func (a *app) clearDerivation(sec *store.Secret, project, name string) error {
+	if sec == nil {
+		return fmt.Errorf("no secret %s/%s", project, name)
+	}
+	if !sec.Derived() {
+		return fmt.Errorf("%s/%s is not derived", project, name)
+	}
+	// The one deliberate read that does not go through resolve, and the reason
+	// is the point: this asks what is *behind* the derivation, which resolve
+	// will never answer — Current short-circuits on Derived() and reports the
+	// computed value. Reading the version directly is the only way to know
+	// whether clearing the derivation leaves anything at all.
+	cur, err := a.st.CurrentVersion(sec.ID)
+	if err != nil {
+		return err
+	}
+	if cur == nil {
+		return fmt.Errorf("%s/%s was created as a derived secret and has no stored value to fall back to.\n"+
+			"Clearing its derivation would leave an entry with no value and no way to remove it; "+
+			"use `signet set` to give it one first, or leave it derived", project, name)
+	}
+	was := sec.Derivation
+	if _, err := a.st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
+		if err := m.SetDerivation(sec.ID, ""); err != nil {
+			return store.AuditRecord{}, err
+		}
+		return store.AuditRecord{
+			Actor: cliActor(), Action: "secret.derive.clear", SecretID: sec.ID,
+			Details: fmt.Sprintf("cleared derivation of %s/%s (was %s) · version %d #%s is current again",
+				project, name, was, cur.VersionNo, cur.VHash),
+			EventKind: store.KindSecretWrite, ActorRole: store.RoleHuman,
+			Status: &store.AuditStatus{Outcome: store.OutcomeUpdated},
+		}, nil
+	}); err != nil {
+		return err
+	}
+	fmt.Printf("%s/%s is no longer derived — version %d #%s is current again\n",
+		project, name, cur.VersionNo, cur.VHash)
+	fmt.Println("its value can drift from what it was composed from again; `signet set` now works on it")
 	return nil
 }
 
@@ -438,7 +685,7 @@ func runRender(args []string) error {
 	if len(targets) == 0 {
 		return fmt.Errorf("project %s has no file targets (import an env file first)", *project)
 	}
-	want, err := a.projectValues(*project)
+	want, err := a.projectValuesStrict(*project)
 	if err != nil {
 		return err
 	}
@@ -484,7 +731,7 @@ func runRender(args []string) error {
 		// The file is already written, so a failure here cannot be undone — but
 		// it leaves the target's recorded state describing the render before
 		// this one, which is worth saying out loud rather than dropping.
-		if err := a.st.UpdateTargetPush(t.ID, "in sync", "", "", time.Now().UTC().Format(time.RFC3339)); err != nil {
+		if err := a.st.UpdateTargetPush(t.ID, "in sync", "", &store.PushProvenance{}, time.Now().UTC().Format(time.RFC3339)); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: rendered %s but could not record its state: %v\n", cfg.Path, err)
 		}
 		if _, err := a.st.AppendAudit(store.AuditRecord{
@@ -500,31 +747,82 @@ func runRender(args []string) error {
 	return nil
 }
 
-// projectValues decrypts every current value of a project into a map.
-func (a *app) projectValues(project string) (map[string]string, error) {
+// projectValues resolves every current value of a project into a map, and
+// reports per-secret failures separately rather than as one error for the
+// project.
+//
+// The split exists because two callers want opposite things from the same
+// failure. render must refuse: writing a file that silently omits a key it
+// manages is how a half-configured container gets deployed. status must not:
+// it loops every project, and one unresolvable derivation taking down the whole
+// listing means the operator cannot see the vault at the moment they most need
+// to — including the entry that is broken.
+func (a *app) projectValues(project string) (map[string]string, map[string]error, error) {
 	secrets, err := a.st.ListSecrets()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	want := map[string]string{}
+	problems := map[string]error{}
 	for _, sec := range secrets {
 		if sec.Project != project {
 			continue
 		}
-		cur, err := a.st.CurrentVersion(sec.ID)
-		if err != nil {
-			return nil, err
-		}
-		if cur == nil {
+		r, err := resolve.Current(a.st, a.key, &sec)
+		switch {
+		case errors.Is(err, resolve.ErrNoVersion):
+			// Absent, not broken — the state every secret passes through
+			// between creation and its first value.
+			continue
+		case err != nil:
+			problems[sec.Name] = err
 			continue
 		}
-		plain, err := vault.Decrypt(a.key, cur.Nonce, cur.Ciphertext)
-		if err != nil {
-			return nil, fmt.Errorf("%s/%s: %w", project, sec.Name, err)
-		}
-		want[sec.Name] = string(plain)
+		want[sec.Name] = r.Value
+	}
+	return want, problems, nil
+}
+
+// ghDrift returns what GHState needs to judge a secret's gh-actions
+// destinations: the current version for a stored secret, or the digest of the
+// resolved value for a derived one, which has no version to compare.
+//
+// A derivation that cannot resolve returns an error rather than an empty
+// digest. Empty means "not derived" to GHState, which would send an
+// unresolvable secret down the version path, find no version, and answer "in
+// sync" — the most confident possible answer about the one secret nobody can
+// currently compute.
+func (a *app) ghDrift(sec *store.Secret) (*store.Version, string, error) {
+	r, err := resolve.Current(a.st, a.key, sec)
+	if err != nil {
+		return nil, "", err
+	}
+	return r.Version, r.Digest, nil
+}
+
+// projectValuesStrict is projectValues for callers that must not proceed on a
+// partial answer — render, which would otherwise write a file missing a key it
+// is responsible for.
+func (a *app) projectValuesStrict(project string) (map[string]string, error) {
+	want, problems, err := a.projectValues(project)
+	if err != nil {
+		return nil, err
+	}
+	for _, name := range sortedKeys(problems) {
+		return nil, fmt.Errorf("%s/%s cannot be resolved: %w", project, name, problems[name])
 	}
 	return want, nil
+}
+
+// sortedKeys returns a map's keys in order, so a failure reports the same
+// secret every time rather than whichever the map happened to yield first.
+func sortedKeys(m map[string]error) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // printDrift reports one file target's state. With prune set the report is the
@@ -946,7 +1244,9 @@ func runTargetList(args []string) error {
 		if v, ok := valuesFor[project]; ok {
 			return v, nil
 		}
-		v, err := a.projectValues(project)
+		// Lenient: a listing that dies on one unresolvable derivation hides
+		// every other target, including the ones that are fine.
+		v, _, err := a.projectValues(project)
 		if err != nil {
 			return nil, err
 		}
@@ -981,13 +1281,14 @@ func runTargetList(args []string) error {
 			if err != nil {
 				return err
 			}
-			// Needs the secret's current version: "in sync" from the last push
-			// is not the same as "still current".
-			cur, err := a.st.CurrentVersion(sec.ID)
-			if err != nil {
-				return err
+			// Needs the secret's current value fingerprint: "in sync" from the
+			// last push is not the same as "still current".
+			cur, digest, derr := a.ghDrift(sec)
+			state := t.GHState(cur, digest)
+			if derr != nil {
+				state = "unresolved"
 			}
-			emit(sec.Project+"/"+sec.Name, t.Kind, cfg.Repo+" · "+cfg.SecretName, t.GHState(cur), t.LastPushedAt)
+			emit(sec.Project+"/"+sec.Name, t.Kind, cfg.Repo+" · "+cfg.SecretName, state, t.LastPushedAt)
 
 		case "file":
 			// File targets belong to a project rather than one secret, so a
@@ -1397,7 +1698,10 @@ func runStatus(args []string) error {
 	}
 	fileByProject := map[string][]fileInfo{}
 	for p := range projects {
-		want, err := a.projectValues(p)
+		// Lenient: status is the view an operator reaches for when something is
+		// wrong, so one unresolvable derivation must not take the whole listing
+		// down — least of all the row describing the broken entry.
+		want, _, err := a.projectValues(p)
 		if err != nil {
 			return err
 		}
@@ -1417,12 +1721,19 @@ func runStatus(args []string) error {
 	w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
 	fmt.Fprintln(w, "PROJECT\tSECRET\tVHASH\tSTATUS\tEXPIRES\tTARGETS")
 	for _, sec := range secrets {
-		cur, err := a.st.CurrentVersion(sec.ID)
-		if err != nil {
-			return err
-		}
+		cur, digest, derr := a.ghDrift(&sec)
+		// A derived secret shows what it is composed from where a stored one
+		// shows its version hash. It has no version — and after a --replace
+		// conversion the abandoned rows it still owns would print a hash for a
+		// value nothing reads, presenting a computed secret as an ordinary one
+		// with a current stored value.
 		vhash := "-"
-		if cur != nil {
+		switch {
+		case sec.Derived() && derr != nil:
+			vhash = "derived (unresolved)"
+		case sec.Derived():
+			vhash = "derived #" + digest
+		case cur != nil:
 			vhash = "#" + cur.VHash
 		}
 		expires := "-"
@@ -1439,7 +1750,11 @@ func runStatus(args []string) error {
 			if err != nil {
 				return err
 			}
-			tgt = append(tgt, fmt.Sprintf("gh:%s→%s [%s]", cfg.Repo, cfg.SecretName, t.GHState(cur)))
+			ghState := t.GHState(cur, digest)
+			if derr != nil {
+				ghState = "unresolved"
+			}
+			tgt = append(tgt, fmt.Sprintf("gh:%s→%s [%s]", cfg.Repo, cfg.SecretName, ghState))
 		}
 		for _, fi := range fileByProject[sec.Project] {
 			if !contains(fi.cfg.Keys, sec.Name) {

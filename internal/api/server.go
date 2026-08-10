@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/Einlanzerous/signet/internal/ops"
+	"github.com/Einlanzerous/signet/internal/resolve"
 	"github.com/Einlanzerous/signet/internal/store"
 	syncpkg "github.com/Einlanzerous/signet/internal/sync"
 	"github.com/Einlanzerous/signet/internal/vault"
@@ -135,15 +136,29 @@ type TargetView struct {
 
 // SecretView is a secret's blind mirror representation. No values, ever.
 type SecretView struct {
-	Name      string       `json:"name"`
-	Scope     string       `json:"scope,omitempty"`
-	Status    string       `json:"status"`
-	Generated bool         `json:"generated"`
-	VHash     string       `json:"vhash,omitempty"`
-	VersionNo int          `json:"version_no"`
-	ExpiresAt string       `json:"expires_at,omitempty"`
-	UpdatedAt string       `json:"updated_at"`
-	Targets   []TargetView `json:"targets,omitempty"`
+	Name      string `json:"name"`
+	Scope     string `json:"scope,omitempty"`
+	Status    string `json:"status"`
+	Generated bool   `json:"generated"`
+	VHash     string `json:"vhash,omitempty"`
+	VersionNo int    `json:"version_no"`
+	ExpiresAt string `json:"expires_at,omitempty"`
+	UpdatedAt string `json:"updated_at"`
+	// Derivation is the template a derived secret is composed from, empty for
+	// a stored one. Published because the mirror's job is explaining vault
+	// state without the master key, and "this value is computed from these
+	// other entries" is the part of that state a version hash cannot express.
+	// Such a secret carries no VHash or VersionNo: it has no version, and any
+	// it once had (before a --replace conversion) is abandoned, so reporting
+	// one would present a number nothing reads as the current value.
+	Derivation string `json:"derivation,omitempty"`
+	// Unresolved carries why a derived secret cannot currently be computed —
+	// a missing input, a cycle, a template that no longer parses. It has to be
+	// its own field: a healthy derived secret also has no version hash, so the
+	// absence of one cannot distinguish them, and a consumer would otherwise
+	// read a broken entry as an ordinary computed value.
+	Unresolved string       `json:"unresolved,omitempty"`
+	Targets    []TargetView `json:"targets,omitempty"`
 }
 
 // ProjectView groups a project's secrets.
@@ -174,21 +189,37 @@ func (s *Server) buildViews() ([]ProjectView, error) {
 		pv := ProjectView{Project: project}
 		secs := byProject[project]
 
-		// Decrypt current values once per project for file-drift checks.
+		// Resolve current values once per project for drift checks. This goes
+		// through resolve like every other reader: reading versions directly
+		// here reported each derived secret as having no value, so the mirror —
+		// the surface Switchyard watches — showed them permanently drifted, and
+		// after a --replace conversion inverted to calling the file in sync
+		// exactly when it was wrong.
 		want := map[string]string{}
 		current := map[string]*store.Version{}
+		digests := map[string]string{}
+		unresolved := map[string]string{}
 		for i := range secs {
-			cur, err := s.st.CurrentVersion(secs[i].ID)
-			if err != nil {
-				return nil, err
-			}
-			current[secs[i].Name] = cur
-			if cur != nil {
-				plain, err := vault.Decrypt(s.key, cur.Nonce, cur.Ciphertext)
-				if err != nil {
-					return nil, fmt.Errorf("%s/%s: %w", project, secs[i].Name, err)
-				}
-				want[secs[i].Name] = string(plain)
+			name := secs[i].Name
+			r, err := resolve.Current(s.st, s.key, &secs[i])
+			switch {
+			case errors.Is(err, resolve.ErrNoVersion):
+				// Created but never written. Not a failure — every secret
+				// passes through this state.
+				current[name] = nil
+			case err != nil:
+				// One unresolvable derivation must not blank the whole mirror:
+				// the other secrets are readable and their drift is still worth
+				// serving. This secret carries its own failure, on the view, so
+				// a consumer can tell it apart from a healthy derived secret —
+				// both of which lack a version hash, which is why the absence of
+				// one cannot be the signal.
+				current[name] = nil
+				unresolved[name] = err.Error()
+			default:
+				current[name] = r.Version
+				want[name] = r.Value
+				digests[name] = r.Digest
 			}
 		}
 
@@ -215,6 +246,7 @@ func (s *Server) buildViews() ([]ProjectView, error) {
 			sv := SecretView{
 				Name: sec.Name, Scope: sec.Scope, Status: sec.Status,
 				Generated: sec.Generated, ExpiresAt: sec.ExpiresAt, UpdatedAt: sec.UpdatedAt,
+				Derivation: sec.Derivation, Unresolved: unresolved[sec.Name],
 			}
 			cur := current[sec.Name]
 			if cur != nil {
@@ -230,9 +262,17 @@ func (s *Server) buildViews() ([]ProjectView, error) {
 				if err != nil {
 					return nil, err
 				}
+				// Never GHState on a secret that could not be resolved: with
+				// no version and no digest it answers "in sync", which is the
+				// most confident possible claim about the one secret nobody can
+				// currently compute.
+				state := "unresolved"
+				if _, bad := unresolved[sec.Name]; !bad {
+					state = t.GHState(cur, digests[sec.Name])
+				}
 				sv.Targets = append(sv.Targets, TargetView{
 					Kind: t.Kind, Repo: cfg.Repo, SecretName: cfg.SecretName,
-					State:        t.GHState(cur),
+					State:        state,
 					LastPushedAt: t.LastPushedAt, LastError: t.LastError,
 				})
 			}
@@ -437,6 +477,16 @@ func (s *Server) handleCommandRotate(w http.ResponseWriter, r *http.Request) {
 	}
 	sec, ok := s.decodeCommand(w, r)
 	if !ok {
+		return
+	}
+	// Checked before the Generated test, which would otherwise catch a derived
+	// secret and tell the caller to rotate it "at the issuer" — advice that
+	// makes no sense for a value with no issuer and no stored form. A derived
+	// secret rotates when its inputs do.
+	if sec.Derived() {
+		writeErr(w, http.StatusConflict,
+			"secret %s/%s is derived from %s — it has no value of its own to rotate; rotate one of its inputs instead",
+			sec.Project, sec.Name, sec.Derivation)
 		return
 	}
 	if !sec.Generated {

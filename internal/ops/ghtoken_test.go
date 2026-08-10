@@ -386,3 +386,34 @@ func TestResolveGHTokenEmptyValue(t *testing.T) {
 		t.Fatalf("want empty-value error, got %v", err)
 	}
 }
+
+// The token lookup is named in resolve's package doc as a reader that goes
+// through it, and for a long time did not. A derived PAT reported "has no value
+// stored" and told the operator to run `signet set` — which refuses derived
+// secrets, so the instruction could not be followed.
+func TestGHTokenResolvesADerivedPAT(t *testing.T) {
+	st, key := newVault(t)
+
+	putSecret(t, st, key, "signet", "PAT_PART", "ghp_realtoken", "")
+	if _, err := st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
+		sec, err := m.CreateSecret("signet", "SIGNET_PAT", "", false, "")
+		if err != nil {
+			return store.AuditRecord{}, err
+		}
+		if err := m.SetDerivation(sec.ID, "{{PAT_PART}}"); err != nil {
+			return store.AuditRecord{}, err
+		}
+		return store.AuditRecord{Actor: "test", Action: "derive", SecretID: sec.ID,
+			EventKind: store.KindSecretWrite, ActorRole: store.RoleHuman}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := ResolveGHTokenFor(st, key, "", "test", store.RoleHuman, PurposePreflight)
+	if err != nil {
+		t.Fatalf("derived PAT did not resolve: %v", err)
+	}
+	if got.Value != "ghp_realtoken" {
+		t.Errorf("got %q", got.Value)
+	}
+}
