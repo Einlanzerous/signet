@@ -276,6 +276,19 @@ CREATE INDEX idx_audit_kind_ts ON audit_log(event_kind, ts);
 	`
 ALTER TABLE secrets ADD COLUMN derivation TEXT NOT NULL DEFAULT '';
 `,
+	// 004 — drift detection for derived secrets on gh-actions targets.
+	//
+	// GHState answers "is this destination current?" by comparing the target's
+	// last pushed version id against the secret's current version. A derived
+	// secret has neither, so that comparison fell through to "in sync" and
+	// stayed there however far its inputs moved — a destination reporting
+	// health it could not have checked. The digest is what it compares instead:
+	// an HMAC of the resolved value under the master key (see vault.ValueDigest),
+	// so the same value gives the same digest while the database alone reveals
+	// only whether two values differ.
+	`
+ALTER TABLE targets ADD COLUMN last_pushed_digest TEXT NOT NULL DEFAULT '';
+`,
 }
 
 func (s *Store) migrate() error {

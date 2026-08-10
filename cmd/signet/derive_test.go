@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Einlanzerous/signet/internal/resolve"
 	"github.com/Einlanzerous/signet/internal/store"
 	"github.com/Einlanzerous/signet/internal/sync"
 )
@@ -97,7 +98,7 @@ func mustValues(t *testing.T, st *store.Store) map[string]string {
 		t.Fatal(err)
 	}
 	defer a.close()
-	v, err := a.projectValues("drydock")
+	v, _, err := a.projectValues("drydock")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,14 +194,14 @@ func TestDependentsOfResolvesBareAndCrossProjectRefs(t *testing.T) {
 
 	// A bare {{PW}} inside drydock means drydock/PW — not construct-server/PW,
 	// which is what a text match on the template would have concluded.
-	deps, err := st.DependentsOf("construct-server", "PW")
+	deps, err := resolve.Dependents(st, "construct-server", "PW")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(deps) != 1 || deps[0].Name != "CROSS" {
 		t.Fatalf("construct-server/PW dependents = %v, want just CROSS", names(deps))
 	}
-	deps, err = st.DependentsOf("drydock", "PW")
+	deps, err = resolve.Dependents(st, "drydock", "PW")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,4 +216,108 @@ func names(secs []store.Secret) []string {
 		out[i] = s.Project + "/" + s.Name
 	}
 	return out
+}
+
+// Re-importing an env file signet rendered is the likeliest way to break the
+// "nothing is stored" invariant from outside `set`: the file contains the
+// resolved value by construction, and import would write it back as a version.
+func TestImportLeavesDerivedSecretsAlone(t *testing.T) {
+	st := newCLIVault(t)
+	dir := t.TempDir()
+	env := filepath.Join(dir, "p.env")
+
+	setValue(t, "p", "PW", "hunter2")
+	if err := os.WriteFile(env, []byte("DSN=placeholder\nOTHER=keepme\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := runImport([]string{"--project", "p", env}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runDerive([]string{"--project", "p", "--name", "DSN", "--replace",
+		"--from", "u:{{PW}}@h"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runRender([]string{"--project", "p"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Import the file signet just wrote.
+	if err := runImport([]string{"--project", "p", env}); err != nil {
+		t.Fatal(err)
+	}
+
+	sec, err := st.GetSecret("p", "DSN")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sec.Derived() {
+		t.Fatal("import overwrote a derived secret's derivation")
+	}
+	cur, err := st.CurrentVersion(sec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// It had one stored version from before the conversion; import must not
+	// have added a second holding the composed credential.
+	if cur != nil && cur.VersionNo != 1 {
+		t.Errorf("import stored version %d onto a derived secret", cur.VersionNo)
+	}
+	// The unrelated key still imports — the guard is per-key, not per-file.
+	if other, _ := st.GetSecret("p", "OTHER"); other == nil {
+		t.Error("the derived guard stopped the rest of the file importing")
+	}
+}
+
+// Keeping a converted secret's old versions is only a real safety net if they
+// can be reached again; otherwise the comment justifying it describes data
+// nothing can read.
+func TestClearDerivationRestoresTheStoredValue(t *testing.T) {
+	st := newCLIVault(t)
+	setValue(t, "p", "PW", "x")
+	setValue(t, "p", "DSN", "hand-written")
+	if err := runDerive([]string{"--project", "p", "--name", "DSN", "--replace",
+		"--from", "u:{{PW}}@h"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runDerive([]string{"--project", "p", "--name", "DSN", "--clear"}); err != nil {
+		t.Fatal(err)
+	}
+
+	sec, err := st.GetSecret("p", "DSN")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sec.Derived() {
+		t.Fatal("--clear left the secret derived")
+	}
+	a, err := setup()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.close()
+	v, _, err := resolve.Value(a.st, a.key, sec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v != "hand-written" {
+		t.Errorf("cleared secret resolves to %q, want the stored value back", v)
+	}
+}
+
+// A secret created as derived has no stored value to fall back to, and signet
+// cannot delete a secret — so clearing it would strand an entry with no value
+// and no way to remove it.
+func TestClearRefusesWhenThereIsNoStoredValue(t *testing.T) {
+	newCLIVault(t)
+	setValue(t, "p", "PW", "x")
+	if err := runDerive([]string{"--project", "p", "--name", "DSN", "--from", "u:{{PW}}@h"}); err != nil {
+		t.Fatal(err)
+	}
+	err := runDerive([]string{"--project", "p", "--name", "DSN", "--clear"})
+	if err == nil {
+		t.Fatal("--clear stranded a secret with no value")
+	}
+	if !strings.Contains(err.Error(), "no stored value") {
+		t.Errorf("refusal does not explain why: %v", err)
+	}
 }

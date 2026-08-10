@@ -94,13 +94,24 @@ Consequences worth knowing:
 
 - **A derived secret cannot be `set` or rotated.** It has no value of its own.
   Rotate one of its inputs, or change the template with `derive --from`.
-- **Setting an input names what else just changed**, including across projects,
-  and which renders to run.
+  `signet import` skips it for the same reason and says which keys it skipped —
+  re-importing a file signet rendered would otherwise store a copy of the
+  composed value, which is the drift this exists to prevent.
+- **Setting an input names what else just changed**, following chains and
+  crossing projects, and which renders to run.
 - **`reveal` prints the value on stdout and its provenance on stderr**, so it
-  stays pipeable while still answering "where did this come from".
+  stays pipeable while still answering "where did this come from". It also
+  appends an audit entry to **each input's** ledger: revealing a composed value
+  discloses its inputs' plaintext, and that has to be recorded where someone
+  investigating *that* credential would look.
 - **Converting an existing stored secret needs `--replace`.** Its stored value
   may be live somewhere signet cannot see, so discarding it is deliberate. The
-  old versions stay in history and stop being read.
+  old versions stay in history and stop being read — `derive --clear` puts the
+  last one back and makes the secret ordinary again.
+- **Drift is tracked by an HMAC of the resolved value**, since there is no
+  version to compare. `status` shows `derived #<digest>`, never a version hash:
+  a converted secret's old versions are abandoned, and printing one would
+  present a value nothing reads as current.
 - **A derivation naming no secrets is refused.** That is a constant, which is
   what an ordinary secret already is.
 - **Cycles are refused** with the chain that forms them.

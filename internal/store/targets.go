@@ -15,7 +15,11 @@ type Target struct {
 	Project             string // file targets
 	Config              string // JSON: FileConfig or GHConfig
 	LastPushedVersionID string
-	LastPushedAt        string
+	// LastPushedDigest fingerprints the value last delivered, for secrets that
+	// have no version to cite — derived ones. Empty for stored secrets, whose
+	// drift is answered by the version id above.
+	LastPushedDigest string
+	LastPushedAt     string
 	// LastState is what the last push recorded: never | in sync | error.
 	// "drift" is NOT stored — see GHState, which derives it.
 	LastState string
@@ -54,18 +58,36 @@ func (t *Target) GHConfig() (GHConfig, error) {
 	return c, nil
 }
 
-// GHState derives a gh-actions target's sync state against the secret's current
-// version. It is derived rather than stored: last_state only ever records what
-// the last push did ("in sync" / "error", or the "never" default), so drift —
-// the vault moving on while the destination keeps an older version — is
-// invisible to it. Any view that answers "is this destination current?" has to
-// compute it.
-func (t *Target) GHState(cur *Version) string {
+// GHState derives a gh-actions target's sync state. It is derived rather than
+// stored: last_state only ever records what the last push did ("in sync" /
+// "error", or the "never" default), so drift — the vault moving on while the
+// destination keeps an older value — is invisible to it. Any view that answers
+// "is this destination current?" has to compute it.
+//
+// cur is the secret's current version, and digest the fingerprint of a derived
+// secret's resolved value; exactly one is meaningful. A derived secret has no
+// version, so the version comparison cannot see it move — without the digest
+// the switch fell through to "in sync" and stayed there however far its inputs
+// travelled, a destination reporting health nobody had checked. See
+// vault.ValueDigest.
+func (t *Target) GHState(cur *Version, digest string) string {
 	switch {
 	case t.LastError != "":
 		return "error"
 	case t.LastPushedAt == "":
 		return "never"
+	case digest != "":
+		if t.LastPushedDigest != digest {
+			return "drift"
+		}
+		// A push that predates the digest column has nothing to compare, and
+		// saying "in sync" about it would be the same unchecked claim in a new
+		// place. It is a real state: delivered once, currency unknown until the
+		// next push writes a fingerprint.
+		if t.LastPushedDigest == "" {
+			return "unknown"
+		}
+		return "in sync"
 	case cur != nil && t.LastPushedVersionID != cur.ID:
 		return "drift" // vault moved on; destination holds an old version
 	default:
@@ -74,7 +96,7 @@ func (t *Target) GHState(cur *Version) string {
 }
 
 const targetCols = `id, kind, COALESCE(secret_id, ''), COALESCE(project, ''), config,
-    COALESCE(last_pushed_version_id, ''), COALESCE(last_pushed_at, ''), last_state, COALESCE(last_error, ''), created_at`
+    COALESCE(last_pushed_version_id, ''), COALESCE(last_pushed_digest, ''), COALESCE(last_pushed_at, ''), last_state, COALESCE(last_error, ''), created_at`
 
 func scanTargets(rows *sql.Rows) ([]Target, error) {
 	defer rows.Close()
@@ -82,7 +104,7 @@ func scanTargets(rows *sql.Rows) ([]Target, error) {
 	for rows.Next() {
 		var t Target
 		if err := rows.Scan(&t.ID, &t.Kind, &t.SecretID, &t.Project, &t.Config,
-			&t.LastPushedVersionID, &t.LastPushedAt, &t.LastState, &t.LastError, &t.CreatedAt); err != nil {
+			&t.LastPushedVersionID, &t.LastPushedDigest, &t.LastPushedAt, &t.LastState, &t.LastError, &t.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan target: %w", err)
 		}
 		out = append(out, t)
@@ -301,15 +323,47 @@ func (m *Mutation) RemoveTarget(id string) error {
 // whether or not this row or its ledger entry lands, so there is nothing here
 // to roll back. Its audit entry is appended separately and a failure to write
 // it is surfaced, not swallowed — see sync.recordPush.
-func (s *Store) UpdateTargetPush(id, state, lastErr, versionID, pushedAt string) error {
+// provenance is what a successful push delivered: the version id it came from,
+// or the digest of a derived secret's resolved value. Nil means "leave both
+// alone", which is what a failed push wants — it changed nothing, so the record
+// of the last successful delivery must survive it.
+//
+// It is a pointer rather than an empty-string sentinel because those are not
+// the same request, and conflating them was a real bug: a derived secret pushes
+// with no version id, the empty string was COALESCEd back into keeping the
+// previous value, and the target went on citing a version that had nothing to
+// do with what was delivered — so drift could never be detected for it.
+type PushProvenance struct {
+	VersionID string
+	Digest    string
+}
+
+// UpdateTargetPush records a push's outcome on the target row.
+func (s *Store) UpdateTargetPush(id, state, lastErr string, prov *PushProvenance, pushedAt string) error {
 	ctx, cancel := pooled()
 	defer cancel()
+	// Written as two statements rather than one with COALESCE tricks: "set
+	// these to exactly this" and "leave these as they are" are different
+	// updates, and expressing them as one taught the reader that an empty
+	// provenance meant "unchanged" when it meant "there isn't one".
+	if prov == nil {
+		_, err := s.db.ExecContext(ctx, `
+        UPDATE targets
+        SET last_state = ?, last_error = NULLIF(?, ''),
+            last_pushed_at = COALESCE(NULLIF(?, ''), last_pushed_at)
+        WHERE id = ?`, state, lastErr, pushedAt, id)
+		if err != nil {
+			return fmt.Errorf("update target push: %w", err)
+		}
+		return nil
+	}
 	_, err := s.db.ExecContext(ctx, `
         UPDATE targets
         SET last_state = ?, last_error = NULLIF(?, ''),
-            last_pushed_version_id = COALESCE(NULLIF(?, ''), last_pushed_version_id),
+            last_pushed_version_id = NULLIF(?, ''),
+            last_pushed_digest = ?,
             last_pushed_at = COALESCE(NULLIF(?, ''), last_pushed_at)
-        WHERE id = ?`, state, lastErr, versionID, pushedAt, id)
+        WHERE id = ?`, state, lastErr, prov.VersionID, prov.Digest, pushedAt, id)
 	if err != nil {
 		return fmt.Errorf("update target push: %w", err)
 	}

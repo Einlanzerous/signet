@@ -162,10 +162,22 @@ func Resolve(origin Ref, tmpl string, look Lookup) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return expand(origin, t, look, []Ref{origin})
+	return expand(origin, t, look, []Ref{origin}, map[Ref]string{})
 }
 
-func expand(origin Ref, t Template, look Lookup, path []Ref) (string, error) {
+// expand walks the template, resolving each reference.
+//
+// done memoizes references already expanded during this resolution. Without it
+// a reference appearing twice is fetched and re-expanded twice, and a
+// diamond-shaped graph — two derivations over one shared input, joined by a
+// third — costs a number of store round-trips exponential in its depth. The
+// cache is per-resolution rather than long-lived so a value can never be stale
+// with respect to the vault it was read from.
+//
+// It is keyed by the qualified ref, which is also why it cannot mask a cycle:
+// the path check runs before the cache is consulted, and the cache is only
+// populated by references that already returned.
+func expand(origin Ref, t Template, look Lookup, path []Ref, done map[Ref]string) (string, error) {
 	if len(path) > maxDepth {
 		return "", fmt.Errorf("derivation nested more than %d deep at %s — %s", maxDepth, origin, chain(path))
 	}
@@ -176,12 +188,18 @@ func expand(origin Ref, t Template, look Lookup, path []Ref) (string, error) {
 			continue
 		}
 		ref := seg.ref.qualify(origin)
-		// Checked before the lookup so a cycle is named as a cycle rather than
-		// as whatever the recursion happens to fail on first.
+		// Checked before both the cache and the lookup, so a cycle is named as
+		// a cycle rather than as whatever the recursion happens to fail on
+		// first — and so a repeat reference on a legal diamond is still
+		// distinguished from one closing a loop.
 		for _, seen := range path {
 			if seen == ref {
 				return "", fmt.Errorf("derivation cycle: %s", chain(append(path, ref)))
 			}
+		}
+		if v, ok := done[ref]; ok {
+			b.WriteString(v)
+			continue
 		}
 		e, err := look(ref)
 		if err != nil {
@@ -194,6 +212,7 @@ func expand(origin Ref, t Template, look Lookup, path []Ref) (string, error) {
 			return "", fmt.Errorf("%s derives from %s, which the vault does not have", origin, ref)
 		}
 		if e.Derivation == "" {
+			done[ref] = e.Value
 			b.WriteString(e.Value)
 			continue
 		}
@@ -201,10 +220,11 @@ func expand(origin Ref, t Template, look Lookup, path []Ref) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("%s: %w", ref, err)
 		}
-		v, err := expand(ref, inner, look, append(path, ref))
+		v, err := expand(ref, inner, look, append(path, ref), done)
 		if err != nil {
 			return "", err
 		}
+		done[ref] = v
 		b.WriteString(v)
 	}
 	return b.String(), nil

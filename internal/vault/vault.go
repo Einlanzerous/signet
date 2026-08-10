@@ -9,6 +9,7 @@ package vault
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -110,6 +111,27 @@ func newAEAD(key []byte) (cipher.AEAD, error) {
 func VersionHash(nonce, ciphertext []byte) string {
 	sum := sha256.Sum256(append(append([]byte{}, nonce...), ciphertext...))
 	return hex.EncodeToString(sum[:])[:6]
+}
+
+// ValueDigest returns a short, stable fingerprint of a plaintext value, for
+// answering "is this the same value as last time" about something that has no
+// stored version — a derived secret, whose value is computed on every read.
+//
+// It is an HMAC under the master key, not a bare hash, and that is the whole
+// point. The mirror publishes these, and a plain SHA-256 of a low-entropy
+// credential is brute-forceable from the database alone — which would break the
+// property the README states outright: version hashes are "never derived from
+// plaintext alone". Keying it means holding the database without the key tells
+// you only whether two values differ, which is exactly the question drift
+// detection needs answered and nothing more.
+//
+// Deliberately distinct from VersionHash: that one is over nonce‖ciphertext and
+// so differs on every encryption of the same value. It cannot answer this
+// question, and this cannot answer that one.
+func ValueDigest(key []byte, plaintext string) string {
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte(plaintext))
+	return hex.EncodeToString(mac.Sum(nil))[:12]
 }
 
 const tokenAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"

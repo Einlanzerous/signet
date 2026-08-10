@@ -5,8 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"time"
-
-	"github.com/Einlanzerous/signet/internal/derive"
 )
 
 // Secret is a vault entry's metadata. Values live in secret_versions.
@@ -120,49 +118,6 @@ func (m *Mutation) SetDerivation(secretID, derivation string) error {
 		return fmt.Errorf("set derivation: %w", err)
 	}
 	return nil
-}
-
-// DependentsOf returns every derived secret whose template names (project,
-// name), directly. It exists so a rotation can say what else it is about to
-// change before it writes: a value composed from this one is rewritten by the
-// next render, and discovering that afterwards — across four env files — is
-// the failure this feature is meant to remove, not relocate.
-//
-// Matching is done by parsing each template rather than by SQL LIKE, because a
-// bare {{NAME}} reference means "the deriving secret's own project" and a text
-// match cannot know that. Indirect dependents (a derived secret built from a
-// derived secret) are deliberately not followed here; callers wanting the full
-// closure iterate.
-func (s *Store) DependentsOf(project, name string) ([]Secret, error) {
-	all, err := s.ListSecrets()
-	if err != nil {
-		return nil, err
-	}
-	var out []Secret
-	for _, sec := range all {
-		if !sec.Derived() {
-			continue
-		}
-		t, err := derive.Parse(sec.Derivation)
-		if err != nil {
-			// A template that no longer parses is worth surfacing here rather
-			// than swallowing: it means this secret cannot render at all, which
-			// the operator is better off learning during a rotation than during
-			// the deploy that follows it.
-			return nil, fmt.Errorf("%s/%s has an invalid derivation: %w", sec.Project, sec.Name, err)
-		}
-		for _, ref := range t.Refs() {
-			p := ref.Project
-			if p == "" {
-				p = sec.Project
-			}
-			if p == project && ref.Name == name {
-				out = append(out, sec)
-				break
-			}
-		}
-	}
-	return out, nil
 }
 
 // ListSecrets returns every secret ordered by project then name.

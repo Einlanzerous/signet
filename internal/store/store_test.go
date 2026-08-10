@@ -260,7 +260,7 @@ func TestGHTargetStateUpdates(t *testing.T) {
 	if tgt.LastState != "never" {
 		t.Fatalf("fresh target state: %q", tgt.LastState)
 	}
-	if err := s.UpdateTargetPush(tgt.ID, "in sync", "", "vid1", "2026-01-01T00:00:00Z"); err != nil {
+	if err := s.UpdateTargetPush(tgt.ID, "in sync", "", &PushProvenance{VersionID: "vid1"}, "2026-01-01T00:00:00Z"); err != nil {
 		t.Fatal(err)
 	}
 	targets, err := s.TargetsForSecret(sec.ID)
@@ -271,7 +271,7 @@ func TestGHTargetStateUpdates(t *testing.T) {
 		t.Fatalf("push state not recorded: %+v", targets[0])
 	}
 	// Error keeps last pushed version.
-	if err := s.UpdateTargetPush(tgt.ID, "error", "boom", "", ""); err != nil {
+	if err := s.UpdateTargetPush(tgt.ID, "error", "boom", nil, ""); err != nil {
 		t.Fatal(err)
 	}
 	targets, _ = s.TargetsForSecret(sec.ID)
@@ -381,16 +381,16 @@ func TestGHStateDerivesDrift(t *testing.T) {
 	sec := mustCreateSecret(t, s, "proj", "KEY", "", true)
 	v1 := mustAddVersion(t, s, sec.ID, []byte("n"), []byte("c"), "aaa")
 	tgt := mustAddGHTarget(t, s, sec.ID, "owner/repo", "KEY")
-	if got := tgt.GHState(v1); got != "never" {
+	if got := tgt.GHState(v1, ""); got != "never" {
 		t.Fatalf("unpushed target: want never, got %q", got)
 	}
 
 	// Push v1: in sync, and last_state agrees.
-	if err := s.UpdateTargetPush(tgt.ID, "in sync", "", v1.ID, "2026-01-01T00:00:00Z"); err != nil {
+	if err := s.UpdateTargetPush(tgt.ID, "in sync", "", &PushProvenance{VersionID: v1.ID}, "2026-01-01T00:00:00Z"); err != nil {
 		t.Fatal(err)
 	}
 	targets, _ := s.TargetsForSecret(sec.ID)
-	if got := targets[0].GHState(v1); got != "in sync" {
+	if got := targets[0].GHState(v1, ""); got != "in sync" {
 		t.Fatalf("just pushed: want in sync, got %q", got)
 	}
 
@@ -400,16 +400,16 @@ func TestGHStateDerivesDrift(t *testing.T) {
 	if targets[0].LastState != "in sync" {
 		t.Fatalf("precondition: stored state should still read in sync, got %q", targets[0].LastState)
 	}
-	if got := targets[0].GHState(v2); got != "drift" {
+	if got := targets[0].GHState(v2, ""); got != "drift" {
 		t.Fatalf("vault moved on: want drift, got %q", got)
 	}
 
 	// An error on the target outranks everything.
-	if err := s.UpdateTargetPush(tgt.ID, "error", "boom", "", ""); err != nil {
+	if err := s.UpdateTargetPush(tgt.ID, "error", "boom", nil, ""); err != nil {
 		t.Fatal(err)
 	}
 	targets, _ = s.TargetsForSecret(sec.ID)
-	if got := targets[0].GHState(v2); got != "error" {
+	if got := targets[0].GHState(v2, ""); got != "error" {
 		t.Fatalf("failed push: want error, got %q", got)
 	}
 }
@@ -760,5 +760,79 @@ func TestConcurrentMutateKeepsChainIntact(t *testing.T) {
 	}
 	if cur.VersionNo != writes {
 		t.Fatalf("version numbers collided or skipped: highest is %d, want %d", cur.VersionNo, writes)
+	}
+}
+
+// A derived secret has no version, so the version comparison cannot see it
+// move. Before the digest, GHState fell through to "in sync" and stayed there
+// however far the inputs travelled — a destination reporting health that
+// nothing had checked.
+func TestGHStateDetectsDriftForDerivedSecrets(t *testing.T) {
+	s := testStore(t)
+	sec := mustCreateSecret(t, s, "proj", "DERIVED", "", false)
+	tgt := mustAddGHTarget(t, s, sec.ID, "owner/repo", "DERIVED")
+
+	const before = "d0d0d0d0d0d0"
+	if err := s.UpdateTargetPush(tgt.ID, "in sync", "", &PushProvenance{Digest: before}, "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	targets, err := s.TargetsForSecret(sec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := targets[0].GHState(nil, before); got != "in sync" {
+		t.Errorf("unchanged derived value: got %q, want in sync", got)
+	}
+	if got := targets[0].GHState(nil, "ffffffffffff"); got != "drift" {
+		t.Errorf("changed derived value: got %q, want drift", got)
+	}
+}
+
+// A failed push changed nothing, so it must not erase the record of the last
+// successful delivery — the empty-string sentinel that used to mean this also
+// meant "a derived secret has no version id", and the two were conflated.
+func TestFailedPushKeepsTheLastDeliveryRecord(t *testing.T) {
+	s := testStore(t)
+	sec := mustCreateSecret(t, s, "proj", "KEY2", "", false)
+	tgt := mustAddGHTarget(t, s, sec.ID, "owner/repo", "KEY2")
+
+	if err := s.UpdateTargetPush(tgt.ID, "in sync", "", &PushProvenance{VersionID: "vid1"}, "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateTargetPush(tgt.ID, "error", "boom", nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	targets, err := s.TargetsForSecret(sec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if targets[0].LastPushedVersionID != "vid1" {
+		t.Errorf("a failed push erased the last delivered version: %q", targets[0].LastPushedVersionID)
+	}
+}
+
+// A derived secret's push carries no version id, and recording it must clear
+// the column rather than leave a stale one — a target citing a version that had
+// nothing to do with what was delivered can never be judged drifted.
+func TestDerivedPushDoesNotInheritAStaleVersionID(t *testing.T) {
+	s := testStore(t)
+	sec := mustCreateSecret(t, s, "proj", "KEY3", "", false)
+	tgt := mustAddGHTarget(t, s, sec.ID, "owner/repo", "KEY3")
+
+	if err := s.UpdateTargetPush(tgt.ID, "in sync", "", &PushProvenance{VersionID: "vid1"}, "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateTargetPush(tgt.ID, "in sync", "", &PushProvenance{Digest: "abc123abc123"}, "2026-01-02T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	targets, err := s.TargetsForSecret(sec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if targets[0].LastPushedVersionID != "" {
+		t.Errorf("derived push kept version id %q", targets[0].LastPushedVersionID)
+	}
+	if targets[0].LastPushedDigest != "abc123abc123" {
+		t.Errorf("digest not recorded: %q", targets[0].LastPushedDigest)
 	}
 }

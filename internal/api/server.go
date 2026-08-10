@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/Einlanzerous/signet/internal/ops"
+	"github.com/Einlanzerous/signet/internal/resolve"
 	"github.com/Einlanzerous/signet/internal/store"
 	syncpkg "github.com/Einlanzerous/signet/internal/sync"
 	"github.com/Einlanzerous/signet/internal/vault"
@@ -135,15 +136,23 @@ type TargetView struct {
 
 // SecretView is a secret's blind mirror representation. No values, ever.
 type SecretView struct {
-	Name      string       `json:"name"`
-	Scope     string       `json:"scope,omitempty"`
-	Status    string       `json:"status"`
-	Generated bool         `json:"generated"`
-	VHash     string       `json:"vhash,omitempty"`
-	VersionNo int          `json:"version_no"`
-	ExpiresAt string       `json:"expires_at,omitempty"`
-	UpdatedAt string       `json:"updated_at"`
-	Targets   []TargetView `json:"targets,omitempty"`
+	Name      string `json:"name"`
+	Scope     string `json:"scope,omitempty"`
+	Status    string `json:"status"`
+	Generated bool   `json:"generated"`
+	VHash     string `json:"vhash,omitempty"`
+	VersionNo int    `json:"version_no"`
+	ExpiresAt string `json:"expires_at,omitempty"`
+	UpdatedAt string `json:"updated_at"`
+	// Derivation is the template a derived secret is composed from, empty for
+	// a stored one. Published because the mirror's job is explaining vault
+	// state without the master key, and "this value is computed from these
+	// other entries" is the part of that state a version hash cannot express.
+	// Such a secret carries no VHash or VersionNo: it has no version, and any
+	// it once had (before a --replace conversion) is abandoned, so reporting
+	// one would present a number nothing reads as the current value.
+	Derivation string       `json:"derivation,omitempty"`
+	Targets    []TargetView `json:"targets,omitempty"`
 }
 
 // ProjectView groups a project's secrets.
@@ -174,21 +183,37 @@ func (s *Server) buildViews() ([]ProjectView, error) {
 		pv := ProjectView{Project: project}
 		secs := byProject[project]
 
-		// Decrypt current values once per project for file-drift checks.
+		// Resolve current values once per project for drift checks. This goes
+		// through resolve like every other reader: reading versions directly
+		// here reported each derived secret as having no value, so the mirror —
+		// the surface Switchyard watches — showed them permanently drifted, and
+		// after a --replace conversion inverted to calling the file in sync
+		// exactly when it was wrong.
 		want := map[string]string{}
 		current := map[string]*store.Version{}
+		digests := map[string]string{}
 		for i := range secs {
-			cur, err := s.st.CurrentVersion(secs[i].ID)
+			ok, err := resolve.HasValue(s.st, &secs[i])
 			if err != nil {
 				return nil, err
 			}
+			if !ok {
+				current[secs[i].Name] = nil
+				continue
+			}
+			plain, cur, err := resolve.Value(s.st, s.key, &secs[i])
+			if err != nil {
+				// One unresolvable derivation must not blank the whole mirror:
+				// the other secrets are readable and their drift is still worth
+				// serving. The secret carries its own failure instead.
+				current[secs[i].Name] = nil
+				digests[secs[i].Name] = ""
+				continue
+			}
 			current[secs[i].Name] = cur
-			if cur != nil {
-				plain, err := vault.Decrypt(s.key, cur.Nonce, cur.Ciphertext)
-				if err != nil {
-					return nil, fmt.Errorf("%s/%s: %w", project, secs[i].Name, err)
-				}
-				want[secs[i].Name] = string(plain)
+			want[secs[i].Name] = plain
+			if secs[i].Derived() {
+				digests[secs[i].Name] = vault.ValueDigest(s.key, plain)
 			}
 		}
 
@@ -215,6 +240,7 @@ func (s *Server) buildViews() ([]ProjectView, error) {
 			sv := SecretView{
 				Name: sec.Name, Scope: sec.Scope, Status: sec.Status,
 				Generated: sec.Generated, ExpiresAt: sec.ExpiresAt, UpdatedAt: sec.UpdatedAt,
+				Derivation: sec.Derivation,
 			}
 			cur := current[sec.Name]
 			if cur != nil {
@@ -232,7 +258,7 @@ func (s *Server) buildViews() ([]ProjectView, error) {
 				}
 				sv.Targets = append(sv.Targets, TargetView{
 					Kind: t.Kind, Repo: cfg.Repo, SecretName: cfg.SecretName,
-					State:        t.GHState(cur),
+					State:        t.GHState(cur, digests[sec.Name]),
 					LastPushedAt: t.LastPushedAt, LastError: t.LastError,
 				})
 			}

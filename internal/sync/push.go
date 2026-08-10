@@ -8,6 +8,7 @@ import (
 
 	"github.com/Einlanzerous/signet/internal/resolve"
 	"github.com/Einlanzerous/signet/internal/store"
+	"github.com/Einlanzerous/signet/internal/vault"
 )
 
 // PushResult records the outcome of pushing one gh-actions target.
@@ -40,8 +41,8 @@ type PushResult struct {
 // compares against to decide whether a destination has drifted, so a silent
 // failure here leaves the target reading "in sync" against a version it no
 // longer holds, and nothing later corrects it.
-func recordPush(st *store.Store, res *PushResult, rec store.AuditRecord, state, lastErr, versionID, pushedAt string) {
-	if err := st.UpdateTargetPush(res.TargetID, state, lastErr, versionID, pushedAt); err != nil {
+func recordPush(st *store.Store, res *PushResult, rec store.AuditRecord, state, lastErr string, prov *store.PushProvenance, pushedAt string) {
+	if err := st.UpdateTargetPush(res.TargetID, state, lastErr, prov, pushedAt); err != nil {
 		res.StateErr = err.Error()
 		log.Printf("target state write failed for %s: %v — the push happened but %s still reads as its previous state",
 			res.Repo, err, res.TargetID)
@@ -61,7 +62,7 @@ func PushSecret(ctx context.Context, st *store.Store, key []byte, gh *GHClient, 
 	// composed value pushed to GitHub is computed from the same inputs the local
 	// render used. Going through resolve is what keeps those two answers from
 	// being produced by two different pieces of code.
-	plaintextStr, err := resolve.Value(st, key, sec)
+	plaintextStr, cur, err := resolve.Value(st, key, sec)
 	if err != nil {
 		return nil, err
 	}
@@ -75,16 +76,20 @@ func PushSecret(ctx context.Context, st *store.Store, key []byte, gh *GHClient, 
 	// vhash beside it in the log while meaning something else entirely (that
 	// one is over ciphertext, which is nonce-randomized and not comparable
 	// across encryptions), and two hashes wearing one label is a trap.
-	var versionID, provenance string
-	if sec.Derived() {
-		provenance = "derived from " + sec.Derivation
-	} else {
-		cur, err := st.CurrentVersion(sec.ID)
-		if err != nil {
-			return nil, err
-		}
-		versionID = cur.ID
+	// resolve.Value is the authority on whether a version exists: nil means the
+	// secret is derived and has none. Re-querying here to find out was both a
+	// second round-trip and an unchecked dereference away from a crash.
+	prov := store.PushProvenance{}
+	provenance := ""
+	if cur != nil {
+		prov.VersionID = cur.ID
 		provenance = "version #" + cur.VHash
+	} else {
+		// A derived secret's currency is the digest of what was delivered.
+		// Without recording it the target has nothing to compare and GHState
+		// reports "in sync" forever, however far the inputs travel.
+		prov.Digest = vault.ValueDigest(key, plaintextStr)
+		provenance = "derived from " + sec.Derivation + " · #" + prov.Digest
 	}
 	targets, err := st.TargetsForSecret(sec.ID)
 	if err != nil {
@@ -130,7 +135,7 @@ func PushSecret(ctx context.Context, st *store.Store, key []byte, gh *GHClient, 
 				Actor: actor, Action: "sync.push.failed", SecretID: sec.ID, TargetID: t.ID,
 				Details:   fmt.Sprintf("%s → %s/%s: %s", sec.Name, cfg.Repo, cfg.SecretName, err),
 				EventKind: kind, ActorRole: role, Status: status,
-			}, "error", err.Error(), "", "")
+			}, "error", err.Error(), nil, "")
 		} else {
 			res.State = "in sync"
 			status.Outcome = store.OutcomeDelivered
@@ -141,7 +146,7 @@ func PushSecret(ctx context.Context, st *store.Store, key []byte, gh *GHClient, 
 			recordPush(st, &res, store.AuditRecord{
 				Actor: actor, Action: "sync.push", SecretID: sec.ID, TargetID: t.ID,
 				Details: detail, EventKind: kind, ActorRole: role, Status: status,
-			}, "in sync", "", versionID, nowRFC3339())
+			}, "in sync", "", &prov, nowRFC3339())
 		}
 		results = append(results, res)
 	}
