@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.6.0](https://github.com/Einlanzerous/signet/compare/v1.5.1...v1.6.0) (2026-08-10)
+
+
+### Features
+
+* **derive:** compose a secret's value from other secrets (SGNT-18) ([#23](https://github.com/Einlanzerous/signet/issues/23)) ([70afeae](https://github.com/Einlanzerous/signet/commit/70afeae685a87dc6b7a7839ca3487122e3e3a4ff))
+
 ## [1.5.1](https://github.com/Einlanzerous/signet/compare/v1.5.0...v1.5.1) (2026-08-09)
 
 
