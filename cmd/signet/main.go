@@ -4,7 +4,10 @@
 //
 //	signet init                                    # create master key + database
 //	signet import --project lyceum ~/projects/lyceum/.env
-//	signet set --project csrv --name API_TOKEN --generate
+//	signet generate --project csrv --name API_TOKEN     # signet mints the value
+//	signet set --project csrv --name API_TOKEN          # value on stdin
+//	signet rotate --secret csrv/API_TOKEN [--expires D] # new value + fan-out
+//	signet derive --project drydock --name DSN --from 'u:{{csrv/PW}}@h'
 //	signet reveal --project csrv --name API_TOKEN  # audited
 //	signet render --project lyceum [--check] [--prune]  # write / drift-check file targets
 //	signet target list [--secret csrv/NAME] [--project csrv]
@@ -114,6 +117,38 @@ func cliActor() string {
 	return "cli"
 }
 
+// cliRole is the role the CLI's ledger entries are attributed to.
+//
+// It defaults to human because that is what the CLI usually is, and reads
+// SIGNET_ACTOR_ROLE so automation can say otherwise. Several verbs are
+// deliberately allowlisted for agents (`generate`, `rotate`, `derive`, `sync`,
+// `target`), and recording those as human makes an agent-driven change
+// indistinguishable from a person's in a log whose whole purpose is saying who
+// did what — permanently, since the field is covered by the chain hash.
+//
+// Only declarable roles are honored, and the check is the same one the API's
+// header goes through: `daemon` and `healer` mean "signet acted on its own
+// initiative", which an env var cannot honestly assert. An unrecognized value
+// is refused rather than silently downgraded to human, because a caller that
+// meant to declare something and was ignored is exactly the case that would
+// write the wrong answer into an append-only ledger.
+func cliRole() store.ActorRole {
+	raw := os.Getenv("SIGNET_ACTOR_ROLE")
+	if raw == "" {
+		return store.RoleHuman
+	}
+	role := store.ActorRole(raw)
+	if !store.DeclarableActorRole(role) {
+		// Reached from every write path, so it cannot return an error without
+		// threading one through all of them. Refusing loudly and exiting beats
+		// recording a role the operator did not ask for.
+		fmt.Fprintf(os.Stderr, "signet: SIGNET_ACTOR_ROLE=%q cannot be declared (one of: %s)\n",
+			raw, strings.Join(store.DeclarableActorRoles(), ", "))
+		os.Exit(2)
+	}
+	return role
+}
+
 // app bundles the wired-up dependencies shared by subcommands.
 type app struct {
 	cfg config.Config
@@ -166,7 +201,7 @@ func runInit() error {
 	defer st.Close()
 	if _, err := st.AppendAudit(store.AuditRecord{
 		Actor: cliActor(), Action: "vault.init", Details: "master key + database created",
-		EventKind: store.KindVaultInit, ActorRole: store.RoleHuman,
+		EventKind: store.KindVaultInit, ActorRole: cliRole(),
 		Status: &store.AuditStatus{Outcome: store.OutcomeCreated},
 	}); err != nil {
 		return err
@@ -196,7 +231,7 @@ func runImport(args []string) error {
 	}
 	defer a.close()
 
-	res, err := ops.ImportEnv(a.st, a.key, *project, *scope, path, cliActor(), store.RoleHuman)
+	res, err := ops.ImportEnv(a.st, a.key, *project, *scope, path, cliActor(), cliRole())
 	if err != nil {
 		return err
 	}
@@ -228,14 +263,55 @@ func runGenerate(args []string) error {
 	name := fs.String("name", "", "secret name (required)")
 	scope := fs.String("scope", "", "scope")
 	expires := fs.String("expires", "", "expiry date YYYY-MM-DD")
+	replace := fs.Bool("replace", false, "overwrite an existing value")
 	fs.Parse(args)
 	if *project == "" || *name == "" {
-		return fmt.Errorf("usage: signet generate --project <p> --name <N> [--scope s] [--expires YYYY-MM-DD]")
+		return fmt.Errorf("usage: signet generate --project <p> --name <N> [--scope s] [--expires YYYY-MM-DD] [--replace]")
 	}
 	expiresAt, expiresGiven, err := parseExpiry(fs, *expires)
 	if err != nil {
 		return err
 	}
+	// Refuse to overwrite an existing value unless asked. This is the verb the
+	// README hands to agents wholesale — `Bash(signet generate:*)` — so it is
+	// the one that must not be able to silently replace a live credential with
+	// a random string. `derive` already refuses exactly this case; the guard
+	// belongs here for the same reason and reads the same way.
+	//
+	// It is deliberately a check on the *existing value*, not on the secret: a
+	// registered secret that was never written has nothing to lose, and is the
+	// ordinary way `target add-key` and `generate` are used together.
+	a, err := setup()
+	if err != nil {
+		return err
+	}
+	existing, err := a.st.GetSecret(*project, *name)
+	if err != nil {
+		a.close()
+		return err
+	}
+	hadValue := false
+	if existing != nil && !existing.Derived() {
+		cur, err := a.st.CurrentVersion(existing.ID)
+		if err != nil {
+			a.close()
+			return err
+		}
+		hadValue = cur != nil
+	}
+	a.close()
+
+	if hadValue && !*replace {
+		if existing.Generated {
+			return fmt.Errorf("%s/%s already holds a value signet minted.\n"+
+				"Use `signet rotate --secret %s/%s` to replace it and push the new value to its destinations, "+
+				"or --replace to overwrite without fanning out", *project, *name, *project, *name)
+		}
+		return fmt.Errorf("%s/%s already holds an externally-issued value, which minting over would discard "+
+			"while it is still live at the issuer.\nRe-run with --replace if that is what you mean",
+			*project, *name)
+	}
+
 	value, err := vault.RandomToken(32)
 	if err != nil {
 		return err
@@ -346,6 +422,20 @@ func storeValue(project, name, scope, value string, generated bool, expiresAt st
 	// had not written. Derived here, from the secret as read, so nothing has to
 	// escape the transaction through a captured variable.
 	setExpiry := expiresGiven && sec != nil && expiresAt != sec.ExpiresAt
+	// generated describes the *current value*, not the secret's origin, because
+	// it is what decides whether `rotate` may mint a replacement. Overwriting a
+	// minted value from stdin has to clear it, or rotate would later mint over a
+	// live externally-issued credential; minting over an imported value has to
+	// set it, or the value signet just minted would be permanently unrotatable.
+	// CreateSecret was the column's only writer, so both directions were wrong.
+	setGenerated := sec != nil && sec.Generated != generated
+	provenanceNote := ""
+	if setGenerated {
+		provenanceNote = " · now externally issued (rotate refuses it)"
+		if generated {
+			provenanceNote = " · now signet-minted (rotate can replace it)"
+		}
+	}
 	expiryNote := ""
 	if setExpiry {
 		expiryNote = " · expiry cleared"
@@ -369,9 +459,16 @@ func storeValue(project, name, scope, value string, generated bool, expiresAt st
 				return nil, store.AuditRecord{}, err
 			}
 			target, action, outcome = created, "secret.create", store.OutcomeCreated
-		} else if setExpiry {
-			if err := m.SetExpiry(target.ID, expiresAt); err != nil {
-				return nil, store.AuditRecord{}, err
+		} else {
+			if setExpiry {
+				if err := m.SetExpiry(target.ID, expiresAt); err != nil {
+					return nil, store.AuditRecord{}, err
+				}
+			}
+			if setGenerated {
+				if err := m.SetGenerated(target.ID, generated); err != nil {
+					return nil, store.AuditRecord{}, err
+				}
 			}
 		}
 		ver, err := m.AddVersion(target.ID, nonce, ct, vault.VersionHash(nonce, ct), cliActor())
@@ -383,15 +480,15 @@ func storeValue(project, name, scope, value string, generated bool, expiresAt st
 		// entry that could only ever be appended after the first had committed.
 		return ver, store.AuditRecord{
 			Actor: cliActor(), Action: action, SecretID: target.ID,
-			Details:   fmt.Sprintf("%s/%s · version %d #%s%s", project, name, ver.VersionNo, ver.VHash, expiryNote),
-			EventKind: store.KindSecretWrite, ActorRole: store.RoleHuman,
+			Details:   fmt.Sprintf("%s/%s · version %d #%s%s%s", project, name, ver.VersionNo, ver.VHash, expiryNote, provenanceNote),
+			EventKind: store.KindSecretWrite, ActorRole: cliRole(),
 			Status: &store.AuditStatus{Outcome: outcome},
 		}, nil
 	})
 	if err != nil {
 		return err
 	}
-	fmt.Printf("%s/%s → version %d #%s%s\n", project, name, v.VersionNo, v.VHash, expiryNote)
+	fmt.Printf("%s/%s → version %d #%s%s%s\n", project, name, v.VersionNo, v.VHash, expiryNote, provenanceNote)
 	reportDependents(dependents, project, name)
 	warnUndelivered(a, project, name)
 	return nil
@@ -502,7 +599,7 @@ func runReveal(args []string) error {
 	if _, err := a.st.AppendAudit(store.AuditRecord{
 		Actor: cliActor(), Action: "secret.reveal", SecretID: sec.ID,
 		Details:   details,
-		EventKind: store.KindSecretReveal, ActorRole: store.RoleHuman,
+		EventKind: store.KindSecretReveal, ActorRole: cliRole(),
 		Status: &store.AuditStatus{Outcome: store.OutcomeDelivered},
 	}); err != nil {
 		return err
@@ -524,7 +621,7 @@ func runReveal(args []string) error {
 			Actor: cliActor(), Action: "secret.reveal", SecretID: in.ID,
 			Details: fmt.Sprintf("value disclosed via reveal of %s/%s, which derives from it",
 				*project, *name),
-			EventKind: store.KindSecretReveal, ActorRole: store.RoleHuman,
+			EventKind: store.KindSecretReveal, ActorRole: cliRole(),
 			Status: &store.AuditStatus{Outcome: store.OutcomeDelivered},
 		}); err != nil {
 			return err
@@ -542,7 +639,7 @@ func runReveal(args []string) error {
 
 // ---- rotate -----------------------------------------------------------------
 
-// runRotate mints a new value for a generated secret and fans it out.
+// runRotate mints a new value for a signet-minted secret and fans it out.
 //
 // It existed only on the HTTP API until SGNT-25, which meant the one way to
 // rotate was a bearer token on a `curl` command line — the credential handling
@@ -550,18 +647,24 @@ func runReveal(args []string) error {
 // likely to be automated. As a verb it is allowlistable like every other, and
 // nothing has to hold the API token to reach it.
 //
-// The refusals below deliberately match the API's wording. Two surfaces that
-// answer the same question differently teach an operator that the answer
-// depends on which door they used.
+// The *refusals* below match the API's wording deliberately: two surfaces that
+// answer "may I rotate this?" differently teach an operator that the answer
+// depends on which door they used. What the two do afterwards differs on
+// purpose — see rotateFanOut.
 func runRotate(args []string) error {
 	fs := flag.NewFlagSet("rotate", flag.ExitOnError)
 	ref := fs.String("secret", "", "secret ref project/NAME (required)")
+	expires := fs.String("expires", "", "expiry date YYYY-MM-DD for the new value (empty clears)")
 	noSync := fs.Bool("no-sync", false, "rotate without pushing to GitHub destinations")
 	fs.Parse(args)
 	if *ref == "" {
-		return fmt.Errorf("usage: signet rotate --secret <project/NAME> [--no-sync]")
+		return fmt.Errorf("usage: signet rotate --secret <project/NAME> [--expires YYYY-MM-DD] [--no-sync]")
 	}
 	project, name, err := parseSecretRef(*ref)
+	if err != nil {
+		return err
+	}
+	expiresAt, expiresGiven, err := parseExpiry(fs, *expires)
 	if err != nil {
 		return err
 	}
@@ -578,16 +681,18 @@ func runRotate(args []string) error {
 	if sec == nil {
 		return fmt.Errorf("no secret %s/%s", project, name)
 	}
-	// Checked before the Generated test, which would otherwise catch a derived
-	// secret and tell the operator to rotate it "at the issuer" — advice that
-	// makes no sense for a value with no issuer and no stored form.
-	if sec.Derived() {
-		return fmt.Errorf("%s/%s is derived from %s — it has no value of its own to rotate; rotate one of its inputs instead",
-			project, name, sec.Derivation)
+	if err := rotatable(sec); err != nil {
+		return err
 	}
-	if !sec.Generated {
-		return fmt.Errorf("%s/%s is externally issued — signet can fan out a new value but cannot mint one; "+
-			"rotate it at the issuer, then `signet set --project %s --name %s`", project, name, project, name)
+
+	// Read before the write, not after. The derivation graph does not change
+	// because a value did, so this answer is the same either side of the commit
+	// — but taken afterwards, a failure here would abort the fan-out with the
+	// new value already in the vault and the destinations still holding the old
+	// one, which is the exact state rotation exists to avoid.
+	dependents, err := resolve.Dependents(a.st, project, name)
+	if err != nil {
+		return err
 	}
 
 	value, err := vault.RandomToken(32)
@@ -598,92 +703,182 @@ func runRotate(args []string) error {
 	if err != nil {
 		return err
 	}
+	setExpiry := expiresGiven && expiresAt != sec.ExpiresAt
+	expiryNote := ""
+	switch {
+	case setExpiry && expiresAt == "":
+		expiryNote = " · expiry cleared"
+	case setExpiry:
+		expiryNote = " · expiry set to " + expiresAt[:10]
+	case sec.ExpiresAt != "":
+		// The value moved and the date did not. Said out loud because the
+		// alternative is an expiry that now describes a version this command
+		// replaced — the silent half of the bug `set --expires` was fixed for.
+		expiryNote = " · expiry unchanged (" + sec.ExpiresAt[:10] + ")"
+	}
+
 	v, _, err := store.MutateValue(a.st, func(m *store.Mutation) (*store.Version, store.AuditRecord, error) {
+		// Re-read inside the transaction. The gates above ran against a snapshot
+		// taken before it opened, and both facts they test can change: another
+		// writer could have derived this secret, or replaced its minted value
+		// with one from stdin, in the window between. Rechecking here is what
+		// makes the refusal binding rather than advisory.
+		fresh, err := m.GetSecretForUpdate(sec.ID)
+		if err != nil {
+			return nil, store.AuditRecord{}, err
+		}
+		if fresh == nil {
+			return nil, store.AuditRecord{}, fmt.Errorf("%s/%s disappeared during rotation", project, name)
+		}
+		if err := rotatable(fresh); err != nil {
+			return nil, store.AuditRecord{}, err
+		}
+		if setExpiry {
+			if err := m.SetExpiry(sec.ID, expiresAt); err != nil {
+				return nil, store.AuditRecord{}, err
+			}
+		}
 		ver, err := m.AddVersion(sec.ID, nonce, ct, vault.VersionHash(nonce, ct), cliActor())
 		if err != nil {
 			return nil, store.AuditRecord{}, err
 		}
 		return ver, store.AuditRecord{
 			Actor: cliActor(), Action: "rotate", SecretID: sec.ID,
-			Details:   fmt.Sprintf("rotated %s/%s → version %d #%s", project, name, ver.VersionNo, ver.VHash),
-			EventKind: store.KindRotation, ActorRole: store.RoleHuman,
+			Details:   fmt.Sprintf("rotated %s/%s → version %d #%s%s", project, name, ver.VersionNo, ver.VHash, expiryNote),
+			EventKind: store.KindRotation, ActorRole: cliRole(),
 			Status: &store.AuditStatus{Outcome: store.OutcomeRotated},
 		}, nil
 	})
 	if err != nil {
 		return err
 	}
-	fmt.Printf("%s/%s → version %d #%s\n", project, name, v.VersionNo, v.VHash)
-
-	// The new value reaches every derived secret built on this one the instant
-	// it lands, exactly as `set` does — same reporting, because a rotation is
-	// the case where an operator most needs to know what else just moved.
-	dependents, err := resolve.Dependents(a.st, project, name)
-	if err != nil {
-		return err
-	}
+	fmt.Printf("%s/%s → version %d #%s%s\n", project, name, v.VersionNo, v.VHash, expiryNote)
 	reportDependents(dependents, project, name)
 
 	if *noSync {
-		fmt.Println("not synced (--no-sync); run `signet sync` to push")
+		fmt.Printf("not synced (--no-sync); run `signet sync --secret %s/%s` to push\n", project, name)
 		return nil
 	}
-	return rotateFanOut(a, sec)
+	return rotateFanOut(a, sec, dependents)
 }
 
-// rotateFanOut pushes the rotated secret to its GitHub destinations.
+// fanOutSet returns the secrets a rotation has to push: the rotated one, plus
+// every derived secret built on it, narrowed to those with a GitHub
+// destination.
 //
-// A rotation that lands in the vault and does not reach the destinations is
-// worse than one that never happened: the old value is still live where it is
-// used, and the vault now disagrees with it. So a push failure is reported and
-// exits non-zero rather than being folded into the success line.
-func rotateFanOut(a *app, sec *store.Secret) error {
-	targets, err := a.st.TargetsForSecret(sec.ID)
+// The narrowing happens before the credential is resolved, deliberately:
+// resolving decrypts the vault's root PAT and records a ledger entry for the
+// read, and doing that for a rotation with nowhere to push would write down an
+// authentication that never happened. PushSecret re-reads each secret's targets
+// afterwards, so this is one extra query to avoid one unnecessary credential
+// read — a trade this vault makes the same way in `sync`.
+func fanOutSet(st *store.Store, sec *store.Secret, dependents []store.Secret) ([]store.Secret, error) {
+	all, err := st.ListTargets()
+	if err != nil {
+		return nil, err
+	}
+	hasGH := map[string]bool{}
+	for _, t := range all {
+		if t.Kind == "gh-actions" {
+			hasGH[t.SecretID] = true
+		}
+	}
+	var out []store.Secret
+	for _, s := range append([]store.Secret{*sec}, dependents...) {
+		if hasGH[s.ID] {
+			out = append(out, s)
+		}
+	}
+	return out, nil
+}
+
+// rotatable reports whether a secret may be rotated, with the API's wording.
+//
+// Derived is tested before Generated because a derived secret would otherwise
+// fall into the externally-issued branch and be told to rotate "at the issuer"
+// — advice for a value that has no issuer and no stored form.
+func rotatable(sec *store.Secret) error {
+	if sec.Derived() {
+		return fmt.Errorf("%s/%s is derived from %s — it has no value of its own to rotate; rotate one of its inputs instead",
+			sec.Project, sec.Name, sec.Derivation)
+	}
+	if !sec.Generated {
+		return fmt.Errorf("%s/%s is externally issued — signet can fan out a new value but cannot mint one; "+
+			"rotate it at the issuer, then `signet set --project %s --name %s`",
+			sec.Project, sec.Name, sec.Project, sec.Name)
+	}
+	return nil
+}
+
+// rotateFanOut pushes the rotated secret, and every derived secret built on it,
+// to their GitHub destinations.
+//
+// The dependents are the part worth stating. A derived secret with its own
+// gh-actions target holds a value composed from the one just rotated, so it
+// changed at the same instant — and pushing only the rotated secret leaves that
+// destination holding a composed value built from the previous version, with
+// the command exiting 0. That is the drydock DSN hazard reached through
+// rotation instead of through a stale copy.
+//
+// A push failure exits non-zero, which is where this deliberately parts company
+// with the API: there, rotation is a command whose structured result the caller
+// inspects, and a fan-out error is a field on a 200 because the rotation itself
+// succeeded. Here the exit code is the whole result, and a rotation whose new
+// value never reached the destinations leaves the old one live where it is
+// actually used — silence would report that as success.
+func rotateFanOut(a *app, sec *store.Secret, dependents []store.Secret) error {
+	toPush, err := fanOutSet(a.st, sec, dependents)
 	if err != nil {
 		return err
 	}
-	gh := 0
-	for _, t := range targets {
-		if t.Kind == "gh-actions" {
-			gh++
-		}
-	}
-	if gh == 0 {
+	if len(toPush) == 0 {
 		// Not silence: a rotated secret nothing delivers is a value that has
 		// changed in the vault and nowhere else, which is worth saying plainly.
 		fmt.Println("no GitHub destinations — nothing to push")
 		warnUndelivered(a, sec.Project, sec.Name)
 		return nil
 	}
-	tok, err := ops.ResolveGHToken(a.st, a.key, a.cfg.GitHubToken, cliActor(), store.RoleHuman)
+
+	tok, err := ops.ResolveGHToken(a.st, a.key, a.cfg.GitHubToken, cliActor(), cliRole())
 	if err != nil {
 		return err
 	}
 	noteTokenSource(tok)
+	gh := syncpkg.NewGHClient(tok.Value)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	results, err := syncpkg.PushSecret(ctx, a.st, a.key, syncpkg.NewGHClient(tok.Value), sec, cliActor(), store.RoleHuman)
-	if err != nil {
-		return err
-	}
-	failed := 0
-	for _, r := range results {
-		if r.State == "in sync" {
-			fmt.Printf("  ✓ %s → %s (%s)\n", sec.Name, r.Repo, r.Secret)
-			continue
+
+	pushed, failed := 0, 0
+	for i := range toPush {
+		results, err := syncpkg.PushSecret(ctx, a.st, a.key, gh, &toPush[i], cliActor(), cliRole())
+		if err != nil {
+			return err
 		}
-		failed++
-		if r.Hint != "" {
-			fmt.Printf("  ✗ %s → %s: %s\n", sec.Name, r.Repo, r.Hint)
-			fmt.Printf("    GitHub said: %s\n", r.Err)
-		} else {
-			fmt.Printf("  ✗ %s → %s: %s\n", sec.Name, r.Repo, r.Err)
+		for _, r := range results {
+			ref := toPush[i].Project + "/" + toPush[i].Name
+			if r.State == "in sync" {
+				pushed++
+				fmt.Printf("  ✓ %s → %s (%s)\n", ref, r.Repo, r.Secret)
+				// A reconciled out-of-band change is why this push was not a
+				// routine fan-out; sync reports it and so must this.
+				if r.Note != "" {
+					fmt.Printf("    note: %s\n", r.Note)
+				}
+				continue
+			}
+			failed++
+			if r.Hint != "" {
+				fmt.Printf("  ✗ %s → %s: %s\n", ref, r.Repo, r.Hint)
+				fmt.Printf("    GitHub said: %s\n", r.Err)
+			} else {
+				fmt.Printf("  ✗ %s → %s: %s\n", ref, r.Repo, r.Err)
+			}
 		}
 	}
 	if failed > 0 {
 		return fmt.Errorf("rotated, but %d of %d destinations did not receive it — "+
 			"the old value is still live there; fix and re-run `signet sync --secret %s/%s`",
-			failed, len(results), sec.Project, sec.Name)
+			failed, pushed+failed, sec.Project, sec.Name)
 	}
 	return nil
 }
@@ -780,7 +975,7 @@ func runDerive(args []string) error {
 		return sec, store.AuditRecord{
 			Actor: cliActor(), Action: "secret.derive", SecretID: sec.ID,
 			Details:   fmt.Sprintf("%s %s/%s from %s", verb, *project, *name, *from),
-			EventKind: store.KindSecretWrite, ActorRole: store.RoleHuman,
+			EventKind: store.KindSecretWrite, ActorRole: cliRole(),
 			Status: &store.AuditStatus{Outcome: store.OutcomeDelivered},
 		}, nil
 	})
@@ -840,7 +1035,7 @@ func (a *app) clearDerivation(sec *store.Secret, project, name string) error {
 			Actor: cliActor(), Action: "secret.derive.clear", SecretID: sec.ID,
 			Details: fmt.Sprintf("cleared derivation of %s/%s (was %s) · version %d #%s is current again",
 				project, name, was, cur.VersionNo, cur.VHash),
-			EventKind: store.KindSecretWrite, ActorRole: store.RoleHuman,
+			EventKind: store.KindSecretWrite, ActorRole: cliRole(),
 			Status: &store.AuditStatus{Outcome: store.OutcomeUpdated},
 		}, nil
 	}); err != nil {
@@ -937,7 +1132,7 @@ func runRender(args []string) error {
 		if _, err := a.st.AppendAudit(store.AuditRecord{
 			Actor: cliActor(), Action: "render", TargetID: t.ID,
 			Details:   fmt.Sprintf("rendered %d keys → %s (mode %s)%s", len(pairs), cfg.Path, cfg.Mode, note),
-			EventKind: store.KindRender, ActorRole: store.RoleHuman,
+			EventKind: store.KindRender, ActorRole: cliRole(),
 			Status: &store.AuditStatus{Outcome: store.OutcomeDelivered},
 		}); err != nil {
 			return err
@@ -1236,7 +1431,7 @@ func runTargetAddKey(args []string) error {
 		return res, store.AuditRecord{
 			Actor: cliActor(), Action: "target.file", TargetID: t.ID,
 			Details:   fmt.Sprintf("%s → %s +%s (%d keys)", *project, abs, strings.Join(names, ", "), res.keys),
-			EventKind: store.KindTargetConfig, ActorRole: store.RoleHuman,
+			EventKind: store.KindTargetConfig, ActorRole: cliRole(),
 			Status: &store.AuditStatus{Outcome: outcome},
 		}, nil
 	})
@@ -1309,7 +1504,7 @@ func runTargetAdd(args []string) error {
 		return store.AuditRecord{
 			Actor: cliActor(), Action: "target.add", SecretID: sec.ID, TargetID: t.ID,
 			Details:   fmt.Sprintf("%s/%s → %s · Actions secret %s", project, name, *ghRepo, dest),
-			EventKind: store.KindTargetConfig, ActorRole: store.RoleHuman,
+			EventKind: store.KindTargetConfig, ActorRole: cliRole(),
 			Status: &store.AuditStatus{Outcome: store.OutcomeCreated},
 		}, nil
 	}); err != nil {
@@ -1342,7 +1537,7 @@ const preflightTimeout = 30 * time.Second
 // add-time one, so its absence is reported and stepped over rather than failing
 // the command that asked.
 func preflightClient(a *app) *syncpkg.GHClient {
-	tok, err := ops.ResolveGHTokenFor(a.st, a.key, a.cfg.GitHubToken, cliActor(), store.RoleHuman, ops.PurposePreflight)
+	tok, err := ops.ResolveGHTokenFor(a.st, a.key, a.cfg.GitHubToken, cliActor(), cliRole(), ops.PurposePreflight)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "preflight skipped: %v\n", err)
 		return nil
@@ -1604,7 +1799,7 @@ func runTargetRm(args []string) error {
 			return store.AuditRecord{
 				Actor: cliActor(), Action: "target.rm", TargetID: t.ID,
 				Details:   fmt.Sprintf("%s → %s (%d keys) detached", *project, cfg.Path, len(cfg.Keys)),
-				EventKind: store.KindTargetConfig, ActorRole: store.RoleHuman,
+				EventKind: store.KindTargetConfig, ActorRole: cliRole(),
 				Status: &store.AuditStatus{Outcome: store.OutcomeRemoved},
 			}, nil
 		}); err != nil {
@@ -1645,7 +1840,7 @@ func runTargetRm(args []string) error {
 		return store.AuditRecord{
 			Actor: cliActor(), Action: "target.rm", SecretID: sec.ID, TargetID: t.ID,
 			Details:   fmt.Sprintf("%s/%s → %s · Actions secret %s detached", p, n, *ghRepo, dest),
-			EventKind: store.KindTargetConfig, ActorRole: store.RoleHuman,
+			EventKind: store.KindTargetConfig, ActorRole: cliRole(),
 			Status: &store.AuditStatus{Outcome: store.OutcomeRemoved},
 		}, nil
 	}); err != nil {
@@ -1724,7 +1919,7 @@ func runSync(args []string) error {
 	// decrypts the vault's root credential, and doing that for a run with no
 	// destinations would record an authentication that never happened.
 	if len(toSync) > 0 {
-		tok, err := ops.ResolveGHToken(a.st, a.key, a.cfg.GitHubToken, cliActor(), store.RoleHuman)
+		tok, err := ops.ResolveGHToken(a.st, a.key, a.cfg.GitHubToken, cliActor(), cliRole())
 		if err != nil {
 			return err
 		}
@@ -1734,7 +1929,7 @@ func runSync(args []string) error {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 		for i := range toSync {
-			results, err := syncpkg.PushSecret(ctx, a.st, a.key, gh, &toSync[i], cliActor(), store.RoleHuman)
+			results, err := syncpkg.PushSecret(ctx, a.st, a.key, gh, &toSync[i], cliActor(), cliRole())
 			if err != nil {
 				return err
 			}
@@ -1774,7 +1969,7 @@ func runSync(args []string) error {
 // add-time preflight, a missing credential fails the command: a check that
 // silently checked nothing would report success.
 func checkClient(a *app) (*syncpkg.GHClient, error) {
-	tok, err := ops.ResolveGHTokenFor(a.st, a.key, a.cfg.GitHubToken, cliActor(), store.RoleHuman, ops.PurposePreflight)
+	tok, err := ops.ResolveGHTokenFor(a.st, a.key, a.cfg.GitHubToken, cliActor(), cliRole(), ops.PurposePreflight)
 	if err != nil {
 		return nil, err
 	}

@@ -89,12 +89,26 @@ A rule whose correctness depends on argument order is not a rule. As separate
 verbs, `Bash(signet generate:*)` grants exactly the half that never carries
 plaintext inward. `set --generate` still works and does the same thing.
 
-`signet rotate --secret p/NAME` mints a replacement for a secret signet already
-minted, then pushes it to that secret's GitHub destinations. It refuses
-externally-issued secrets (signet can fan out a new value, not mint one) and
-derived secrets (they have no value of their own — rotate an input). A push
-failure exits non-zero: a rotation that lands in the vault and not at the
-destination leaves the old value live where it is actually used.
+`signet generate` refuses to overwrite an existing value without `--replace`.
+It is the verb granted to agents wholesale, so it is the one that must not be
+able to replace a live credential with a random string by accident. On a secret
+signet already minted, the message points at `rotate` instead — that is the
+operation you almost certainly want, since it also pushes.
+
+`signet rotate --secret p/NAME [--expires YYYY-MM-DD] [--no-sync]` mints a
+replacement for a secret signet already minted, then pushes it — **and pushes
+every derived secret built on it**, since those changed at the same instant and
+their own destinations would otherwise keep a value composed from the previous
+version.
+
+It refuses externally-issued secrets (signet can fan out a new value, not mint
+one) and derived secrets (they have no value of their own — rotate an input),
+re-checking both inside the write transaction so the refusal is binding rather
+than advisory. `--expires` moves the expiry with the value; without it, an
+existing expiry is reported as unchanged rather than left to silently describe
+the version this command replaced. A push failure exits non-zero: a rotation
+that lands in the vault and not at the destination leaves the old value live
+where it is actually used.
 
 ## Derived secrets
 

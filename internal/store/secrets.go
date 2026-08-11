@@ -108,6 +108,43 @@ func (m *Mutation) SetExpiry(secretID, expiresAt string) error {
 	return nil
 }
 
+// GetSecretForUpdate reads a secret through the mutation's transaction, so a
+// check made on it and the write that depends on it cannot be separated by
+// another writer.
+//
+// The Store variant reads a snapshot taken before the transaction opened, which
+// is fine for a report and wrong for a gate: `rotate` refuses derived and
+// externally-issued secrets, and both of those facts can change between the
+// read and the write. Re-reading here is what makes the refusal binding.
+func (m *Mutation) GetSecretForUpdate(id string) (*Secret, error) {
+	row := m.tx.QueryRow(`
+        SELECT id, project, name, scope, status, generated, COALESCE(expires_at, ''), created_at, updated_at, derivation
+        FROM secrets WHERE id = ?`, id)
+	return scanSecret(row)
+}
+
+// SetGenerated records whether signet minted the secret's current value.
+//
+// It exists because the column was write-once — CreateSecret was its only
+// writer — while the fact it records is a property of the *current value*, not
+// of the secret's origin. Overwriting a minted value with one from stdin left
+// it reading "signet minted this", so `rotate` would mint over a live
+// externally-issued credential; minting over an imported value left it reading
+// the opposite, so the value signet had just minted was permanently
+// unrotatable. Both directions contradict what rotation promises.
+func (m *Mutation) SetGenerated(secretID string, generated bool) error {
+	g := 0
+	if generated {
+		g = 1
+	}
+	if _, err := m.tx.Exec(
+		`UPDATE secrets SET generated = ?, updated_at = ? WHERE id = ?`,
+		g, now(), secretID); err != nil {
+		return fmt.Errorf("set generated: %w", err)
+	}
+	return nil
+}
+
 // SetDerivation makes a secret derived, or clears it back to an ordinary one
 // with the empty string. The caller validates the template; the store only
 // records it.
