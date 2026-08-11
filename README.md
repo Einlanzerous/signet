@@ -89,11 +89,22 @@ A rule whose correctness depends on argument order is not a rule. As separate
 verbs, `Bash(signet generate:*)` grants exactly the half that never carries
 plaintext inward. `set --generate` still works and does the same thing.
 
-`signet generate` refuses to overwrite an existing value without `--replace`.
-It is the verb granted to agents wholesale, so it is the one that must not be
-able to replace a live credential with a random string by accident. On a secret
-signet already minted, the message points at `rotate` instead — that is the
-operation you almost certainly want, since it also pushes.
+**Minting over an existing value needs `--replace`** — from `generate` *and*
+from `set --generate`, since they perform the identical write and a guard one
+of them walks around is not a guard. Minting is the case that needs it: the
+replaced value is gone and nobody ever saw the new one, so an accidental
+overwrite of a live PAT is unrecoverable in a way an accidental `set` — where
+you supplied the value — is not. On a secret signet already minted, the message
+points at `rotate` instead; that is the operation you almost certainly want,
+since it also pushes.
+
+**`signet import` records imported values as externally issued**, so a secret
+whose value came from an env file stops being rotatable even if signet minted
+an earlier one. The provenance follows the *value*, not the secret.
+
+A write that does not push — `set`, `generate` — warns when the secret (or a
+derived secret built on it) has GitHub destinations still holding the previous
+value, and names the `sync` commands that fix it.
 
 `signet rotate --secret p/NAME [--expires YYYY-MM-DD] [--no-sync]` mints a
 replacement for a secret signet already minted, then pushes it — **and pushes
@@ -173,6 +184,13 @@ Hashing transforms (`scrypt`, `bcrypt`, `base64`) are **not** implemented;
   a *blind mirror* built on exactly this surface.
 - Plaintext leaves the vault in two audited ways only: `signet reveal` (stdout)
   and rendered env-file targets.
+- **Ledger attribution**: CLI writes record `human` unless `SIGNET_ACTOR_ROLE`
+  says otherwise. Agents driving allowlisted verbs should set it to
+  `rule_engine`, or their changes are indistinguishable from a person's in a
+  log whose purpose is saying who acted. Only roles an API caller could declare
+  are accepted — `daemon` and `healer` mean signet acted on its own initiative,
+  which nothing outside the daemon can honestly assert — and an unusable value
+  fails before the command does any work.
 - Rotation of externally-issued credentials (GitHub App keys, API keys) is
   human-in-the-loop by design: Signet automates the **fan-out**, not the
   minting. `rotate` only self-serves for secrets signet minted itself

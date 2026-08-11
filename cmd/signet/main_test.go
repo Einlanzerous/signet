@@ -62,7 +62,7 @@ func TestSetMovesExpiryOnExistingSecret(t *testing.T) {
 		t.Fatalf("create: expiry %q want %q", got, want)
 	}
 
-	if err := runSet([]string{"--project", "signet", "--name", "SIGNET_PAT", "--generate", "--expires", "2027-01-15"}); err != nil {
+	if err := runSet([]string{"--project", "signet", "--name", "SIGNET_PAT", "--generate", "--replace", "--expires", "2027-01-15"}); err != nil {
 		t.Fatal(err)
 	}
 	if got, want := expiryOf(t, st, "signet", "SIGNET_PAT"), day(t, "2027-01-15"); got != want {
@@ -90,7 +90,7 @@ func TestSetWithoutExpiryFlagKeepsExpiry(t *testing.T) {
 	if err := runSet([]string{"--project", "p", "--name", "N", "--generate", "--expires", "2026-10-19"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := runSet([]string{"--project", "p", "--name", "N", "--generate"}); err != nil {
+	if err := runSet([]string{"--project", "p", "--name", "N", "--generate", "--replace"}); err != nil {
 		t.Fatal(err)
 	}
 	if got, want := expiryOf(t, st, "p", "N"), day(t, "2026-10-19"); got != want {
@@ -104,7 +104,7 @@ func TestSetExplicitEmptyExpiryClears(t *testing.T) {
 	if err := runSet([]string{"--project", "p", "--name", "N", "--generate", "--expires", "2026-10-19"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := runSet([]string{"--project", "p", "--name", "N", "--generate", "--expires", ""}); err != nil {
+	if err := runSet([]string{"--project", "p", "--name", "N", "--generate", "--replace", "--expires", ""}); err != nil {
 		t.Fatal(err)
 	}
 	if got := expiryOf(t, st, "p", "N"); got != "" {

@@ -479,19 +479,10 @@ func (s *Server) handleCommandRotate(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	// Checked before the Generated test, which would otherwise catch a derived
-	// secret and tell the caller to rotate it "at the issuer" — advice that
-	// makes no sense for a value with no issuer and no stored form. A derived
-	// secret rotates when its inputs do.
-	if sec.Derived() {
-		writeErr(w, http.StatusConflict,
-			"secret %s/%s is derived from %s — it has no value of its own to rotate; rotate one of its inputs instead",
-			sec.Project, sec.Name, sec.Derivation)
-		return
-	}
-	if !sec.Generated {
-		writeErr(w, http.StatusConflict,
-			"secret %s/%s is externally issued — signet can fan out a new value but cannot mint one; rotate it at the issuer, then `signet set`", sec.Project, sec.Name)
+	// Shared with the CLI verb so the two surfaces refuse the same secret with
+	// the same words; they had two copies and had already drifted.
+	if err := ops.Rotatable(sec); err != nil {
+		writeErr(w, http.StatusConflict, "%v", err)
 		return
 	}
 	value, err := vault.RandomToken(32)
@@ -505,7 +496,20 @@ func (s *Server) handleCommandRotate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	v, _, err := store.MutateValue(s.st, func(m *store.Mutation) (*store.Version, store.AuditRecord, error) {
-		ver, err := m.AddVersion(sec.ID, nonce, ct, vault.VersionHash(nonce, ct), s.actor(r))
+		// Re-read inside the transaction: the gate above ran against a snapshot
+		// taken before it opened, and both facts it tests can change under a
+		// concurrent write. The CLI does the same, for the same reason.
+		fresh, err := m.GetSecretForUpdate(sec.ID)
+		if err != nil {
+			return nil, store.AuditRecord{}, err
+		}
+		if fresh == nil {
+			return nil, store.AuditRecord{}, fmt.Errorf("secret %s/%s disappeared during rotation", sec.Project, sec.Name)
+		}
+		if err := ops.Rotatable(fresh); err != nil {
+			return nil, store.AuditRecord{}, err
+		}
+		ver, err := m.AddVersion(sec.ID, nonce, ct, vault.VersionHash(nonce, ct), s.actor(r), store.Minted)
 		if err != nil {
 			return nil, store.AuditRecord{}, err
 		}

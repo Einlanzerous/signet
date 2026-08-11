@@ -685,3 +685,102 @@ func TestFanOutSetIncludesTheRotatedSecretAndSkipsUndeliveredOnes(t *testing.T) 
 		t.Errorf("fan-out set = %v, want just p/TOK (q/PLAIN has no destination)", toPush)
 	}
 }
+
+// SIGNET_ACTOR_ROLE decides what a hash-chained ledger records about who acted,
+// so its handling has to be exact: validated before anything happens, trimmed
+// the way every other signet env var is, and refused rather than downgraded.
+func TestActorRoleDeclaration(t *testing.T) {
+	cases := []struct {
+		name string
+		env  string
+		want store.ActorRole
+		ok   bool
+	}{
+		{"absent defaults to human", "", store.RoleHuman, true},
+		{"declarable role is honored", "rule_engine", store.RoleRuleEngine, true},
+		{"dispatcher is declarable", "dispatcher", store.RoleDispatcher, true},
+		// A trailing newline is what a heredoc or a CI variable editor produces.
+		// Refusing it would be refusing a correct answer over invisible bytes.
+		{"trailing newline is trimmed", "rule_engine\n", store.RoleRuleEngine, true},
+		{"CR is trimmed", "rule_engine\r\n", store.RoleRuleEngine, true},
+		// daemon and healer assert that signet acted on its own initiative,
+		// which an env var cannot honestly claim.
+		{"daemon is refused", "daemon", "", false},
+		{"healer is refused", "healer", "", false},
+		{"nonsense is refused", "wizard", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("SIGNET_ACTOR_ROLE", tc.env)
+			got, err := checkActorRole()
+			if tc.ok && err != nil {
+				t.Fatalf("rejected a declarable role: %v", err)
+			}
+			if !tc.ok {
+				if err == nil {
+					t.Fatal("accepted a role that cannot be declared")
+				}
+				// The message has to name the alternatives, or the operator is
+				// left guessing at a closed set.
+				if !strings.Contains(err.Error(), "one of:") {
+					t.Errorf("refusal does not list the declarable roles: %v", err)
+				}
+				return
+			}
+			if got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// The declared role has to reach the chain, not just be computed.
+func TestDeclaredRoleIsRecordedInTheLedger(t *testing.T) {
+	st := newCLIVault(t)
+	t.Setenv("SIGNET_ACTOR_ROLE", "rule_engine")
+	role, err := checkActorRole()
+	if err != nil {
+		t.Fatal(err)
+	}
+	declaredRole = role
+	t.Cleanup(func() { declaredRole = store.RoleHuman })
+
+	if err := runGenerate([]string{"--project", "p", "--name", "TOK"}); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := st.ListAudit(1, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) == 0 {
+		t.Fatal("no audit entry")
+	}
+	if entries[0].ActorRole != store.RoleRuleEngine {
+		t.Errorf("ledger recorded role %q, want rule_engine — an agent's write is indistinguishable from a person's",
+			entries[0].ActorRole)
+	}
+}
+
+// import is the other version-writer, and the provenance fix originally missed
+// it: importing over a minted secret left it claiming signet had minted the
+// value, so rotate would have minted over a credential from an env file.
+func TestImportMarksImportedValuesAsExternallyIssued(t *testing.T) {
+	st := newCLIVault(t)
+	if err := runGenerate([]string{"--project", "p", "--name", "TOK"}); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	env := filepath.Join(dir, "p.env")
+	if err := os.WriteFile(env, []byte("TOK=from-a-file\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := runImport([]string{"--project", "p", env}); err != nil {
+		t.Fatal(err)
+	}
+	if mustSecret(t, st, "p", "TOK").Generated {
+		t.Fatal("imported value still reads as signet-minted")
+	}
+	if err := runRotate([]string{"--secret", "p/TOK"}); err == nil {
+		t.Error("rotate minted over a value that came from an env file")
+	}
+}
