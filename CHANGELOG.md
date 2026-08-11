@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.7.0](https://github.com/Einlanzerous/signet/compare/v1.6.0...v1.7.0) (2026-08-11)
+
+
+### Features
+
+* **cli:** add generate and rotate verbs (SGNT-25) ([#25](https://github.com/Einlanzerous/signet/issues/25)) ([16a9a59](https://github.com/Einlanzerous/signet/commit/16a9a59c384931d9889bfbb94b6bbb250b945a0a))
+
 ## [1.6.0](https://github.com/Einlanzerous/signet/compare/v1.5.1...v1.6.0) (2026-08-10)
 
 
