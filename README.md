@@ -12,7 +12,9 @@ is a single SQLite file; crypto is AES-256-GCM under a master key file.
 ```
 signet init                                          # master key + database
 signet import --project lyceum ~/projects/lyceum/.env
-signet set --project construct-server --name API_TOKEN --generate
+signet generate --project construct-server --name API_TOKEN   # signet mints it
+signet set --project construct-server --name API_TOKEN        # value on stdin
+signet rotate --secret construct-server/API_TOKEN             # new value + fan-out
 signet target add --secret construct-server/RELEASE_BOT_PRIVATE_KEY \
     --gh-repo Einlanzerous/purser
 signet target list [--secret <p>/<NAME>] [--project <p>]
@@ -68,6 +70,31 @@ invisible until someone runs `render --check` by hand.
 |---|---|---|
 | **Managed, not blind** | `~/projects/*/.env` dev files | Signet is the registry + renderer + drift detector. The human (and their agents) can read these files — pretending otherwise would be blindness theater. |
 | **Blind (future)** | `.env.vault` for the compose stack | Daemon-owned file, mode 0600, separate system user; agents never get read access to a valid injection destination. Lands with the Phase-2 watcher/healer work. |
+
+## Minting versus setting, and why they are separate verbs
+
+`signet generate` mints a value and stores it. `signet set` reads one from
+stdin. They differ in whether a credential passes through whatever is running
+the command, which is the distinction worth gating — and Claude Code's
+permission rules match a command **prefix**, so they can gate a verb and cannot
+gate a flag:
+
+```
+Bash(signet set --generate:*)
+  matches  signet set --generate --project p --name N
+  misses   signet set --project p --name N --generate
+```
+
+A rule whose correctness depends on argument order is not a rule. As separate
+verbs, `Bash(signet generate:*)` grants exactly the half that never carries
+plaintext inward. `set --generate` still works and does the same thing.
+
+`signet rotate --secret p/NAME` mints a replacement for a secret signet already
+minted, then pushes it to that secret's GitHub destinations. It refuses
+externally-issued secrets (signet can fan out a new value, not mint one) and
+derived secrets (they have no value of their own — rotate an input). A push
+failure exits non-zero: a rotation that lands in the vault and not at the
+destination leaves the old value live where it is actually used.
 
 ## Derived secrets
 
@@ -134,8 +161,8 @@ Hashing transforms (`scrypt`, `bcrypt`, `base64`) are **not** implemented;
   and rendered env-file targets.
 - Rotation of externally-issued credentials (GitHub App keys, API keys) is
   human-in-the-loop by design: Signet automates the **fan-out**, not the
-  minting. `rotate` only self-serves for `--generate` secrets; everything else
-  409s with instructions.
+  minting. `rotate` only self-serves for secrets signet minted itself
+  (`signet generate`); everything else is refused with instructions.
 - Every mutation appends to a hash-chained, append-only audit log (SQLite
   triggers block UPDATE/DELETE; `signet audit --verify` walks the chain). Each
   entry is typed — event kind, actor role, structured outcome — and those fields

@@ -321,3 +321,160 @@ func TestClearRefusesWhenThereIsNoStoredValue(t *testing.T) {
 		t.Errorf("refusal does not explain why: %v", err)
 	}
 }
+
+// The reason `generate` is a verb: the permission allowlist matches command
+// prefixes, so a flag whose position is free cannot be gated. These assert the
+// verb does what the flag did, so the allowlist can grant one without the other.
+func TestGenerateVerbMintsAndMarksRotatable(t *testing.T) {
+	st := newCLIVault(t)
+	if err := runGenerate([]string{"--project", "p", "--name", "TOK"}); err != nil {
+		t.Fatal(err)
+	}
+	sec, err := st.GetSecret("p", "TOK")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sec == nil {
+		t.Fatal("generate created no secret")
+	}
+	// Generated is what makes a secret rotatable; a value minted by signet that
+	// did not record this would be unrotatable for no reason.
+	if !sec.Generated {
+		t.Error("generate did not mark the secret as signet-minted")
+	}
+	a, err := setup()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.close()
+	r, err := resolve.Current(a.st, a.key, sec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Value) != 32 {
+		t.Errorf("generated value is %d chars, want 32", len(r.Value))
+	}
+}
+
+func TestGenerateAcceptsExpiry(t *testing.T) {
+	st := newCLIVault(t)
+	if err := runGenerate([]string{"--project", "p", "--name", "TOK", "--expires", "2026-10-19"}); err != nil {
+		t.Fatal(err)
+	}
+	sec, _ := st.GetSecret("p", "TOK")
+	if sec.ExpiresAt == "" {
+		t.Error("generate dropped --expires")
+	}
+}
+
+// set --generate has to keep working: it is in the README and in muscle memory.
+func TestSetGenerateStillWorks(t *testing.T) {
+	st := newCLIVault(t)
+	if err := runSet([]string{"--project", "p", "--name", "TOK", "--generate"}); err != nil {
+		t.Fatal(err)
+	}
+	sec, _ := st.GetSecret("p", "TOK")
+	if sec == nil || !sec.Generated {
+		t.Error("set --generate no longer mints a rotatable secret")
+	}
+}
+
+// Rotation existed only on the HTTP API, which meant reaching it required a
+// bearer token on a command line. The CLI verb has to refuse exactly what the
+// API refuses, or the two surfaces disagree about the same question.
+func TestRotateMintsANewVersion(t *testing.T) {
+	st := newCLIVault(t)
+	if err := runGenerate([]string{"--project", "p", "--name", "TOK"}); err != nil {
+		t.Fatal(err)
+	}
+	sec, _ := st.GetSecret("p", "TOK")
+	before, err := st.CurrentVersion(sec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runRotate([]string{"--secret", "p/TOK"}); err != nil {
+		t.Fatal(err)
+	}
+	after, err := st.CurrentVersion(sec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.VersionNo != before.VersionNo+1 {
+		t.Errorf("version %d → %d, want an increment", before.VersionNo, after.VersionNo)
+	}
+	if after.VHash == before.VHash {
+		t.Error("rotation produced the same value")
+	}
+}
+
+func TestRotateRefusesExternallyIssuedSecrets(t *testing.T) {
+	newCLIVault(t)
+	setValue(t, "p", "PAT", "ghp_issued_elsewhere")
+	err := runRotate([]string{"--secret", "p/PAT"})
+	if err == nil {
+		t.Fatal("rotate minted a new value for an externally-issued secret")
+	}
+	// Same reasoning the API gives: signet can fan out, not mint.
+	if !strings.Contains(err.Error(), "issuer") {
+		t.Errorf("refusal does not explain why: %v", err)
+	}
+}
+
+func TestRotateRefusesDerivedSecrets(t *testing.T) {
+	newCLIVault(t)
+	setValue(t, "p", "PW", "x")
+	if err := runDerive([]string{"--project", "p", "--name", "DSN", "--from", "u:{{PW}}"}); err != nil {
+		t.Fatal(err)
+	}
+	err := runRotate([]string{"--secret", "p/DSN"})
+	if err == nil {
+		t.Fatal("rotate acted on a derived secret")
+	}
+	// Must not fall through to the externally-issued message, which would tell
+	// the operator to rotate at an issuer that does not exist.
+	if strings.Contains(err.Error(), "issuer") {
+		t.Errorf("derived secret got the externally-issued advice: %v", err)
+	}
+	if !strings.Contains(err.Error(), "inputs") {
+		t.Errorf("refusal does not say what to rotate instead: %v", err)
+	}
+}
+
+// A rotation changes every derived secret built on it, at the same instant —
+// that is the property, and it is worth asserting rather than asserting that a
+// message about it was printed.
+func TestRotateMovesEveryDerivedSecretBuiltOnIt(t *testing.T) {
+	newCLIVault(t)
+	if err := runGenerate([]string{"--project", "p", "--name", "PW"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runDerive([]string{"--project", "q", "--name", "DSN", "--from", "u:{{p/PW}}@h"}); err != nil {
+		t.Fatal(err)
+	}
+
+	resolved := func() string {
+		t.Helper()
+		a, err := setup()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer a.close()
+		sec, err := a.st.GetSecret("q", "DSN")
+		if err != nil {
+			t.Fatal(err)
+		}
+		r, err := resolve.Current(a.st, a.key, sec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r.Value
+	}
+
+	before := resolved()
+	if err := runRotate([]string{"--secret", "p/PW"}); err != nil {
+		t.Fatal(err)
+	}
+	if after := resolved(); after == before {
+		t.Error("rotating an input left the derived secret unchanged")
+	}
+}
