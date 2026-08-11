@@ -108,6 +108,31 @@ func (m *Mutation) SetExpiry(secretID, expiresAt string) error {
 	return nil
 }
 
+// GetSecretForUpdate reads a secret through the mutation's transaction, so a
+// check made on it and the write that depends on it cannot be separated by
+// another writer.
+//
+// The Store variant reads a snapshot taken before the transaction opened, which
+// is fine for a report and wrong for a gate: `rotate` refuses derived and
+// externally-issued secrets, and both of those facts can change between the
+// read and the write. Re-reading here is what makes the refusal binding.
+func (m *Mutation) GetSecretForUpdate(id string) (*Secret, error) {
+	row := m.tx.QueryRow(`
+        SELECT id, project, name, scope, status, generated, COALESCE(expires_at, ''), created_at, updated_at, derivation
+        FROM secrets WHERE id = ?`, id)
+	return scanSecret(row)
+}
+
+// CurrentVersionForUpdate reads a secret's newest version through the
+// mutation's transaction, for gates whose answer another writer could change
+// between the read and the write they guard.
+func (m *Mutation) CurrentVersionForUpdate(secretID string) (*Version, error) {
+	row := m.tx.QueryRow(`
+        SELECT id, secret_id, version_no, nonce, ciphertext, vhash, created_by, created_at
+        FROM secret_versions WHERE secret_id = ? ORDER BY version_no DESC LIMIT 1`, secretID)
+	return scanVersion(row)
+}
+
 // SetDerivation makes a secret derived, or clears it back to an ordinary one
 // with the empty string. The caller validates the template; the store only
 // records it.
@@ -144,10 +169,34 @@ func (s *Store) ListSecrets() ([]Secret, error) {
 	return out, rows.Err()
 }
 
-// AddVersion appends a new encrypted version for a secret and bumps
-// updated_at. The next version number is read inside the same transaction that
-// writes it, so two writers cannot both claim it.
-func (m *Mutation) AddVersion(secretID string, nonce, ciphertext []byte, vhash, createdBy string) (*Version, error) {
+// Provenance says where a value came from: signet minted it, or it arrived
+// from outside. It is a property of the value, so every write of one declares
+// it.
+type Provenance bool
+
+const (
+	// Minted means signet generated the value itself, which is what makes the
+	// secret rotatable — signet can produce a replacement.
+	Minted Provenance = true
+	// Issued means the value came from outside signet: stdin, an env file, an
+	// issuer's console. Signet can fan such a value out but cannot mint a new
+	// one, so rotation refuses it.
+	Issued Provenance = false
+)
+
+// AddVersion appends a new encrypted version for a secret, records where the
+// value came from, and bumps updated_at. The next version number is read inside
+// the same transaction that writes it, so two writers cannot both claim it.
+//
+// Provenance is a required argument rather than a separate SetGenerated call
+// because it describes *this value*, and the two must not be able to disagree.
+// They did: the column was written only at CreateSecret, so overwriting a
+// minted value with one from stdin left the secret claiming signet had minted
+// it — and rotate, which reads that claim, would have minted over a live
+// externally-issued credential. Fixing it at one caller left `signet import`,
+// the other version-writer, still wrong. Owning it here is what makes the
+// invariant hold for every writer, including ones not yet written.
+func (m *Mutation) AddVersion(secretID string, nonce, ciphertext []byte, vhash, createdBy string, prov Provenance) (*Version, error) {
 	var next int
 	if err := m.tx.QueryRow(`SELECT COALESCE(MAX(version_no), 0) + 1 FROM secret_versions WHERE secret_id = ?`, secretID).Scan(&next); err != nil {
 		return nil, fmt.Errorf("add version: %w", err)
@@ -163,7 +212,12 @@ func (m *Mutation) AddVersion(secretID string, nonce, ciphertext []byte, vhash, 
 		v.ID, v.SecretID, v.VersionNo, v.Nonce, v.Ciphertext, v.VHash, v.CreatedBy, v.CreatedAt); err != nil {
 		return nil, fmt.Errorf("add version: %w", err)
 	}
-	if _, err := m.tx.Exec(`UPDATE secrets SET updated_at = ? WHERE id = ?`, now(), secretID); err != nil {
+	generated := 0
+	if prov == Minted {
+		generated = 1
+	}
+	if _, err := m.tx.Exec(`UPDATE secrets SET updated_at = ?, generated = ? WHERE id = ?`,
+		now(), generated, secretID); err != nil {
 		return nil, fmt.Errorf("add version: %w", err)
 	}
 	return &v, nil
@@ -176,6 +230,12 @@ func (s *Store) CurrentVersion(secretID string) (*Version, error) {
 	row := s.db.QueryRowContext(ctx, `
         SELECT id, secret_id, version_no, nonce, ciphertext, vhash, created_by, created_at
         FROM secret_versions WHERE secret_id = ? ORDER BY version_no DESC LIMIT 1`, secretID)
+	return scanVersion(row)
+}
+
+// scanVersion decodes one version row, shared by the Store and transaction
+// readers so they cannot disagree about column order or the no-rows case.
+func scanVersion(row *sql.Row) (*Version, error) {
 	var v Version
 	err := row.Scan(&v.ID, &v.SecretID, &v.VersionNo, &v.Nonce, &v.Ciphertext, &v.VHash, &v.CreatedBy, &v.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {

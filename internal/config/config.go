@@ -107,6 +107,12 @@ func ephemeralPort(addr string) bool {
 // The value is returned trimmed, not merely tested that way: every consumer
 // here is a path, an address, or a credential, and none of them wants the
 // trailing \r a CRLF .env file leaves on the end.
+// EnvOr is envOr exported for callers outside this package that must read a
+// signet environment variable the same way signet reads its own — same
+// trimming, same empty-means-absent rule. A second reader with subtly different
+// rules is how a value that looks set gets treated as unset.
+func EnvOr(key, def string) string { return envOr(key, def) }
+
 func envOr(key, def string) string {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 		return v

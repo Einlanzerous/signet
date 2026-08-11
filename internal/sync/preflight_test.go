@@ -281,7 +281,7 @@ func TestPushSecretExplainsMissingGrant(t *testing.T) {
 		if err != nil {
 			return nil, store.AuditRecord{}, err
 		}
-		if _, err := m.AddVersion(s.ID, nonce, ct, vault.VersionHash(nonce, ct), "test"); err != nil {
+		if _, err := m.AddVersion(s.ID, nonce, ct, vault.VersionHash(nonce, ct), "test", store.Minted); err != nil {
 			return nil, store.AuditRecord{}, err
 		}
 		if _, err := m.AddGHTarget(s.ID, "Einlanzerous/argosy", "API_TOKEN"); err != nil {

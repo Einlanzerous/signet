@@ -65,7 +65,11 @@ func seedSecret(t *testing.T, st *store.Store, project, name string, generated b
 	return sec
 }
 
-func seedVersion(t *testing.T, st *store.Store, secretID string, key []byte, value string) *store.Version {
+// seedVersion writes a value with its provenance declared, because AddVersion
+// owns the generated column: a helper that always said Minted would silently
+// flip an externally-issued fixture into a rotatable one, which is exactly the
+// mistake it once made.
+func seedVersion(t *testing.T, st *store.Store, secretID string, key []byte, value string, prov store.Provenance) *store.Version {
 	t.Helper()
 	nonce, ct, err := vault.Encrypt(key, []byte(value))
 	if err != nil {
@@ -73,7 +77,7 @@ func seedVersion(t *testing.T, st *store.Store, secretID string, key []byte, val
 	}
 	var v *store.Version
 	if _, err := st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
-		added, err := m.AddVersion(secretID, nonce, ct, vault.VersionHash(nonce, ct), "test")
+		added, err := m.AddVersion(secretID, nonce, ct, vault.VersionHash(nonce, ct), "test", prov)
 		if err != nil {
 			return store.AuditRecord{}, err
 		}
@@ -374,7 +378,7 @@ func TestSetExpiry(t *testing.T) {
 func TestRotateExternallyIssuedConflicts(t *testing.T) {
 	srv, st, key, _ := testServer(t)
 	sec := seedSecret(t, st, "proj", "EXTERNAL_KEY", false)
-	seedVersion(t, st, sec.ID, key, "issued-elsewhere")
+	seedVersion(t, st, sec.ID, key, "issued-elsewhere", store.Issued)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/commands/rotate",
 		strings.NewReader(`{"project":"proj","name":"EXTERNAL_KEY"}`))
@@ -390,7 +394,7 @@ func TestRotateGenerated(t *testing.T) {
 	srv, st, key, _ := testServer(t)
 	sec := seedSecret(t, st, "proj", "GEN_TOKEN", true)
 	val, _ := vault.RandomToken(32)
-	v1 := seedVersion(t, st, sec.ID, key, val)
+	v1 := seedVersion(t, st, sec.ID, key, val, store.Minted)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/commands/rotate",
 		strings.NewReader(`{"project":"proj","name":"GEN_TOKEN"}`))

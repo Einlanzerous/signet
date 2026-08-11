@@ -34,7 +34,7 @@ func put(t *testing.T, st *store.Store, key []byte, project, name, value string)
 		if err != nil {
 			return store.AuditRecord{}, err
 		}
-		if _, err := m.AddVersion(sec.ID, nonce, ct, vault.VersionHash(nonce, ct), "test"); err != nil {
+		if _, err := m.AddVersion(sec.ID, nonce, ct, vault.VersionHash(nonce, ct), "test", store.Minted); err != nil {
 			return store.AuditRecord{}, err
 		}
 		return store.AuditRecord{Actor: "test", Action: "set", SecretID: sec.ID,

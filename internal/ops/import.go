@@ -92,7 +92,7 @@ func ImportEnv(st *store.Store, key []byte, project, scope, path, actor string, 
 				}
 				target = created
 			}
-			v, err := m.AddVersion(target.ID, nonce, ct, vault.VersionHash(nonce, ct), actor)
+			v, err := m.AddVersion(target.ID, nonce, ct, vault.VersionHash(nonce, ct), actor, store.Issued)
 			if err != nil {
 				return store.AuditRecord{}, err
 			}

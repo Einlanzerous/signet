@@ -42,7 +42,7 @@ func mustAddVersion(t *testing.T, s *Store, secretID string, nonce, ciphertext [
 	t.Helper()
 	var v *Version
 	if _, err := s.Mutate(func(m *Mutation) (AuditRecord, error) {
-		added, err := m.AddVersion(secretID, nonce, ciphertext, vhash, "test")
+		added, err := m.AddVersion(secretID, nonce, ciphertext, vhash, "test", Minted)
 		if err != nil {
 			return AuditRecord{}, err
 		}
@@ -443,7 +443,7 @@ func TestAuditFailureRollsBackMutation(t *testing.T) {
 		s := testStore(t)
 		sec := mustCreateSecret(t, s, "proj", "KEY", "", true)
 		if _, err := s.Mutate(func(m *Mutation) (AuditRecord, error) {
-			if _, err := m.AddVersion(sec.ID, []byte("n"), []byte("c"), "aaa", "test"); err != nil {
+			if _, err := m.AddVersion(sec.ID, []byte("n"), []byte("c"), "aaa", "test", Minted); err != nil {
 				return AuditRecord{}, err
 			}
 			return unrecordable, nil
@@ -524,7 +524,7 @@ func TestFailedMutationLeavesChainIntact(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := s.Mutate(func(m *Mutation) (AuditRecord, error) {
-		if _, err := m.AddVersion(sec.ID, []byte("n"), []byte("c"), "aaa", "test"); err != nil {
+		if _, err := m.AddVersion(sec.ID, []byte("n"), []byte("c"), "aaa", "test", Minted); err != nil {
 			return AuditRecord{}, err
 		}
 		return unrecordable, nil
@@ -727,7 +727,7 @@ func TestConcurrentMutateKeepsChainIntact(t *testing.T) {
 				st = b
 			}
 			_, err := st.Mutate(func(m *Mutation) (AuditRecord, error) {
-				v, err := m.AddVersion(sec.ID, []byte("n"), []byte("c"), fmt.Sprintf("%06d", i), "test")
+				v, err := m.AddVersion(sec.ID, []byte("n"), []byte("c"), fmt.Sprintf("%06d", i), "test", Minted)
 				if err != nil {
 					return AuditRecord{}, err
 				}
