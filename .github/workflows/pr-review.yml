@@ -338,7 +338,11 @@ jobs:
           PR_NUMBER: ${{ steps.pr.outputs.number }}
         run: |
           set -euo pipefail
-          N=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/reviews" --jq 'length')
+          # --paginate, because the default page is 30: a PR that accumulates
+          # that many reviews would otherwise read the same count before and
+          # after and red this check permanently, on a run where the review is
+          # sitting right there.
+          N=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/reviews" --jq '.[].id' | wc -l)
           echo "count=$N" >> "$GITHUB_OUTPUT"
           echo "reviews before: $N"
 
@@ -403,10 +407,16 @@ jobs:
           # the review failed*, so the one artifact this step inspected is
           # written on both sides of the outcome it cares about — a review that
           # never reached the PR would have gone green. Ask GitHub instead.
-          AFTER=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/reviews" --jq 'length')
+          #
+          # A count, not an identity, so two runs overlapping on one PR can
+          # still satisfy each other: A posts, B fails to post, B sees the total
+          # rise and passes. Closing that needs the reviewer to record the id
+          # its POST returned, which lives in review-prompt.md and is shared
+          # across four repos — SGNT-28.
+          AFTER=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/reviews" --jq '.[].id' | wc -l)
           if [ "$AFTER" -le "$BEFORE" ]; then
             echo "::error::Reviewer produced a verdict but no review appeared on the PR (${BEFORE} before, ${AFTER} after)."
-            echo "The findings are in the Review step log; the posting step is what failed." >&2
+            echo "The findings are in the Review step log; the review was written but not posted." >&2
             exit 1
           fi
 
