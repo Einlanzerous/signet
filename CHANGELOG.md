@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.7.1](https://github.com/Einlanzerous/signet/compare/v1.7.0...v1.7.1) (2026-08-12)
+
+
+### Bug Fixes
+
+* **api:** de-flake the lost-listener test, and add PR review in CI (SGNT-26, SGNT-21) ([#27](https://github.com/Einlanzerous/signet/issues/27)) ([f7e2c5a](https://github.com/Einlanzerous/signet/commit/f7e2c5afe7c83f654bbd8ae4535631d765dbb11c))
+* **ci:** skip release PRs in the reviewer, which cannot review them anyway (SGNT-21) ([#29](https://github.com/Einlanzerous/signet/issues/29)) ([e35c31d](https://github.com/Einlanzerous/signet/commit/e35c31de89c9335ba0c7badeab121af03f9bbccf))
+
 ## [1.7.0](https://github.com/Einlanzerous/signet/compare/v1.6.0...v1.7.0) (2026-08-11)
 
 
