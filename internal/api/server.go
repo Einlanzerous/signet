@@ -904,9 +904,11 @@ func serveListeners(ctx context.Context, listeners []net.Listener, h http.Handle
 		// healthy on its way out.
 		//
 		// Shut down first, then hear from every listener. Peeking at what had
-		// already arrived would miss the one that died moments before the
-		// signal, whose error is still in flight — which is precisely the case
-		// where the two events look alike and the wrong one wins the select.
+		// already arrived would miss one whose error is still in flight, so
+		// waiting is strictly better — but it is not sufficient, and this is
+		// not the place that decides the coinciding case. See awaitStopped:
+		// once Shutdown begins, a loss arrives relabelled as an ordinary stop
+		// and no amount of waiting recovers it.
 		stopErr := shutdownAll(servers, bound)
 		if lost := awaitStopped(errCh, len(servers)); lost != nil {
 			return lost
@@ -940,13 +942,27 @@ func serveListeners(ctx context.Context, listeners []net.Listener, h http.Handle
 // awaitStopped receives one result per listener and reports the first that is
 // not the ordinary consequence of shutting down.
 //
-// It waits rather than peeks, which is the whole point: a listener that failed
-// moments before the signal has not necessarily delivered its error yet, and
-// that near-simultaneous case is exactly the one where a peek reports a clean
+// It waits rather than peeks: a listener that failed shortly before the signal
+// has not necessarily delivered its error yet, and peeking would report a clean
 // stop for a daemon that had lost an interface. Waiting terminates because
 // every Serve returns exactly once — Shutdown closes the listeners out from
 // under the ones still accepting — and errCh is buffered per listener, so no
 // send can block on a reader that has gone away.
+//
+// Waiting does not close that window completely, and the earlier version of
+// this comment claimed it did. http.Server.Serve checks whether Shutdown has
+// begun when Accept fails, and returns ErrServerClosed instead of the accept
+// error — so a listener whose failure is still being processed when the signal
+// arrives has its cause rewritten to something this function filters as
+// ordinary. Recording the loss at the listener instead does not fix it either:
+// whichever goroutine wins, the two events are microseconds apart and the
+// observation is inherently racy.
+//
+// What remains true is the case that matters. A listener that dies while the
+// daemon is running is reported immediately, by the errCh branch in
+// serveListeners, without waiting for anything — see
+// TestServeReportsALostListener. Only a loss that coincides with a shutdown
+// already in progress can be missed, and such a daemon is stopping anyway.
 func awaitStopped(errCh chan error, n int) error {
 	var lost error
 	for i := 0; i < n; i++ {

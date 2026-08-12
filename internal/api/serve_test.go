@@ -154,8 +154,14 @@ func TestServeRejectsAddressesThatDefeatTheGuarantee(t *testing.T) {
 	}
 }
 
-// awaitStopped is what keeps a lost listener from being reported as a clean
-// stop when SIGTERM lands at the same moment.
+// awaitStopped waits for a result that has not arrived yet rather than
+// concluding from its absence — whatever ended that listener.
+//
+// It does not decide the coinciding case, and an earlier version of this
+// comment said it did. Once Shutdown begins, http.Server hands Serve
+// ErrServerClosed in place of the accept error, so a loss racing a signal
+// arrives already relabelled and awaitStopped filters it as ordinary. See its
+// doc comment for what is and is not guaranteed.
 func TestAwaitStopped(t *testing.T) {
 	// An ordinary shutdown is not a failure, however many listeners report it.
 	ch := make(chan error, 3)
@@ -186,13 +192,15 @@ func TestAwaitStopped(t *testing.T) {
 	}
 }
 
-// A listener that dies on its own has to be reported rather than swallowed.
+// A listener that dies while the daemon is running has to be reported without
+// a signal to prompt it — a daemon serving one of two interfaces must not sit
+// there until someone stops it.
 //
-// This exercises whichever way the select happens to resolve on the machine
-// running it, and on an unloaded one that is reliably the errCh side — the
-// near-simultaneous case, where the report is still in flight when the signal
-// lands, is pinned deterministically by TestAwaitStopped instead. Both paths
-// have to reach the same answer, which is what this checks.
+// That is the whole of what this covers, and the whole of what serveListeners
+// promises. The near-simultaneous case — a loss still in flight when a shutdown
+// begins — is not pinned here or anywhere: http.Server rewrites the accept
+// error once Shutdown starts, so the window is inherent. See awaitStopped,
+// which says so.
 func TestServeReportsALostListener(t *testing.T) {
 	srv, _, _, _ := testServer(t)
 	listeners, addrs := listenLoopback(t, 2)
@@ -206,15 +214,25 @@ func TestServeReportsALostListener(t *testing.T) {
 	// Take one listener out from under the daemon: it is now half-listening.
 	listeners[1].Close()
 	waitGone(t, addrs[1])
-	cancel()
 
+	// No cancel. The guarantee under test is that losing a listener is reported
+	// on its own, without a signal to prompt it — a daemon serving one of two
+	// interfaces must not sit there until someone stops it.
+	//
+	// Cancelling here instead is what made this test flaky, and the flake was
+	// telling the truth: with a signal racing the loss, http.Server rewrites the
+	// accept error to ErrServerClosed the moment Shutdown begins, and
+	// awaitStopped filters it as an ordinary stop. That window is inherent —
+	// see awaitStopped — so a test that opens it deliberately is asserting
+	// something the design does not promise. The cancel deferred above is the
+	// safety net if serveListeners fails to return at all.
 	select {
 	case err := <-done:
 		if err == nil {
 			t.Fatal("clean stop reported for a daemon that had lost a listener")
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatal("serveListeners did not return")
+		t.Fatal("serveListeners did not report a lost listener")
 	}
 }
 
