@@ -184,26 +184,6 @@ jobs:
               skip "draft PR (comment '@claude review' to force one)"
             fi
 
-            # A release PR is a generated CHANGELOG and a version manifest,
-            # opened by the release bot. There is nothing for a fresh-context
-            # reviewer to say about it, and claude-code-action refuses a
-            # bot-initiated run outright ("Workflow initiated by non-human
-            # actor ... Add bot to allowed_bots"), so without this the check is
-            # red on every release — permanently, and on exactly the PRs that
-            # most need to look trustworthy at a glance. A check that is wrong
-            # and immovable is what the BLOCKING note below says trains you to
-            # bypass it.
-            #
-            # The docs-only rule nearly covers this and does not: CHANGELOG.md
-            # is .md, .release-please-manifest.json is not.
-            #
-            # Skipped only for the automatic path. `@claude review` on a release
-            # PR still works, because then the initiating actor is the person
-            # who commented rather than the bot.
-            if [[ "$HEAD_BRANCH" == release-please--* ]]; then
-              skip "release PR (generated changelog and version manifest)"
-            fi
-
             # Re-reviewing on every push is the single largest cost multiplier,
             # and most pushes are a typo fix on a PR that was already read. Opt
             # in per PR with the label when a change is worth watching closely.
@@ -215,6 +195,37 @@ jobs:
           FILES=$(gh pr diff "$PR_NUMBER" --name-only)
           if [ -z "$FILES" ]; then
             skip "empty diff"
+          fi
+
+          # A release PR is a generated CHANGELOG and a version manifest, opened
+          # by the release bot. There is nothing for a fresh-context reviewer to
+          # say about it, and claude-code-action refuses a bot-initiated run
+          # outright ("Workflow initiated by non-human actor ... Add bot to
+          # allowed_bots"), so without this the check is red on every release --
+          # permanently, and on exactly the PRs that most need to look
+          # trustworthy at a glance. The BLOCKING note below says a check that is
+          # wrong and immovable trains you to bypass it.
+          #
+          # The docs-only rule nearly covers this and does not: CHANGELOG.md is
+          # .md, .release-please-manifest.json is not.
+          #
+          # Keyed on the branch AND the file list, not the branch alone. The
+          # justification above is a claim about content, and today nothing
+          # enforced it: adding `extra-files` to release-please-config.json --
+          # the usual reason being to stamp the version into a source file
+          # rather than at link time -- would put code in a release PR and skip
+          # it unreviewed and green, with nothing in the log to distinguish that
+          # from a correct skip. A release branch carrying anything else now
+          # falls through to a normal review and says so.
+          #
+          # Skipped only on the automatic path. `@claude review` still works,
+          # because the initiating actor is then the person who commented.
+          if [ "$MANUAL" != "true" ] && [[ "$HEAD_BRANCH" == release-please--* ]]; then
+            RELEASE_FILES=$(printf '%s\n' 'CHANGELOG.md' '.release-please-manifest.json' | sort)
+            if [ "$(sort <<<"$FILES")" = "$RELEASE_FILES" ]; then
+              skip "release PR (generated changelog and version manifest)"
+            fi
+            echo "→ release branch carrying more than the changelog and manifest; reviewing it"
           fi
 
           # Docs-only changes get nothing out of a correctness reviewer. Written
