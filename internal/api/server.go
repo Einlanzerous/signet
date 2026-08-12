@@ -904,9 +904,11 @@ func serveListeners(ctx context.Context, listeners []net.Listener, h http.Handle
 		// healthy on its way out.
 		//
 		// Shut down first, then hear from every listener. Peeking at what had
-		// already arrived would miss the one that died moments before the
-		// signal, whose error is still in flight — which is precisely the case
-		// where the two events look alike and the wrong one wins the select.
+		// already arrived would miss one whose error is still in flight, so
+		// waiting is strictly better — but it is not sufficient, and this is
+		// not the place that decides the coinciding case. See awaitStopped:
+		// once Shutdown begins, a loss arrives relabelled as an ordinary stop
+		// and no amount of waiting recovers it.
 		stopErr := shutdownAll(servers, bound)
 		if lost := awaitStopped(errCh, len(servers)); lost != nil {
 			return lost

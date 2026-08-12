@@ -327,6 +327,21 @@ jobs:
             echo 'REVIEW_PROMPT_EOF'
           } >> "$GITHUB_OUTPUT"
 
+      # What the Gate compares against. Counted before the reviewer runs, because
+      # the Gate's question is "did a review reach the PR", and the only honest
+      # way to answer it is to see one appear.
+      - name: Count reviews before
+        id: before
+        if: steps.triage.outputs.review == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          set -euo pipefail
+          N=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/reviews" --jq 'length')
+          echo "count=$N" >> "$GITHUB_OUTPUT"
+          echo "reviews before: $N"
+
       - name: Review
         if: steps.triage.outputs.review == 'true'
         uses: anthropics/claude-code-action@v1
@@ -365,6 +380,9 @@ jobs:
           # merges while it is still being tuned trains you to bypass it. Set the
           # repository variable to 'true' to make Important findings blocking.
           BLOCKING: ${{ vars.PR_REVIEW_BLOCKING || 'false' }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          BEFORE: ${{ steps.before.outputs.count }}
         run: |
           set -euo pipefail
 
@@ -377,6 +395,18 @@ jobs:
           if [ ! -f review-verdict.json ]; then
             echo "::error::Reviewer produced no verdict file — the review did not complete."
             echo "Check the Review step for permission denials or a truncated run." >&2
+            exit 1
+          fi
+
+          # The verdict file alone does not answer the question above.
+          # review-prompt.md §5 tells the reviewer to write it *even if posting
+          # the review failed*, so the one artifact this step inspected is
+          # written on both sides of the outcome it cares about — a review that
+          # never reached the PR would have gone green. Ask GitHub instead.
+          AFTER=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/reviews" --jq 'length')
+          if [ "$AFTER" -le "$BEFORE" ]; then
+            echo "::error::Reviewer produced a verdict but no review appeared on the PR (${BEFORE} before, ${AFTER} after)."
+            echo "The findings are in the Review step log; the posting step is what failed." >&2
             exit 1
           fi
 

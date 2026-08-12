@@ -154,8 +154,14 @@ func TestServeRejectsAddressesThatDefeatTheGuarantee(t *testing.T) {
 	}
 }
 
-// awaitStopped is what keeps a lost listener from being reported as a clean
-// stop when SIGTERM lands at the same moment.
+// awaitStopped waits for a result that has not arrived yet rather than
+// concluding from its absence — whatever ended that listener.
+//
+// It does not decide the coinciding case, and an earlier version of this
+// comment said it did. Once Shutdown begins, http.Server hands Serve
+// ErrServerClosed in place of the accept error, so a loss racing a signal
+// arrives already relabelled and this function filters it as ordinary. See
+// awaitStopped's own doc comment for what is and is not guaranteed.
 func TestAwaitStopped(t *testing.T) {
 	// An ordinary shutdown is not a failure, however many listeners report it.
 	ch := make(chan error, 3)
