@@ -186,13 +186,15 @@ func TestAwaitStopped(t *testing.T) {
 	}
 }
 
-// A listener that dies on its own has to be reported rather than swallowed.
+// A listener that dies while the daemon is running has to be reported without
+// a signal to prompt it — a daemon serving one of two interfaces must not sit
+// there until someone stops it.
 //
-// This exercises whichever way the select happens to resolve on the machine
-// running it, and on an unloaded one that is reliably the errCh side — the
-// near-simultaneous case, where the report is still in flight when the signal
-// lands, is pinned deterministically by TestAwaitStopped instead. Both paths
-// have to reach the same answer, which is what this checks.
+// That is the whole of what this covers, and the whole of what serveListeners
+// promises. The near-simultaneous case — a loss still in flight when a shutdown
+// begins — is not pinned here or anywhere: http.Server rewrites the accept
+// error once Shutdown starts, so the window is inherent. See awaitStopped,
+// which says so.
 func TestServeReportsALostListener(t *testing.T) {
 	srv, _, _, _ := testServer(t)
 	listeners, addrs := listenLoopback(t, 2)
@@ -216,7 +218,7 @@ func TestServeReportsALostListener(t *testing.T) {
 	// accept error to ErrServerClosed the moment Shutdown begins, and
 	// awaitStopped filters it as an ordinary stop. That window is inherent —
 	// see awaitStopped — so a test that opens it deliberately is asserting
-	// something the design does not promise. The deferred cancel below is the
+	// something the design does not promise. The cancel deferred above is the
 	// safety net if serveListeners fails to return at all.
 	select {
 	case err := <-done:

@@ -31,7 +31,7 @@ name: PR Review
 
 on:
   pull_request:
-    types: [opened, ready_for_review, synchronize]
+    types: [opened, reopened, ready_for_review, synchronize]
   issue_comment:
     types: [created]
 
@@ -64,11 +64,20 @@ jobs:
     # This repo is private and single-author so it is largely theoretical, but
     # inheriting it silently is how it stops being theoretical later.
     #
-    # The comment path needs the same guard and originally had none, which was
-    # worse: it is the only path that checks out PR code, so any commenter could
-    # have put their own review-prompt.md in the workspace and had it run with
-    # Bash on a runner holding SWITCHYARD_TOKEN. `author_association` gates who
-    # may ask; the head-repo check in the next step gates what gets checked out.
+    # Both paths end up holding PR code: checkout with no `ref:` takes
+    # github.ref, which for a pull_request is refs/pull/N/merge. The extra
+    # checkout step exists because issue_comment leaves github.ref on the
+    # default branch, not because the pull_request path avoids PR content.
+    #
+    # So the reviewer's own procedure — .github/review-prompt.md, cat'd from the
+    # workspace — is the PR's copy on both paths, and this review is running
+    # under it. That is not a widening: the gate below admits same-repo PRs
+    # only, and for pull_request GitHub runs the head's copy of this workflow
+    # anyway, so anyone who could rewrite the prompt could rewrite this file
+    # beside it. What the guards actually do is decide whether a fork's code is
+    # checked out at all (head-repo check) and who may ask for a review
+    # (author_association). Unlike CLAUDE.md, review-prompt.md is not restored
+    # from base; if it should be, read it with `git show origin/BASE:...`.
     if: >-
       (github.event_name == 'pull_request' &&
        github.event.pull_request.head.repo.full_name == github.repository) ||
@@ -79,6 +88,16 @@ jobs:
                 github.event.comment.author_association))
     runs-on: self-hosted
     timeout-minutes: 30
+
+    # gh resolves the repository from --repo, then GH_REPO, then the working
+    # directory's git remotes — it does not read GITHUB_REPOSITORY. The fork
+    # guard below deliberately runs BEFORE Checkout, so on a fresh runner
+    # workspace it has no .git to read and every gh call in it fails. Setting it
+    # here rather than on that step means no later step has to remember: the
+    # first `@claude review` on a wiped workspace is exactly the case a
+    # per-step fix would have missed.
+    env:
+      GH_REPO: ${{ github.repository }}
 
     steps:
       # First, because every later step depends on these. The runner is a systemd
