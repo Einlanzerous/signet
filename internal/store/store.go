@@ -289,6 +289,49 @@ ALTER TABLE secrets ADD COLUMN derivation TEXT NOT NULL DEFAULT '';
 	`
 ALTER TABLE targets ADD COLUMN last_pushed_digest TEXT NOT NULL DEFAULT '';
 `,
+	// 005 — rendered blob targets, and the environment scope both GitHub kinds
+	// can carry.
+	//
+	// A gh-render target delivers a whole rendered env file as the value of one
+	// GitHub secret, so it is project-scoped like a file target and key-shaped
+	// like neither of the existing kinds. Widening the kind CHECK means
+	// rebuilding the table: SQLite has no ALTER for a constraint.
+	//
+	// last_pushed_keys records the key set the last successful push carried. It
+	// is what makes a shrinking render refusable — the destination's value is
+	// never readable back, so the only account of what is currently deployed is
+	// the one signet keeps of what it last sent. Without it, a key dropped from
+	// the vault leaves the deployed environment silently, which is the exact
+	// failure this whole target kind exists to end.
+	`
+CREATE TABLE targets_new (
+    id                     TEXT PRIMARY KEY,
+    kind                   TEXT NOT NULL CHECK (kind IN ('file', 'gh-actions', 'gh-render')),
+    secret_id              TEXT REFERENCES secrets(id),
+    project                TEXT,
+    config                 TEXT NOT NULL,
+    last_pushed_version_id TEXT,
+    last_pushed_at         TEXT,
+    last_state             TEXT NOT NULL DEFAULT 'never',
+    last_error             TEXT,
+    created_at             TEXT NOT NULL,
+    last_pushed_digest     TEXT NOT NULL DEFAULT '',
+    last_pushed_keys       TEXT NOT NULL DEFAULT ''
+);
+
+INSERT INTO targets_new
+    (id, kind, secret_id, project, config, last_pushed_version_id,
+     last_pushed_at, last_state, last_error, created_at, last_pushed_digest)
+SELECT id, kind, secret_id, project, config, last_pushed_version_id,
+       last_pushed_at, last_state, last_error, created_at, last_pushed_digest
+FROM targets;
+
+DROP TABLE targets;
+ALTER TABLE targets_new RENAME TO targets;
+
+CREATE INDEX idx_targets_secret  ON targets(secret_id);
+CREATE INDEX idx_targets_project ON targets(project);
+`,
 }
 
 func (s *Store) migrate() error {

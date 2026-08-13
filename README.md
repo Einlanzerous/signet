@@ -249,6 +249,75 @@ still takes its token from the environment. Each read is a `secret_reveal`
 entry that states which of the two it was, so an audit of the root credential
 can tell a push from a check.
 
+### Environment secrets, and whole-file rendered targets
+
+A GitHub secret can be scoped to a **deployment environment** rather than to the
+repository. That is not a label on the same thing: the secret lives behind
+`/repos/{owner}/{repo}/environments/{env}/secrets/...` and is sealed with the
+*environment's* public key, so sealing against the repository key and PUTting to
+the environment path produces a secret GitHub stores and no workflow can read.
+`--gh-environment` carries the scope, and everything downstream — the push, the
+drift check, the preflight probe — follows it to the right endpoints.
+
+```
+signet target add --secret csrv/API_TOKEN --gh-repo owner/name --gh-environment home-server
+```
+
+The environment is part of the destination's identity, not a note beside it. The
+same secret name in the same repository is one destination at repository scope
+and a different one under an environment, so `(repo, environment, secret_name)`
+is what `target add` refuses to duplicate.
+
+A **rendered target** (`gh-render`) is the other axis: a whole env file,
+delivered as the value of a single secret. It belongs to a project rather than
+to one secret, carries its own key set, and is pushed as one atomic blob whose
+digest is its drift record.
+
+```
+signet target add --project construct-server --render-as-secret \
+  --gh-repo Einlanzerous/construct-server \
+  --gh-environment home-server --gh-secret PROD_ENV_FILE
+```
+
+The key set is **seeded from the project's file target**, not from the whole
+project. "Every secret in the project" is wrong in both directions: it carries
+keys the environment has never held into it, and it makes every later
+`signet set` on that project a silent change to a live environment. Widening
+stays an explicit act:
+
+```
+signet target add-key --project construct-server --gh-secret PROD_ENV_FILE --name AMBER_TAG
+```
+
+#### Why this kind is guarded more heavily than the others
+
+A rendered target is the only destination where **an absent key is invisible**.
+GitHub never returns a secret's value, so nothing can diff the destination
+against the vault; and the consumer of an env file interpolates a missing key to
+the empty string, so a short file deploys a half-configured container rather
+than failing. Three production incidents took exactly that shape. Three guards
+sit in front of it:
+
+- **A managed key with no value refuses the whole push.** Not a partial render —
+  a shorter env file is still a valid env file, which is precisely the danger.
+  `signet render --project <p> --check` reports this as `INCOMPLETE` before a
+  sync discovers it.
+- **A render that would deliver fewer keys than the last push is refused**, and
+  the refusal is recorded in the ledger. Signet's record of what it last sent is
+  the only account of what the destination holds. `--allow-shrink` overrides it
+  when the removal is deliberate.
+- **`--against` compares the render against a live env file.** This is the only
+  guard that covers the *first* push, which has no previous delivery to compare
+  with:
+
+```
+signet render --project construct-server --check --against /opt/construct-server/.env
+```
+
+It names each key the file has and the render lacks — every one of which would
+go empty in the deployed environment on the next deploy — and counts the ones it
+would add. An empty report is what makes a first push safe.
+
 ### The repository grant is a manual step, so signet checks it early
 
 The PAT is fine-grained: every new repo must be added to its **repository list**
@@ -261,9 +330,13 @@ material; no secret is sent or returned) and warns if the credential cannot
 reach it. **The target is still added**: attaching a destination and widening
 the PAT are two steps in either order, and the check is skippable with
 `--no-preflight` or when no credential resolves. `sync --check` does the same
-across every destination at once, one probe per repository rather than per
-secret. The mirror's `add-target` reports the same thing as a `preflight` state
-plus a `warning` on its success response.
+across every destination at once, one probe per *destination* — a repository, or
+an environment within one — rather than per secret. An environment cannot be
+vouched for by its repository: it has its own key behind its own path, and it
+has to already exist, since pushing a secret does not create it. A 404 there is
+as likely to mean "no such environment" as "no such grant", and the hint says
+so. The mirror's `add-target` reports the same thing as a `preflight` state plus
+a `warning` on its success response.
 
 **What a pass proves, and what it does not.** The sealing key needs fine-grained
 *Secrets: read*; the PUT that delivers a secret needs *read and write*, and

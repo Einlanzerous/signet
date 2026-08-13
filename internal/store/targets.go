@@ -10,10 +10,10 @@ import (
 // Target is a destination a secret (or a project's secrets) is delivered to.
 type Target struct {
 	ID                  string
-	Kind                string // "file" | "gh-actions"
+	Kind                string // "file" | "gh-actions" | "gh-render"
 	SecretID            string // gh-actions targets
-	Project             string // file targets
-	Config              string // JSON: FileConfig or GHConfig
+	Project             string // file and gh-render targets
+	Config              string // JSON: FileConfig, GHConfig or GHRenderConfig
 	LastPushedVersionID string
 	// LastPushedDigest fingerprints the value last delivered, for secrets that
 	// have no version to cite — derived ones. Empty for stored secrets, whose
@@ -24,7 +24,27 @@ type Target struct {
 	// "drift" is NOT stored — see GHState, which derives it.
 	LastState string
 	LastError string
-	CreatedAt string
+	// LastPushedKeys is the JSON key set the last successful push delivered, for
+	// gh-render targets. GitHub never reads a secret's value back, so this is
+	// signet's only account of what the destination currently holds — and the
+	// only basis on which a push that would drop keys can be recognized as one.
+	// Empty for every other kind, and for a render target that has never pushed.
+	LastPushedKeys string
+	CreatedAt      string
+}
+
+// PushedKeys decodes LastPushedKeys. A target that has never pushed, or one of
+// a kind that does not record a key set, returns nil — which callers must read
+// as "no baseline", not as "the last push carried no keys".
+func (t *Target) PushedKeys() ([]string, error) {
+	if t.LastPushedKeys == "" {
+		return nil, nil
+	}
+	var keys []string
+	if err := json.Unmarshal([]byte(t.LastPushedKeys), &keys); err != nil {
+		return nil, fmt.Errorf("target %s: bad pushed key set: %w", t.ID, err)
+	}
+	return keys, nil
 }
 
 // FileConfig is the config payload of a kind=file target.
@@ -34,10 +54,52 @@ type FileConfig struct {
 	Mode string   `json:"mode"`
 }
 
-// GHConfig is the config payload of a kind=gh-actions target.
+// GHConfig is the config payload of a kind=gh-actions target, and the GitHub
+// half of a kind=gh-render one.
 type GHConfig struct {
 	Repo       string `json:"repo"`        // owner/name
 	SecretName string `json:"secret_name"` // destination Actions secret
+	// Environment scopes the secret to a deployment environment. Empty means a
+	// repository secret, which is what every target predating this field is.
+	//
+	// It is not cosmetic: an environment secret lives behind a different API
+	// path and is sealed with a different public key, so this field decides
+	// which endpoints a push talks to rather than merely how it is labelled.
+	Environment string `json:"environment,omitempty"`
+}
+
+// GHRenderConfig is the config payload of a kind=gh-render target: a whole
+// rendered env file delivered as the value of one GitHub secret.
+//
+// It carries its own key set rather than borrowing the project's file target's.
+// The two are separate destinations that happen to have been seeded from one
+// another — a project may keep no file target at all (construct-server is meant
+// to end up that way), and a key set that lives on the thing it describes does
+// not evaporate when its neighbour is retired.
+type GHRenderConfig struct {
+	GHConfig
+	Keys []string `json:"keys"`
+}
+
+// Destination renders a GitHub target's address for display: repo, the
+// environment when it has one, and the secret name. One function so that
+// `target list`, `status` and the ledger cannot describe the same destination
+// three different ways — the environment is precisely the part that, left out,
+// makes two different destinations print identically.
+func (c GHConfig) Destination() string {
+	if c.Environment == "" {
+		return c.Repo + " · " + c.SecretName
+	}
+	return c.Repo + " · " + c.Environment + " · " + c.SecretName
+}
+
+// Scope names what a GitHub destination is scoped to, for prose that has to
+// distinguish the two ("repository secret" / "environment secret").
+func (c GHConfig) Scope() string {
+	if c.Environment == "" {
+		return "repository secret"
+	}
+	return "environment secret"
 }
 
 // FileConfig decodes the target's config as a FileConfig.
@@ -54,6 +116,15 @@ func (t *Target) GHConfig() (GHConfig, error) {
 	var c GHConfig
 	if err := json.Unmarshal([]byte(t.Config), &c); err != nil {
 		return c, fmt.Errorf("target %s: bad gh config: %w", t.ID, err)
+	}
+	return c, nil
+}
+
+// GHRenderConfig decodes the target's config as a GHRenderConfig.
+func (t *Target) GHRenderConfig() (GHRenderConfig, error) {
+	var c GHRenderConfig
+	if err := json.Unmarshal([]byte(t.Config), &c); err != nil {
+		return c, fmt.Errorf("target %s: bad gh-render config: %w", t.ID, err)
 	}
 	return c, nil
 }
@@ -96,7 +167,8 @@ func (t *Target) GHState(cur *Version, digest string) string {
 }
 
 const targetCols = `id, kind, COALESCE(secret_id, ''), COALESCE(project, ''), config,
-    COALESCE(last_pushed_version_id, ''), COALESCE(last_pushed_digest, ''), COALESCE(last_pushed_at, ''), last_state, COALESCE(last_error, ''), created_at`
+    COALESCE(last_pushed_version_id, ''), COALESCE(last_pushed_digest, ''), COALESCE(last_pushed_keys, ''),
+    COALESCE(last_pushed_at, ''), last_state, COALESCE(last_error, ''), created_at`
 
 func scanTargets(rows *sql.Rows) ([]Target, error) {
 	defer rows.Close()
@@ -104,7 +176,8 @@ func scanTargets(rows *sql.Rows) ([]Target, error) {
 	for rows.Next() {
 		var t Target
 		if err := rows.Scan(&t.ID, &t.Kind, &t.SecretID, &t.Project, &t.Config,
-			&t.LastPushedVersionID, &t.LastPushedDigest, &t.LastPushedAt, &t.LastState, &t.LastError, &t.CreatedAt); err != nil {
+			&t.LastPushedVersionID, &t.LastPushedDigest, &t.LastPushedKeys,
+			&t.LastPushedAt, &t.LastState, &t.LastError, &t.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan target: %w", err)
 		}
 		out = append(out, t)
@@ -147,6 +220,26 @@ func (s *Store) TargetsForSecret(secretID string) ([]Target, error) {
 // FileTargetsForProject returns the file targets for a project.
 func (s *Store) FileTargetsForProject(project string) ([]Target, error) {
 	return s.queryTargets(`WHERE kind = 'file' AND project = ? ORDER BY created_at, id`, project)
+}
+
+// RenderTargetsForProject returns the gh-render targets for a project.
+func (s *Store) RenderTargetsForProject(project string) ([]Target, error) {
+	return s.queryTargets(`WHERE kind = 'gh-render' AND project = ? ORDER BY created_at, id`, project)
+}
+
+// RenderTargetsForProject is the tx-scoped listing, for a caller whose write
+// depends on which targets exist — see Mutation.FindFileTarget for why the
+// Store variant will not do from inside a transaction.
+func (m *Mutation) RenderTargetsForProject(project string) ([]Target, error) {
+	return m.queryTargets(`WHERE kind = 'gh-render' AND project = ? ORDER BY created_at, id`, project)
+}
+
+// RenderTargets returns every gh-render target, in creation order. sync needs
+// them across all projects, and asking project by project would mean first
+// enumerating projects from the secrets table — a longer route to the same rows
+// that silently omits a render target whose project has no secrets left.
+func (s *Store) RenderTargets() ([]Target, error) {
+	return s.queryTargets(`WHERE kind = 'gh-render' ORDER BY created_at, id`)
 }
 
 // UpsertFileTarget creates a project file target for path, or merges keys into
@@ -201,9 +294,11 @@ func (m *Mutation) UpsertFileTarget(project, path string, keys []string, mode st
 	return &t, OutcomeCreated, nil
 }
 
-// AddGHTarget attaches a GitHub Actions repo-secret destination to a secret.
-func (m *Mutation) AddGHTarget(secretID, repo, secretName string) (*Target, error) {
-	cfg := GHConfig{Repo: repo, SecretName: secretName}
+// AddGHTarget attaches a GitHub Actions secret destination to a secret. env is
+// the deployment environment to scope the secret to, or "" for a repository
+// secret.
+func (m *Mutation) AddGHTarget(secretID, repo, env, secretName string) (*Target, error) {
+	cfg := GHConfig{Repo: repo, SecretName: secretName, Environment: env}
 	raw, _ := json.Marshal(cfg)
 	t := Target{ID: newID(), Kind: "gh-actions", SecretID: secretID, Config: string(raw), LastState: "never", CreatedAt: now()}
 	if _, err := m.tx.Exec(`
@@ -214,31 +309,72 @@ func (m *Mutation) AddGHTarget(secretID, repo, secretName string) (*Target, erro
 	return &t, nil
 }
 
+// AddGHRenderTarget attaches a whole-file rendered destination to a project:
+// the project's keys are rendered to env-file content and delivered as the
+// value of one GitHub secret.
+func (m *Mutation) AddGHRenderTarget(project, repo, env, secretName string, keys []string) (*Target, error) {
+	cfg := GHRenderConfig{GHConfig: GHConfig{Repo: repo, SecretName: secretName, Environment: env}, Keys: mergeKeys(nil, keys)}
+	raw, _ := json.Marshal(cfg)
+	t := Target{ID: newID(), Kind: "gh-render", Project: project, Config: string(raw), LastState: "never", CreatedAt: now()}
+	if _, err := m.tx.Exec(`
+        INSERT INTO targets (id, kind, project, config, last_state, created_at)
+        VALUES (?, 'gh-render', ?, ?, 'never', ?)`, t.ID, project, t.Config, t.CreatedAt); err != nil {
+		return nil, fmt.Errorf("add gh-render target: %w", err)
+	}
+	return &t, nil
+}
+
+// AddRenderKeys merges keys into a gh-render target's key set, reporting
+// whether anything changed. Keys are kept sorted and deduplicated, as they are
+// on a file target.
+func (m *Mutation) AddRenderKeys(t *Target, keys []string) (*Target, Outcome, error) {
+	cfg, err := t.GHRenderConfig()
+	if err != nil {
+		return nil, "", err
+	}
+	before := t.Config
+	cfg.Keys = mergeKeys(cfg.Keys, keys)
+	raw, _ := json.Marshal(cfg)
+	if string(raw) == before {
+		return t, OutcomeUnchanged, nil
+	}
+	if _, err := m.tx.Exec(`UPDATE targets SET config = ? WHERE id = ?`, string(raw), t.ID); err != nil {
+		return nil, "", fmt.Errorf("add render keys: %w", err)
+	}
+	t.Config = string(raw)
+	return t, OutcomeUpdated, nil
+}
+
 // FindGHTarget returns the gh-actions target on secretID delivering to repo
-// under secretName, or nil when there is none. (repo, secretName) is what
-// uniquely identifies a destination for a given secret — the same pair
-// add-target refuses to duplicate.
-func (s *Store) FindGHTarget(secretID, repo, secretName string) (*Target, error) {
+// under secretName in env, or nil when there is none. (repo, env, secretName)
+// is what uniquely identifies a destination for a given secret — the same
+// triple add-target refuses to duplicate.
+//
+// The environment belongs in that key rather than beside it: the same secret
+// name in the same repository is a different destination at repository scope
+// than it is under an environment, and treating the pair as unique would have
+// made attaching the second look like a duplicate of the first.
+func (s *Store) FindGHTarget(secretID, repo, env, secretName string) (*Target, error) {
 	targets, err := s.TargetsForSecret(secretID)
 	if err != nil {
 		return nil, err
 	}
-	return findGHTarget(targets, repo, secretName)
+	return findGHTarget(targets, repo, env, secretName)
 }
 
 // FindGHTarget is the tx-scoped lookup. A caller enforcing the uniqueness of
-// (repo, secretName) must use this rather than the Store variant: checking
+// (repo, env, secretName) must use this rather than the Store variant: checking
 // outside the transaction that then inserts leaves a window where another
 // writer creates the destination the check just found missing.
-func (m *Mutation) FindGHTarget(secretID, repo, secretName string) (*Target, error) {
+func (m *Mutation) FindGHTarget(secretID, repo, env, secretName string) (*Target, error) {
 	targets, err := m.queryTargets(`WHERE secret_id = ? ORDER BY created_at, id`, secretID)
 	if err != nil {
 		return nil, err
 	}
-	return findGHTarget(targets, repo, secretName)
+	return findGHTarget(targets, repo, env, secretName)
 }
 
-func findGHTarget(targets []Target, repo, secretName string) (*Target, error) {
+func findGHTarget(targets []Target, repo, env, secretName string) (*Target, error) {
 	for i := range targets {
 		if targets[i].Kind != "gh-actions" {
 			continue
@@ -247,7 +383,43 @@ func findGHTarget(targets []Target, repo, secretName string) (*Target, error) {
 		if err != nil {
 			return nil, err
 		}
-		if cfg.Repo == repo && cfg.SecretName == secretName {
+		if cfg.Repo == repo && cfg.Environment == env && cfg.SecretName == secretName {
+			return &targets[i], nil
+		}
+	}
+	return nil, nil
+}
+
+// FindGHRenderTarget returns the project's gh-render target delivering to repo
+// under secretName in env, or nil when there is none.
+func (s *Store) FindGHRenderTarget(project, repo, env, secretName string) (*Target, error) {
+	targets, err := s.RenderTargetsForProject(project)
+	if err != nil {
+		return nil, err
+	}
+	return findGHRenderTarget(targets, repo, env, secretName)
+}
+
+// FindGHRenderTarget is the tx-scoped lookup, for a caller whose write depends
+// on the target existing (or on it not existing yet).
+func (m *Mutation) FindGHRenderTarget(project, repo, env, secretName string) (*Target, error) {
+	targets, err := m.queryTargets(`WHERE kind = 'gh-render' AND project = ? ORDER BY created_at, id`, project)
+	if err != nil {
+		return nil, err
+	}
+	return findGHRenderTarget(targets, repo, env, secretName)
+}
+
+func findGHRenderTarget(targets []Target, repo, env, secretName string) (*Target, error) {
+	for i := range targets {
+		if targets[i].Kind != "gh-render" {
+			continue
+		}
+		cfg, err := targets[i].GHRenderConfig()
+		if err != nil {
+			return nil, err
+		}
+		if cfg.Repo == repo && cfg.Environment == env && cfg.SecretName == secretName {
 			return &targets[i], nil
 		}
 	}
@@ -336,6 +508,10 @@ func (m *Mutation) RemoveTarget(id string) error {
 type PushProvenance struct {
 	VersionID string
 	Digest    string
+	// Keys is the key set a gh-render push delivered. Recorded so the next push
+	// can tell a render that has gained keys from one that has quietly lost
+	// them; nil for every other kind, which leaves the stored set untouched.
+	Keys []string
 }
 
 // UpdateTargetPush records a push's outcome on the target row.
@@ -357,13 +533,25 @@ func (s *Store) UpdateTargetPush(id, state, lastErr string, prov *PushProvenance
 		}
 		return nil
 	}
+	// A nil key set leaves the recorded one alone rather than clearing it: only
+	// a gh-render push has one to state, and every other kind writing "" would
+	// erase the baseline a render target's shrink check depends on.
+	keys := ""
+	if prov.Keys != nil {
+		raw, err := json.Marshal(prov.Keys)
+		if err != nil {
+			return fmt.Errorf("update target push: %w", err)
+		}
+		keys = string(raw)
+	}
 	_, err := s.db.ExecContext(ctx, `
         UPDATE targets
         SET last_state = ?, last_error = NULLIF(?, ''),
             last_pushed_version_id = NULLIF(?, ''),
             last_pushed_digest = ?,
+            last_pushed_keys = COALESCE(NULLIF(?, ''), last_pushed_keys),
             last_pushed_at = COALESCE(NULLIF(?, ''), last_pushed_at)
-        WHERE id = ?`, state, lastErr, prov.VersionID, prov.Digest, pushedAt, id)
+        WHERE id = ?`, state, lastErr, prov.VersionID, prov.Digest, keys, pushedAt, id)
 	if err != nil {
 		return fmt.Errorf("update target push: %w", err)
 	}

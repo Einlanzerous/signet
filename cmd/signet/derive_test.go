@@ -626,7 +626,7 @@ func TestRotationFansOutToDerivedSecretsWithTheirOwnTargets(t *testing.T) {
 	// nothing at all.
 	dsn := mustSecret(t, st, "drydock", "DSN")
 	if _, err := st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
-		if _, err := m.AddGHTarget(dsn.ID, "Einlanzerous/drydock", "DSN"); err != nil {
+		if _, err := m.AddGHTarget(dsn.ID, "Einlanzerous/drydock", "", "DSN"); err != nil {
 			return store.AuditRecord{}, err
 		}
 		return store.AuditRecord{Actor: "test", Action: "target.add", SecretID: dsn.ID,
@@ -665,7 +665,7 @@ func TestFanOutSetIncludesTheRotatedSecretAndSkipsUndeliveredOnes(t *testing.T) 
 	}
 	tok := mustSecret(t, st, "p", "TOK")
 	if _, err := st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
-		if _, err := m.AddGHTarget(tok.ID, "Einlanzerous/p", "TOK"); err != nil {
+		if _, err := m.AddGHTarget(tok.ID, "Einlanzerous/p", "", "TOK"); err != nil {
 			return store.AuditRecord{}, err
 		}
 		return store.AuditRecord{Actor: "test", Action: "target.add", SecretID: tok.ID,

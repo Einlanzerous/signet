@@ -89,18 +89,24 @@ func (p RepoProbe) Message() string {
 }
 
 // CheckRepoAccess asks whether the credential can manage repo's Actions
-// secrets, classifying the answer and attaching the fix.
+// secrets, classifying the answer and attaching the fix. env narrows the
+// question to one deployment environment, or "" asks it of the repository.
 //
-// It probes the repository's Actions public key: the cheapest read that needs a
-// grant on the repo at all. Nothing secret is sent and nothing secret comes
-// back — a repo sealing key is public by definition, and it is discarded here
-// anyway. See AccessOK for what a pass does and does not prove.
-func (c *GHClient) CheckRepoAccess(ctx context.Context, repo string) RepoProbe {
-	_, _, err := c.RepoPublicKey(ctx, repo)
+// It probes the destination's public key: the cheapest read that needs a grant
+// on the repo at all. Nothing secret is sent and nothing secret comes back — a
+// sealing key is public by definition, and it is discarded here anyway. See
+// AccessOK for what a pass does and does not prove.
+//
+// Probing the environment's key rather than the repository's is what makes an
+// environment target's preflight worth running: the environment has to exist
+// and be reachable for the push to work, and the repository key says nothing
+// about either.
+func (c *GHClient) CheckRepoAccess(ctx context.Context, repo, env string) RepoProbe {
+	_, _, err := c.RepoPublicKey(ctx, repo, env)
 	if err == nil {
 		return RepoProbe{Access: AccessOK}
 	}
-	return RepoProbe{Access: classifyAccess(err), Err: err, Hint: AccessHint(repo, err)}
+	return RepoProbe{Access: classifyAccess(err), Err: err, Hint: AccessHint(repo, env, err)}
 }
 
 // classifyAccess maps a failed Actions-secrets call to what it says about the
@@ -133,11 +139,23 @@ func classifyAccess(err error) RepoAccess {
 // also how GitHub answers an archived repository, disabled Actions, and an org
 // SAML or IP policy — so the hint accompanies the response rather than standing
 // in for it, and callers are expected to show both.
-func AccessHint(repo string, err error) string {
+func AccessHint(repo, env string, err error) string {
 	switch classifyAccess(err) {
 	case AccessDenied:
+		if env != "" {
+			return fmt.Sprintf("the GitHub credential cannot reach environment secrets on %s · %s — the repository must be in the fine-grained PAT's repository list with Secrets: read and write, and environment secrets additionally need Environments: read; an org SAML/IP policy answers the same 403", repo, env)
+		}
 		return fmt.Sprintf("the GitHub credential cannot reach Actions Secrets on %s — usually the repository is missing from the fine-grained PAT's repository list (Secrets: read and write); an archived repo, disabled Actions, or an org SAML/IP policy answers the same 403", repo)
 	case AccessMissing:
+		// An environment probe has two ways to 404 and they have different
+		// fixes, so the hint names both rather than sending the reader to check
+		// a repository that is very likely fine. The environment is the newer
+		// and likelier of the two: it is created in the repository's settings,
+		// not by pushing to it, so a target can be attached to one that does not
+		// exist yet.
+		if env != "" {
+			return fmt.Sprintf("%s · %s could not be found — either the environment %q does not exist in the repository (create it in Settings → Environments; pushing a secret does not create it), or the repository is missing from the fine-grained PAT's list", repo, env, env)
+		}
 		return fmt.Sprintf("%s does not exist, or the GitHub credential cannot see it — check the owner/name, and that the repository is in the fine-grained PAT's repository list", repo)
 	case AccessRejected:
 		// Deliberately says nothing about repo: a refused credential is not a
@@ -146,7 +164,11 @@ func AccessHint(repo string, err error) string {
 		return "GitHub rejected the credential — the PAT is revoked, expired, or malformed; issue a new one and store it in the vault"
 	case AccessUnknown:
 		if errors.Is(err, ErrRateLimited) {
-			return fmt.Sprintf("GitHub is rate-limiting this credential, so %s could not be checked — retry shortly; this says nothing about the repository's grant", repo)
+			where := repo
+			if env != "" {
+				where = repo + " · " + env
+			}
+			return fmt.Sprintf("GitHub is rate-limiting this credential, so %s could not be checked — retry shortly; this says nothing about the repository's grant", where)
 		}
 	}
 	return ""

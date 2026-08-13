@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -171,23 +172,46 @@ func (c *GHClient) do(ctx context.Context, method, path string, body []byte, out
 	return stat, nil
 }
 
-// RepoPublicKey fetches the sealing key for owner/name.
-func (c *GHClient) RepoPublicKey(ctx context.Context, repo string) (PublicKey, CallStat, error) {
+// secretsBase is the API path prefix for a destination's secrets: the
+// repository's Actions secrets, or an environment's.
+//
+// The two are not a URL parameter apart — the environment form drops the
+// "actions" segment entirely — and each has its own sealing key, so this is the
+// one place that decides which surface a call lands on. Everything reached
+// through here (public key, PUT, metadata) has to agree on that choice: sealing
+// against the repository key and PUTting to the environment path produces a
+// secret GitHub accepts and no workflow can decrypt.
+//
+// env is escaped because environment names are free text — "home server" and
+// "staging/eu" are both legal, and neither survives being pasted into a path
+// raw. repo and name are not: both are already constrained to path-safe
+// characters by GitHub, and escaping the "/" in owner/name would break it.
+func secretsBase(repo, env string) string {
+	if env == "" {
+		return "/repos/" + repo + "/actions/secrets"
+	}
+	return "/repos/" + repo + "/environments/" + url.PathEscape(env) + "/secrets"
+}
+
+// RepoPublicKey fetches the sealing key for owner/name, scoped to env when it
+// is non-empty. An environment seals with its own key, not the repository's.
+func (c *GHClient) RepoPublicKey(ctx context.Context, repo, env string) (PublicKey, CallStat, error) {
 	var pk PublicKey
-	stat, err := c.do(ctx, http.MethodGet, "/repos/"+repo+"/actions/secrets/public-key", nil, &pk)
+	stat, err := c.do(ctx, http.MethodGet, secretsBase(repo, env)+"/public-key", nil, &pk)
 	return pk, stat, err
 }
 
-// PutSecret creates or updates an Actions repo secret with a sealed value.
-func (c *GHClient) PutSecret(ctx context.Context, repo, name, sealedB64, keyID string) (CallStat, error) {
+// PutSecret creates or updates an Actions secret with a sealed value, at
+// repository scope or under env.
+func (c *GHClient) PutSecret(ctx context.Context, repo, env, name, sealedB64, keyID string) (CallStat, error) {
 	body, _ := json.Marshal(map[string]string{"encrypted_value": sealedB64, "key_id": keyID})
-	return c.do(ctx, http.MethodPut, "/repos/"+repo+"/actions/secrets/"+name, body, nil)
+	return c.do(ctx, http.MethodPut, secretsBase(repo, env)+"/"+name, body, nil)
 }
 
 // GetSecretMeta fetches an Actions secret's metadata (ErrNotFound if absent).
-func (c *GHClient) GetSecretMeta(ctx context.Context, repo, name string) (SecretMeta, error) {
+func (c *GHClient) GetSecretMeta(ctx context.Context, repo, env, name string) (SecretMeta, error) {
 	var m SecretMeta
-	_, err := c.do(ctx, http.MethodGet, "/repos/"+repo+"/actions/secrets/"+name, nil, &m)
+	_, err := c.do(ctx, http.MethodGet, secretsBase(repo, env)+"/"+name, nil, &m)
 	return m, err
 }
 
@@ -223,8 +247,8 @@ const (
 )
 
 // CheckGHDrift compares remote metadata against our last recorded push time.
-func (c *GHClient) CheckGHDrift(ctx context.Context, repo, name, lastPushedAt string) (GHDrift, error) {
-	meta, err := c.GetSecretMeta(ctx, repo, name)
+func (c *GHClient) CheckGHDrift(ctx context.Context, repo, env, name, lastPushedAt string) (GHDrift, error) {
+	meta, err := c.GetSecretMeta(ctx, repo, env, name)
 	if errors.Is(err, ErrNotFound) {
 		return GHMissing, nil
 	}

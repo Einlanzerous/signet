@@ -490,3 +490,34 @@ func sortedStrings(xs []string) bool {
 	}
 	return true
 }
+
+// A blob is materialized to a path a file target may also render into. The blob
+// header says edits are lost on the next deploy; once RenderInto is merging
+// into that path, unmanaged lines are in fact kept — so the stale line has to be
+// replaced rather than preserved, or the file carries the most misleading
+// sentence available at the top.
+func TestRenderIntoReplacesABlobHeaderItIsNowMergingInto(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".env")
+	content := BlobHeader + "\nALPHA=old\nHAND_WRITTEN=keepme\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, unmanaged, err := RenderInto(path, []Pair{{Key: "ALPHA", Value: "new"}}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(got, BlobHeader) {
+		t.Fatalf("the blob header survived a merge that keeps unmanaged lines:\n%s", got)
+	}
+	if !strings.HasPrefix(got, Header) {
+		t.Fatalf("the merged file does not carry the file-target header:\n%s", got)
+	}
+	// And the promise the new header makes is kept.
+	if !strings.Contains(got, "HAND_WRITTEN=keepme") {
+		t.Fatalf("an unmanaged line was dropped:\n%s", got)
+	}
+	if len(unmanaged) != 1 || unmanaged[0] != "HAND_WRITTEN" {
+		t.Fatalf("unmanaged = %v", unmanaged)
+	}
+}

@@ -116,7 +116,7 @@ func TestPreflightClassifiesAccess(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			c := preflightServer(t, map[string]func(http.ResponseWriter){"o/r": tc.respond})
-			probe := c.CheckRepoAccess(context.Background(), "o/r")
+			probe := c.CheckRepoAccess(context.Background(), "o/r", "")
 			if probe.Access != tc.want {
 				t.Fatalf("access = %q, want %q (err %v)", probe.Access, tc.want, probe.Err)
 			}
@@ -168,7 +168,7 @@ func TestSecondaryRateLimitIsNotReadAsAMissingGrant(t *testing.T) {
 			w.Write([]byte(`{"message":"You have exceeded a secondary rate limit. Please wait a few minutes before you try again."}`))
 		},
 	})
-	probe := c.CheckRepoAccess(context.Background(), "o/r")
+	probe := c.CheckRepoAccess(context.Background(), "o/r", "")
 	if probe.Access != AccessUnknown {
 		t.Fatalf("secondary rate limit classified as %q", probe.Access)
 	}
@@ -190,7 +190,7 @@ func TestNotFoundKeepsTheResponse(t *testing.T) {
 			w.Write([]byte(`{"message":"Not Found","documentation_url":"https://docs.github.com/rest"}`))
 		},
 	})
-	probe := c.CheckRepoAccess(context.Background(), "o/r")
+	probe := c.CheckRepoAccess(context.Background(), "o/r", "")
 	if probe.Access != AccessMissing {
 		t.Fatalf("access = %q", probe.Access)
 	}
@@ -221,16 +221,16 @@ func TestReadOnlyGrantPassesButPushStillExplainsItself(t *testing.T) {
 	c := NewGHClient("tok")
 	c.BaseURL = srv.URL
 
-	if probe := c.CheckRepoAccess(context.Background(), "o/r"); probe.Access != AccessOK {
+	if probe := c.CheckRepoAccess(context.Background(), "o/r", ""); probe.Access != AccessOK {
 		t.Fatalf("a read-only grant should still pass the read probe, got %q", probe.Access)
 	}
 	// The narrower mistake is not caught by the probe, so the push has to be the
 	// thing that explains it.
-	_, err = c.PutSecret(context.Background(), "o/r", "TOKEN", "c2VhbGVk", "k1")
+	_, err = c.PutSecret(context.Background(), "o/r", "", "TOKEN", "c2VhbGVk", "k1")
 	if err == nil {
 		t.Fatal("write to a read-only grant succeeded")
 	}
-	if hint := AccessHint("o/r", err); !strings.Contains(hint, "read and write") {
+	if hint := AccessHint("o/r", "", err); !strings.Contains(hint, "read and write") {
 		t.Fatalf("push hint does not name the write permission: %q", hint)
 	}
 }
@@ -249,7 +249,7 @@ func TestPreflightSendsNoSecretMaterial(t *testing.T) {
 	c := NewGHClient("tok")
 	c.BaseURL = srv.URL
 
-	if probe := c.CheckRepoAccess(context.Background(), "o/r"); probe.Err == nil {
+	if probe := c.CheckRepoAccess(context.Background(), "o/r", ""); probe.Err == nil {
 		t.Fatal("403 preflight returned no error")
 	}
 	if len(calls) != 1 || calls[0] != "GET /repos/o/r/actions/secrets/public-key" {
@@ -284,7 +284,7 @@ func TestPushSecretExplainsMissingGrant(t *testing.T) {
 		if _, err := m.AddVersion(s.ID, nonce, ct, vault.VersionHash(nonce, ct), "test", store.Minted); err != nil {
 			return nil, store.AuditRecord{}, err
 		}
-		if _, err := m.AddGHTarget(s.ID, "Einlanzerous/argosy", "API_TOKEN"); err != nil {
+		if _, err := m.AddGHTarget(s.ID, "Einlanzerous/argosy", "", "API_TOKEN"); err != nil {
 			return nil, store.AuditRecord{}, err
 		}
 		return s, store.AuditRecord{
