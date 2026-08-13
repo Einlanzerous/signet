@@ -124,11 +124,20 @@ func writeErr(w http.ResponseWriter, code int, format string, args ...any) {
 
 // TargetView is a target's blind mirror representation.
 type TargetView struct {
-	Kind         string             `json:"kind"`
-	Repo         string             `json:"repo,omitempty"`
-	SecretName   string             `json:"secret_name,omitempty"`
-	Path         string             `json:"path,omitempty"`
-	State        string             `json:"state"`
+	Kind string `json:"kind"`
+	Repo string `json:"repo,omitempty"`
+	// Environment is the deployment environment a GitHub secret is scoped to,
+	// absent for a repository secret. Published because two targets differing
+	// only in this are different destinations, and a mirror that omitted it
+	// would show one repo·name pair twice with no way to tell which was which.
+	Environment string `json:"environment,omitempty"`
+	SecretName  string `json:"secret_name,omitempty"`
+	Path        string `json:"path,omitempty"`
+	State       string `json:"state"`
+	// KeyCount is how many keys a rendered target carries. The blob's contents
+	// are one opaque value at the destination, so the count is the only measure
+	// of it a blind mirror can honestly publish.
+	KeyCount     int                `json:"key_count,omitempty"`
 	LastPushedAt string             `json:"last_pushed_at,omitempty"`
 	LastError    string             `json:"last_error,omitempty"`
 	Keys         []syncpkg.KeyState `json:"keys,omitempty"`
@@ -165,6 +174,15 @@ type SecretView struct {
 type ProjectView struct {
 	Project string       `json:"project"`
 	Secrets []SecretView `json:"secrets"`
+	// Renders lists the project's rendered targets, which belong to the project
+	// rather than to any one secret.
+	//
+	// They are published here as well as beside each secret they carry because
+	// the most dangerous one carries nothing: a target managing no keys would
+	// deliver an empty environment, and annotating secrets is the only way it
+	// reached the mirror before — so the single state Switchyard most needed to
+	// see was the one state that could never appear.
+	Renders []TargetView `json:"renders,omitempty"`
 }
 
 // buildViews assembles the full blind mirror, computing sync state locally
@@ -241,6 +259,42 @@ func (s *Server) buildViews() ([]ProjectView, error) {
 			checks = append(checks, fileCheck{ft, cfg, syncpkg.CheckFile(cfg.Path, want, cfg.Keys)})
 		}
 
+		renderTargets, err := s.st.RenderTargetsForProject(project)
+		if err != nil {
+			return nil, err
+		}
+		type renderCheck struct {
+			cfg   store.GHRenderConfig
+			state string
+		}
+		var renders []renderCheck
+		for i := range renderTargets {
+			cfg, err := renderTargets[i].GHRenderConfig()
+			if err != nil {
+				return nil, err
+			}
+			// A key the vault cannot supply makes the next push a refusal, so
+			// the whole blob reports as incomplete rather than as drift: drift
+			// says the destination is behind, and this one is unreachable.
+			//
+			// A target with no keys at all is reported as its own state, not as
+			// incomplete. Both are refused, but the fixes differ — one wants a
+			// value set, the other wants keys attached — and the mirror is the
+			// surface Switchyard reads, so it is the one that can least afford
+			// to name the wrong one. The CLI draws the same distinction.
+			var state string
+			switch {
+			case len(cfg.Keys) == 0:
+				state = "empty"
+			default:
+				state = "incomplete"
+				if content, rerr := syncpkg.RenderBlob(cfg, project, want); rerr == nil {
+					state = renderTargets[i].GHState(nil, vault.ValueDigest(s.key, content))
+				}
+			}
+			renders = append(renders, renderCheck{cfg, state})
+		}
+
 		for i := range secs {
 			sec := secs[i]
 			sv := SecretView{
@@ -271,7 +325,7 @@ func (s *Server) buildViews() ([]ProjectView, error) {
 					state = t.GHState(cur, digests[sec.Name])
 				}
 				sv.Targets = append(sv.Targets, TargetView{
-					Kind: t.Kind, Repo: cfg.Repo, SecretName: cfg.SecretName,
+					Kind: t.Kind, Repo: cfg.Repo, Environment: cfg.Environment, SecretName: cfg.SecretName,
 					State:        state,
 					LastPushedAt: t.LastPushedAt, LastError: t.LastError,
 				})
@@ -281,7 +335,24 @@ func (s *Server) buildViews() ([]ProjectView, error) {
 					sv.Targets = append(sv.Targets, TargetView{Kind: "file", Path: fc.cfg.Path, State: state})
 				}
 			}
+			for i, rc := range renders {
+				if !rc.cfg.Manages(sec.Name) {
+					continue
+				}
+				sv.Targets = append(sv.Targets, TargetView{
+					Kind: "gh-render", Repo: rc.cfg.Repo, Environment: rc.cfg.Environment,
+					SecretName: rc.cfg.SecretName, State: rc.state, KeyCount: len(rc.cfg.Keys),
+					LastPushedAt: renderTargets[i].LastPushedAt, LastError: renderTargets[i].LastError,
+				})
+			}
 			pv.Secrets = append(pv.Secrets, sv)
+		}
+		for i, rc := range renders {
+			pv.Renders = append(pv.Renders, TargetView{
+				Kind: "gh-render", Repo: rc.cfg.Repo, Environment: rc.cfg.Environment,
+				SecretName: rc.cfg.SecretName, State: rc.state, KeyCount: len(rc.cfg.Keys),
+				LastPushedAt: renderTargets[i].LastPushedAt, LastError: renderTargets[i].LastError,
+			})
 		}
 		out = append(out, pv)
 	}
@@ -462,12 +533,93 @@ func (s *Server) handleCommandSync(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
-	results, err := syncpkg.PushSecret(ctx, s.st, s.key, s.gh, sec, s.actor(r), role)
+	results, err := s.pushSecretAndRenders(ctx, sec, s.actor(r), role)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"results": results})
+}
+
+// pushSecretAndRenders delivers a secret to its own destinations and to every
+// rendered target that carries it.
+//
+// Both commands that deliver a value go through here, because the half that is
+// easy to forget is the half that fails silently: a secret carried inside a
+// rendered blob has no target of its own to fan out to, so pushing only its own
+// destinations leaves the environment serving the previous value with nothing
+// reporting a problem. That is the drift this target kind exists to end, and
+// rotate had already rediscovered it through its own door.
+func (s *Server) pushSecretAndRenders(ctx context.Context, sec *store.Secret, actor string, role store.ActorRole) ([]syncpkg.PushResult, error) {
+	results, err := syncpkg.PushSecret(ctx, s.st, s.key, s.gh, sec, actor, role)
+	if err != nil {
+		return nil, err
+	}
+	rendered, err := s.renderTargetsFor(sec)
+	if err != nil {
+		return nil, err
+	}
+	if len(rendered) == 0 {
+		return results, nil
+	}
+	want, err := s.projectValues(sec.Project)
+	if err != nil {
+		return nil, err
+	}
+	for i := range rendered {
+		res, err := syncpkg.PushRender(ctx, s.st, s.key, s.gh, &rendered[i], want,
+			syncpkg.RenderPushOptions{}, actor, role)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, res)
+	}
+	return results, nil
+}
+
+// renderTargetsFor returns the project's rendered targets that carry sec.
+func (s *Server) renderTargetsFor(sec *store.Secret) ([]store.Target, error) {
+	all, err := s.st.RenderTargetsForProject(sec.Project)
+	if err != nil {
+		return nil, err
+	}
+	var out []store.Target
+	for _, t := range all {
+		cfg, err := t.GHRenderConfig()
+		if err != nil {
+			return nil, err
+		}
+		if cfg.Manages(sec.Name) {
+			out = append(out, t)
+		}
+	}
+	return out, nil
+}
+
+// projectValues resolves a project's current values, skipping the ones that
+// cannot be resolved.
+//
+// Leniently, because the caller is a push that enforces its own completeness:
+// PushRender refuses on any key its target manages that is absent here, so a
+// strict resolve would only turn a broken secret the target does not even
+// manage into a failure of the whole command.
+func (s *Server) projectValues(project string) (map[string]string, error) {
+	secrets, err := s.st.ListSecrets()
+	if err != nil {
+		return nil, err
+	}
+	want := map[string]string{}
+	for i := range secrets {
+		if secrets[i].Project != project {
+			continue
+		}
+		r, err := resolve.Current(s.st, s.key, &secrets[i])
+		if err != nil {
+			continue
+		}
+		want[secrets[i].Name] = r.Value
+	}
+	return want, nil
 }
 
 func (s *Server) handleCommandRotate(w http.ResponseWriter, r *http.Request) {
@@ -529,7 +681,11 @@ func (s *Server) handleCommandRotate(w http.ResponseWriter, r *http.Request) {
 	if s.gh != nil {
 		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 		defer cancel()
-		if results, err := syncpkg.PushSecret(ctx, s.st, s.key, s.gh, sec, s.actor(r), role); err == nil {
+		// The rendered targets carrying this secret go out with the fan-out. A
+		// rotation that updated only the secret's own destinations would leave
+		// the environment file holding the credential the vault has already
+		// replaced — and answer `{"rotated": true}` while it did.
+		if results, err := s.pushSecretAndRenders(ctx, sec, s.actor(r), role); err == nil {
 			resp["fan_out"] = results
 		} else {
 			resp["fan_out_error"] = err.Error()
@@ -568,6 +724,10 @@ type addTargetReq struct {
 	Name       string `json:"name"`
 	Repo       string `json:"repo"`
 	SecretName string `json:"secret_name"`
+	// Environment scopes the destination to a deployment environment. Absent
+	// means a repository secret, which is what every caller predating the field
+	// means and what every existing target is.
+	Environment string `json:"environment"`
 }
 
 // handleCommandAddTarget attaches a gh-actions fan-out destination to a secret.
@@ -609,27 +769,28 @@ func (s *Server) handleCommandAddTarget(w http.ResponseWriter, r *http.Request) 
 	// (repo, secret_name) uniqueness is only advisory: two callers adding the
 	// same destination both read no match and both insert, and nothing in the
 	// schema catches it afterwards.
+	cfg := store.GHConfig{Repo: req.Repo, SecretName: dest, Environment: req.Environment}
 	t, _, err := store.MutateValue(s.st, func(m *store.Mutation) (*store.Target, store.AuditRecord, error) {
-		dup, err := m.FindGHTarget(sec.ID, req.Repo, dest)
+		dup, err := m.FindGHTarget(sec.ID, req.Repo, req.Environment, dest)
 		if err != nil {
 			return nil, store.AuditRecord{}, err
 		}
 		if dup != nil {
 			return nil, store.AuditRecord{}, errTargetExists
 		}
-		created, err := m.AddGHTarget(sec.ID, req.Repo, dest)
+		created, err := m.AddGHTarget(sec.ID, req.Repo, req.Environment, dest)
 		if err != nil {
 			return nil, store.AuditRecord{}, err
 		}
 		return created, store.AuditRecord{
 			Actor: s.actor(r), Action: "target.add", SecretID: sec.ID, TargetID: created.ID,
-			Details:   fmt.Sprintf("%s/%s → %s · Actions secret %s", req.Project, req.Name, req.Repo, dest),
+			Details:   fmt.Sprintf("%s/%s → %s · %s %s", req.Project, req.Name, req.Repo, cfg.Scope(), dest),
 			EventKind: store.KindTargetConfig, ActorRole: role,
 			Status: &store.AuditStatus{Outcome: store.OutcomeCreated},
 		}, nil
 	})
 	if errors.Is(err, errTargetExists) {
-		writeErr(w, http.StatusConflict, "target already exists: %s → %s (Actions secret %s)", req.Repo, dest, dest)
+		writeErr(w, http.StatusConflict, "target already exists: %s → %s (%s %s)", req.Repo, dest, cfg.Scope(), dest)
 		return
 	}
 	if err != nil {
@@ -638,7 +799,7 @@ func (s *Server) handleCommandAddTarget(w http.ResponseWriter, r *http.Request) 
 	}
 	resp := map[string]any{
 		"added":  true,
-		"target": TargetView{Kind: t.Kind, Repo: req.Repo, SecretName: dest, State: "never"},
+		"target": TargetView{Kind: t.Kind, Repo: req.Repo, Environment: req.Environment, SecretName: dest, State: "never"},
 	}
 	// Same preflight the CLI runs, for the same reason: the mirror can attach a
 	// destination the root PAT was never granted, and without this the mistake
@@ -653,7 +814,7 @@ func (s *Server) handleCommandAddTarget(w http.ResponseWriter, r *http.Request) 
 	if s.gh != nil {
 		ctx, cancel := context.WithTimeout(r.Context(), addTargetPreflightTimeout)
 		defer cancel()
-		probe := s.gh.CheckRepoAccess(ctx, req.Repo)
+		probe := s.gh.CheckRepoAccess(ctx, req.Repo, req.Environment)
 		// Always reported, including "unknown". Sending a warning only when
 		// signet can name a cause would leave the mirror unable to tell a probe
 		// that passed from one that never completed — and it would show a target
@@ -704,13 +865,14 @@ func (s *Server) handleCommandRemoveTarget(w http.ResponseWriter, r *http.Reques
 		writeErr(w, http.StatusNotFound, "no secret %s/%s", req.Project, req.Name)
 		return
 	}
-	t, err := s.st.FindGHTarget(sec.ID, req.Repo, dest)
+	cfg := store.GHConfig{Repo: req.Repo, SecretName: dest, Environment: req.Environment}
+	t, err := s.st.FindGHTarget(sec.ID, req.Repo, req.Environment, dest)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
 	if t == nil {
-		writeErr(w, http.StatusNotFound, "no target %s/%s → %s (Actions secret %s)", req.Project, req.Name, req.Repo, dest)
+		writeErr(w, http.StatusNotFound, "no target %s/%s → %s (%s %s)", req.Project, req.Name, req.Repo, cfg.Scope(), dest)
 		return
 	}
 	if _, err := s.st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
@@ -719,7 +881,7 @@ func (s *Server) handleCommandRemoveTarget(w http.ResponseWriter, r *http.Reques
 		}
 		return store.AuditRecord{
 			Actor: s.actor(r), Action: "target.rm", SecretID: sec.ID, TargetID: t.ID,
-			Details:   fmt.Sprintf("%s/%s → %s · Actions secret %s detached", req.Project, req.Name, req.Repo, dest),
+			Details:   fmt.Sprintf("%s/%s → %s · %s %s detached", req.Project, req.Name, req.Repo, cfg.Scope(), dest),
 			EventKind: store.KindTargetConfig, ActorRole: role,
 			Status: &store.AuditStatus{Outcome: store.OutcomeRemoved},
 		}, nil
@@ -729,7 +891,7 @@ func (s *Server) handleCommandRemoveTarget(w http.ResponseWriter, r *http.Reques
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"removed": true,
-		"note":    fmt.Sprintf("Actions secret %s in %s was left in place — signet has stopped updating it", dest, req.Repo),
+		"note":    fmt.Sprintf("%s %s in %s was left in place — signet has stopped updating it", cfg.Scope(), dest, req.Repo),
 	})
 }
 

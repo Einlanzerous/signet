@@ -534,13 +534,27 @@ func warnStaleDestinations(a *app, project, name string, dependents []store.Secr
 		return
 	}
 	toPush, err := fanOutSet(a.st, sec, dependents)
-	if err != nil || len(toPush) == 0 {
+	if err != nil {
+		return
+	}
+	// A secret carried only inside a rendered blob has no gh-actions target of
+	// its own, so fanOutSet answers no about it — and the one warning that
+	// tells an operator a destination still holds the previous value would stay
+	// silent about the destination whose value can least be checked by hand.
+	covered, _, err := renderCoverage(a.st, append([]store.Secret{*sec}, dependents...))
+	if err != nil {
+		return
+	}
+	toPush = mergeSecrets(toPush, covered)
+	if len(toPush) == 0 {
 		return
 	}
 	fmt.Fprintf(os.Stderr, "warning: %d GitHub destination(s) still hold the previous value\n", len(toPush))
 	for _, s := range toPush {
 		fmt.Fprintf(os.Stderr, "  %s/%s\n", s.Project, s.Name)
 	}
+	// `sync --secret` delivers a rendered target that carries the secret as
+	// well as the secret's own destinations, so one command covers both.
 	fmt.Fprintln(os.Stderr, "  push them with: "+syncCommandFor(toPush))
 }
 
@@ -590,8 +604,15 @@ func reportDependents(dependents []store.Secret, project, name string) {
 // warning that could not be computed is not worth failing a successful set over.
 func warnUndelivered(a *app, project, name string) {
 	targets, err := a.st.FileTargetsForProject(project)
-	if err != nil || len(targets) == 0 {
-		return // no rendered file for this project — nothing to be wrong about
+	if err != nil {
+		return
+	}
+	renderTargets, err := a.st.RenderTargetsForProject(project)
+	if err != nil {
+		return
+	}
+	if len(targets) == 0 && len(renderTargets) == 0 {
+		return // nothing renders this project — nothing to be wrong about
 	}
 	sec, err := a.st.GetSecret(project, name)
 	if err != nil || sec == nil {
@@ -607,15 +628,44 @@ func warnUndelivered(a *app, project, name string) {
 		if err != nil {
 			return
 		}
-		if contains(cfg.Keys, name) {
+		if cfg.Manages(name) {
 			return
 		}
 		paths = append(paths, cfg.Path)
 	}
-	fmt.Fprintf(os.Stderr, "warning: no file target for %s manages %s — render will not write it to %s\n",
-		project, name, strings.Join(paths, ", "))
-	fmt.Fprintf(os.Stderr, "  add it with: signet target add-key --project %s --path %s --name %s\n",
-		project, paths[0], name)
+	// A rendered target delivers the value as surely as a file does, so one
+	// carrying this key means it is not undelivered and there is nothing to
+	// warn about.
+	var rendered []string
+	for _, t := range renderTargets {
+		cfg, err := t.GHRenderConfig()
+		if err != nil {
+			return
+		}
+		if cfg.Manages(name) {
+			return
+		}
+		rendered = append(rendered, cfg.SecretName)
+	}
+
+	var dests []string
+	if len(paths) > 0 {
+		dests = append(dests, strings.Join(paths, ", "))
+	}
+	for _, r := range rendered {
+		dests = append(dests, "the "+r+" render")
+	}
+	fmt.Fprintf(os.Stderr, "warning: nothing in %s manages %s — it will not reach %s\n",
+		project, name, strings.Join(dests, " or "))
+	// The suggested fix names whichever destination exists, file first: it is
+	// the one whose key set is usually the source the render was seeded from.
+	if len(paths) > 0 {
+		fmt.Fprintf(os.Stderr, "  add it with: signet target add-key --project %s --path %s --name %s\n",
+			project, paths[0], name)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "  add it with: signet target add-key --project %s --gh-secret %s --name %s\n",
+		project, rendered[0], name)
 }
 
 // ---- reveal -----------------------------------------------------------------
@@ -874,6 +924,65 @@ func withGHTargets(st *store.Store, candidates []store.Secret) ([]store.Secret, 
 	return out, nil
 }
 
+// renderCoverage reports which of candidates a gh-render target delivers, and
+// which targets those are.
+//
+// It is the other half of withGHTargets, and every caller that asks "does this
+// value reach anywhere?" needs both. A secret carried only inside a rendered
+// blob has no gh-actions target of its own, so the older question — does any
+// target name this secret_id — answers no about a value that is very much
+// deployed. Getting that wrong is how a rotated credential gets reported as
+// having nowhere to go while the environment goes on serving the old one.
+func renderCoverage(st *store.Store, candidates []store.Secret) ([]store.Secret, []store.Target, error) {
+	all, err := st.RenderTargets()
+	if err != nil {
+		return nil, nil, err
+	}
+	keysOf := make([]store.GHRenderConfig, len(all))
+	for i := range all {
+		cfg, err := all[i].GHRenderConfig()
+		if err != nil {
+			return nil, nil, err
+		}
+		keysOf[i] = cfg
+	}
+	var covered []store.Secret
+	var targets []store.Target
+	seen := map[string]bool{}
+	for _, s := range candidates {
+		hit := false
+		for i := range all {
+			if all[i].Project != s.Project || !keysOf[i].Manages(s.Name) {
+				continue
+			}
+			hit = true
+			if !seen[all[i].ID] {
+				seen[all[i].ID] = true
+				targets = append(targets, all[i])
+			}
+		}
+		if hit {
+			covered = append(covered, s)
+		}
+	}
+	return covered, targets, nil
+}
+
+// mergeSecrets appends any of extra not already in base, by id.
+func mergeSecrets(base, extra []store.Secret) []store.Secret {
+	have := make(map[string]bool, len(base))
+	for _, s := range base {
+		have[s.ID] = true
+	}
+	for _, s := range extra {
+		if !have[s.ID] {
+			have[s.ID] = true
+			base = append(base, s)
+		}
+	}
+	return base
+}
+
 // rotatable reports whether a secret may be rotated, with the API's wording.
 //
 // Derived is tested before Generated because a derived secret would otherwise
@@ -913,7 +1022,15 @@ func rotateFanOut(a *app, sec *store.Secret, dependents []store.Secret) error {
 	if err != nil {
 		return err
 	}
-	if len(toPush) == 0 {
+	// A rotated secret carried inside a rendered blob has to go out with the
+	// blob, or the rotation lands in the vault and the environment keeps
+	// serving the credential it just replaced — silently, since the
+	// destination's value can never be read back to notice.
+	_, renderTargets, err := renderCoverage(a.st, append([]store.Secret{*sec}, dependents...))
+	if err != nil {
+		return err
+	}
+	if len(toPush) == 0 && len(renderTargets) == 0 {
 		// Not silence: a rotated secret nothing delivers is a value that has
 		// changed in the vault and nowhere else, which is worth saying plainly.
 		fmt.Println("no GitHub destinations — nothing to push")
@@ -932,6 +1049,7 @@ func rotateFanOut(a *app, sec *store.Secret, dependents []store.Secret) error {
 
 	pushed := 0
 	var stale []store.Secret
+	var renderFailed []string
 	markStale := func(sec store.Secret) {
 		for _, s := range stale {
 			if s.ID == sec.ID {
@@ -973,13 +1091,52 @@ func rotateFanOut(a *app, sec *store.Secret, dependents []store.Secret) error {
 			}
 		}
 	}
-	if len(stale) > 0 {
-		// Names the secrets whose destinations actually failed, which are not
-		// necessarily the rotated one: a derived dependent can fail on its own,
-		// and a remediation command naming the rotated secret would not fix it.
-		return fmt.Errorf("rotated, but %d secret(s) did not reach their destinations "+
-			"(%d push(es) succeeded) — the old value is still live there; fix and re-run:\n  %s",
-			len(stale), pushed, syncCommandFor(stale))
+	// The rendered blobs go last, once every secret they carry holds its new
+	// value: the blob is built from current vault state, so pushing it before
+	// the fan-out finished would deliver a file that is correct about the
+	// rotated secret and stale about nothing — but would have to be pushed
+	// again anyway if a dependent moved after it.
+	for i := range renderTargets {
+		t := &renderTargets[i]
+		want, _, err := a.projectValues(t.Project)
+		if err != nil {
+			return err
+		}
+		res, err := syncpkg.PushRender(ctx, a.st, a.key, gh, t, want,
+			syncpkg.RenderPushOptions{}, cliActor(), cliRole())
+		if err != nil {
+			return err
+		}
+		dest := res.Dest
+		if res.State == "in sync" {
+			pushed++
+			fmt.Printf("  ✓ %s render → %s\n", t.Project, dest)
+			if res.Note != "" {
+				fmt.Printf("    note: %s\n", res.Note)
+			}
+			continue
+		}
+		// Tracked apart from `stale`, which names secrets and builds a
+		// per-secret remediation. A rendered target is not any one secret's
+		// destination, so the command that retries it is a project-wide sync.
+		renderFailed = append(renderFailed, fmt.Sprintf("%s render → %s: %s", t.Project, dest, res.Err))
+	}
+
+	if len(stale) > 0 || len(renderFailed) > 0 {
+		var msg strings.Builder
+		fmt.Fprintf(&msg, "rotated, but %d destination(s) did not receive the new value (%d push(es) succeeded) — the old value is still live there",
+			len(stale)+len(renderFailed), pushed)
+		if len(stale) > 0 {
+			// Names the secrets whose destinations actually failed, which are
+			// not necessarily the rotated one: a derived dependent can fail on
+			// its own, and a remediation command naming the rotated secret
+			// would not fix it.
+			fmt.Fprintf(&msg, "\n  %s", syncCommandFor(stale))
+		}
+		for _, f := range renderFailed {
+			fmt.Fprintf(&msg, "\n  %s", f)
+		}
+		return errors.New(msg.String())
 	}
 	return nil
 }
@@ -1164,9 +1321,13 @@ func runRender(args []string) error {
 	project := fs.String("project", "", "project (required)")
 	check := fs.Bool("check", false, "report drift without writing")
 	prune := fs.Bool("prune", false, "delete keys the target does not manage instead of keeping them")
+	against := fs.String("against", "", "with --check: an env file to compare the rendered key sets against")
 	fs.Parse(args)
 	if *project == "" {
-		return fmt.Errorf("usage: signet render --project <p> [--check] [--prune]")
+		return fmt.Errorf("usage: signet render --project <p> [--check [--against </path/to/.env>]] [--prune]")
+	}
+	if *against != "" && !*check {
+		return fmt.Errorf("--against reports what a render would differ from, so it only makes sense with --check")
 	}
 	a, err := setup()
 	if err != nil {
@@ -1178,25 +1339,81 @@ func runRender(args []string) error {
 	if err != nil {
 		return err
 	}
-	if len(targets) == 0 {
+	renderTargets, err := a.st.RenderTargetsForProject(*project)
+	if err != nil {
+		return err
+	}
+	if len(targets) == 0 && len(renderTargets) == 0 {
 		return fmt.Errorf("project %s has no file targets (import an env file first)", *project)
+	}
+	// Rejected rather than ignored. --against exists to answer one question —
+	// what would the environment lose — and with no rendered target to ask it
+	// of, the honest answer is not "nothing": it is that the comparison never
+	// ran. Accepting the flag and printing a clean report would be the same
+	// false all-clear the flag was added to prevent.
+	if *against != "" && len(renderTargets) == 0 {
+		return fmt.Errorf("--against compares what a rendered target would deliver against a live file, and project %s has no rendered targets — attach one with `signet target add --project %s --render-as-secret …`", *project, *project)
+	}
+	// --check is a report, so it must survive the state it exists to report on.
+	// The strict resolve is what a write needs; making the check depend on it
+	// too would mean the command that answers "what is wrong" refuses to run
+	// precisely when something is.
+	if *check {
+		want, problems, err := a.projectValues(*project)
+		if err != nil {
+			return err
+		}
+		// Named up front, because this is the state that stops `signet render`
+		// working at all. A secret that cannot be resolved is simply absent
+		// from want, and every drift check below compares against an absent
+		// value as though it were an empty one — so without this the report
+		// would describe a broken derivation as a key whose value has changed,
+		// and point at a write that would refuse to run.
+		if len(problems) > 0 {
+			fmt.Printf("%d secret(s) in %s cannot be resolved — `signet render` refuses to write while this is true:\n", len(problems), *project)
+			for _, name := range sortedKeys(problems) {
+				fmt.Printf("  %-40s %s\n", name, problems[name])
+			}
+		}
+		for _, t := range targets {
+			cfg, err := t.FileConfig()
+			if err != nil {
+				return err
+			}
+			// --check --prune is the dry run for a delete that cannot be undone,
+			// so it is answered rather than rejected: same report, framed as what
+			// --prune would take.
+			printDrift(syncpkg.CheckFile(cfg.Path, want, cfg.Keys), *prune, problems)
+		}
+		blocked := false
+		for i := range renderTargets {
+			b, err := printRenderCheck(&renderTargets[i], *project, want, problems, *against, a.key)
+			if err != nil {
+				return err
+			}
+			blocked = blocked || b
+		}
+		// Non-zero so this is gateable from a deploy script. Returned rather than
+		// os.Exit'd: the report above is the useful output either way, and an
+		// exit here would take the process down mid-command, past the deferred
+		// close and out of reach of any test.
+		if blocked {
+			return errRenderCheckBlocked
+		}
+		return nil
 	}
 	want, err := a.projectValuesStrict(*project)
 	if err != nil {
 		return err
+	}
+	if len(targets) == 0 {
+		return fmt.Errorf("project %s has only rendered targets, which `signet sync` delivers — there is no file to write", *project)
 	}
 
 	for _, t := range targets {
 		cfg, err := t.FileConfig()
 		if err != nil {
 			return err
-		}
-		if *check {
-			// --check --prune is the dry run for a delete that cannot be undone,
-			// so it is answered rather than rejected: same report, framed as what
-			// --prune would take.
-			printDrift(syncpkg.CheckFile(cfg.Path, want, cfg.Keys), *prune)
-			continue
 		}
 		var pairs []envfile.Pair
 		for _, k := range cfg.Keys {
@@ -1239,6 +1456,21 @@ func runRender(args []string) error {
 			return err
 		}
 		fmt.Printf("rendered %s (%d keys%s)\n", cfg.Path, len(pairs), note)
+	}
+	// A rendered target delivers over the network, not to disk, so this command
+	// cannot touch it — but staying silent let `render` report success while
+	// leaving the environment holding the values the file no longer has. The
+	// operator's next step is a sync, and nothing else was going to say so.
+	if len(renderTargets) > 0 {
+		fmt.Printf("%d rendered target(s) in %s were not written — they deliver to GitHub, not to disk:\n", len(renderTargets), *project)
+		for i := range renderTargets {
+			cfg, err := renderTargets[i].GHRenderConfig()
+			if err != nil {
+				return err
+			}
+			fmt.Printf("  %s (%d keys) — now stale\n", cfg.Destination(), len(cfg.Keys))
+		}
+		fmt.Printf("run `signet sync` to deliver them\n")
 	}
 	return nil
 }
@@ -1321,10 +1553,144 @@ func sortedKeys(m map[string]error) []string {
 	return out
 }
 
+// errRenderCheckBlocked is the verdict of `render --check` when it found a
+// condition that would stop a push: keys that would be dropped, a target that
+// manages nothing, or managed keys the vault cannot resolve. The report itself
+// has already been printed; this exists to carry the exit code, which is the
+// only part of it a deploy script can act on.
+var errRenderCheckBlocked = errors.New("rendered target(s) would not deliver what the live environment has — see the report above")
+
+// printRenderCheck reports what a rendered target would deliver, and — given a
+// reference env file — how that differs from what is deployed today.
+//
+// The comparison exists because a rendered target's first push is the one no
+// other guard covers. Afterwards signet can compare against its own record of
+// the last push and refuse a shrinking render; before it, there is no record,
+// and the destination's value cannot be read back. A live env file is the only
+// evidence available of what the environment actually holds, so this is the
+// step that turns "the vault is presumably complete" into something checked.
+//
+// Keys the reference has and the render lacks are the dangerous direction and
+// are named individually: each is a value that would go empty in the deployed
+// environment on the next deploy. The other direction is reported too, but as a
+// count — an added key is a change worth seeing, not a hazard.
+//
+// It reports whether it found a condition that should stop a first push: an
+// empty or incomplete target, or a render that would drop keys the reference
+// has. That answer is what gives the command an exit code, and an exit code is
+// the only part of this report a deploy script can read — printing WOULD DROP
+// and exiting 0 made the safety story in the README unusable from anything but
+// a human's eyes.
+func printRenderCheck(t *store.Target, project string, want map[string]string, problems map[string]error, against string, key []byte) (bool, error) {
+	cfg, err := t.GHRenderConfig()
+	if err != nil {
+		return false, err
+	}
+	fmt.Printf("%s → %s (%d keys)\n", project, cfg.Destination(), len(cfg.Keys))
+
+	if len(cfg.Keys) == 0 {
+		// No diff is worth printing against a target that manages nothing: it
+		// would list the reference file's every key as one that would be
+		// dropped, which is true and useless.
+		fmt.Printf("  EMPTY — this target manages no keys, so sync will refuse it rather than deliver an empty environment\n")
+		fmt.Printf("    signet target add-key --project %s --gh-secret %s --name NAME\n", project, cfg.SecretName)
+		return true, nil
+	}
+	blocking := false
+
+	// Reported before any diff, because an incomplete render is not a
+	// difference of opinion with the reference file — it is a push that will be
+	// refused whatever the reference says.
+	var missing []string
+	for _, k := range cfg.Keys {
+		if _, ok := want[k]; !ok {
+			missing = append(missing, k)
+		}
+	}
+	if len(missing) > 0 {
+		blocking = true
+		sort.Strings(missing)
+		fmt.Printf("  INCOMPLETE — %d managed key(s) have no value in the vault, so sync will refuse this target:\n", len(missing))
+		for _, k := range missing {
+			reason := "no value set"
+			if err, broken := problems[k]; broken {
+				reason = err.Error()
+			}
+			fmt.Printf("    %-40s %s\n", k, reason)
+		}
+	} else {
+		fmt.Printf("  state: %s\n", t.GHState(nil, vault.ValueDigest(key, mustRenderBlob(cfg, project, want))))
+	}
+
+	if against == "" {
+		if t.LastPushedAt == "" {
+			fmt.Printf("  never pushed — compare against the live environment before the first sync:\n")
+			fmt.Printf("    signet render --project %s --check --against /path/to/the/live/.env\n", project)
+		}
+		return blocking, nil
+	}
+
+	pairs, err := envfile.ParseFile(against)
+	if err != nil {
+		return false, fmt.Errorf("--against %s: %w", against, err)
+	}
+	managed := map[string]bool{}
+	for _, k := range cfg.Keys {
+		managed[k] = true
+	}
+	var absent []string
+	for _, p := range pairs {
+		if !managed[p.Key] {
+			absent = append(absent, p.Key)
+		}
+	}
+	added := 0
+	have := envfile.Map(pairs)
+	for _, k := range cfg.Keys {
+		if _, ok := have[k]; !ok {
+			added++
+		}
+	}
+	if len(absent) > 0 {
+		blocking = true
+		sort.Strings(absent)
+		fmt.Printf("  WOULD DROP %d key(s) that %s has and this render does not:\n", len(absent), against)
+		for _, k := range absent {
+			fmt.Printf("    %s\n", k)
+		}
+		fmt.Printf("  each would be delivered absent, and read as empty by whatever consumes the file\n")
+		fmt.Printf("  import them into the vault, then `signet target add-key --project %s --gh-secret %s --name ...`\n", project, cfg.SecretName)
+	} else {
+		fmt.Printf("  covers every key in %s\n", against)
+	}
+	if added > 0 {
+		fmt.Printf("  and would add %d key(s) that %s does not have\n", added, against)
+	}
+	return blocking, nil
+}
+
+// mustRenderBlob renders a target whose keys have already been confirmed
+// resolvable. The error path is unreachable — the caller checked for exactly
+// the one condition that produces it — and returning "" on it is harmless: it
+// would yield a digest that matches no recorded push, so the state reads as
+// drift rather than as a false "in sync".
+func mustRenderBlob(cfg store.GHRenderConfig, project string, want map[string]string) string {
+	content, err := syncpkg.RenderBlob(cfg, project, want)
+	if err != nil {
+		return ""
+	}
+	return content
+}
+
 // printDrift reports one file target's state. With prune set the report is the
 // dry run for `render --prune`, so the unmanaged keys are framed as what that
 // write would delete rather than what an ordinary one would keep.
-func printDrift(d syncpkg.FileDrift, prune bool) {
+// problems names the project's unresolvable secrets, so a key whose value
+// could not be computed is reported as that rather than as drift: it is absent
+// from the comparison map, which makes it indistinguishable from a key whose
+// value is the empty string, and calling it "changed" promises a repair that
+// `render` will decline to attempt.
+func printDrift(d syncpkg.FileDrift, prune bool, problems map[string]error) {
 	switch {
 	case d.MissingFile:
 		fmt.Printf("%s: MISSING FILE\n", d.Path)
@@ -1333,11 +1699,15 @@ func printDrift(d syncpkg.FileDrift, prune bool) {
 		fmt.Printf("%s: UNREADABLE — render will refuse this file rather than overwrite it\n", d.Path)
 		fmt.Printf("  %s\n", d.Unreadable)
 		return
-	case d.Clean():
+	case d.Clean() && !anyUnresolved(d, problems):
 		fmt.Printf("%s: in sync (%d keys)\n", d.Path, len(d.Keys))
 	default:
 		fmt.Printf("%s: DRIFT\n", d.Path)
 		for _, k := range d.Keys {
+			if _, broken := problems[k.Key]; broken {
+				fmt.Printf("  %-40s %s\n", k.Key, "unresolved — no value to compare")
+				continue
+			}
 			if k.State != "ok" {
 				fmt.Printf("  %-40s %s\n", k.Key, k.State)
 			}
@@ -1426,10 +1796,13 @@ func atomicWrite(path, content, mode string) error {
 
 const targetUsage = `usage:
   signet target list [--secret <p>/<NAME>] [--project <p>]
-  signet target add --secret <p>/<NAME> --gh-repo owner/name [--gh-secret NAME] [--no-preflight]
+  signet target add --secret <p>/<NAME> --gh-repo owner/name [--gh-environment ENV] [--gh-secret NAME] [--no-preflight]
+  signet target add --project <p> --render-as-secret --gh-repo owner/name --gh-secret NAME [--gh-environment ENV] [--seed-from </path/to/.env>]
   signet target add-key --project <p> --path </path/to/.env> --name NAME[,NAME…]
-  signet target rm  --secret <p>/<NAME> --gh-repo owner/name [--gh-secret NAME]
-  signet target rm  --project <p> --path </path/to/.env>`
+  signet target add-key --project <p> --gh-secret NAME --name NAME[,NAME…]
+  signet target rm  --secret <p>/<NAME> --gh-repo owner/name [--gh-environment ENV] [--gh-secret NAME]
+  signet target rm  --project <p> --path </path/to/.env>
+  signet target rm  --project <p> --gh-repo owner/name --gh-secret NAME [--gh-environment ENV]`
 
 func runTarget(args []string) error {
 	if len(args) == 0 {
@@ -1460,10 +1833,13 @@ func runTarget(args []string) error {
 func runTargetAddKey(args []string) error {
 	fs := flag.NewFlagSet("target add-key", flag.ExitOnError)
 	project := fs.String("project", "", "project (required)")
-	path := fs.String("path", "", "rendered file path (required)")
+	path := fs.String("path", "", "rendered file path (file targets)")
+	ghSecret := fs.String("gh-secret", "", "destination secret name (rendered targets)")
+	ghRepo := fs.String("gh-repo", "", "GitHub repo owner/name (rendered targets, when --gh-secret is ambiguous)")
+	ghEnv := fs.String("gh-environment", "", "deployment environment (rendered targets, when --gh-secret is ambiguous)")
 	name := fs.String("name", "", "secret name(s) to add, comma-separated (required)")
 	fs.Parse(args)
-	if *project == "" || *path == "" || *name == "" {
+	if *project == "" || *name == "" || (*path == "") == (*ghSecret == "") {
 		return fmt.Errorf("%s", targetUsage)
 	}
 	var names []string
@@ -1474,6 +1850,9 @@ func runTargetAddKey(args []string) error {
 	}
 	if len(names) == 0 {
 		return fmt.Errorf("%s", targetUsage)
+	}
+	if *ghSecret != "" {
+		return runTargetAddKeyRender(*project, *ghRepo, *ghEnv, *ghSecret, names)
 	}
 	// Normalized the way import records it. A relative --path would match no
 	// target, and the "import it first" error that follows would send the
@@ -1556,15 +1935,160 @@ type addKeyResult struct {
 	outcome store.Outcome
 }
 
+// runTargetAddKeyRender widens a rendered target's key set, so the next sync
+// carries those keys into the destination environment.
+//
+// Every name has to exist in the vault first, for the same reason the file
+// variant insists: the push is refused outright if any managed key cannot be
+// resolved, so a typo here would stop the whole environment from syncing rather
+// than just its own key.
+func runTargetAddKeyRender(project, ghRepo, ghEnv, ghSecret string, names []string) error {
+	a, err := setup()
+	if err != nil {
+		return err
+	}
+	defer a.close()
+
+	// Existence is not the property that matters. A push refuses on any key it
+	// cannot *resolve*, so a secret row whose value is missing or whose
+	// derivation is broken arms exactly the refusal this check is documented as
+	// preventing — and arms it for the whole environment, not just this key.
+	// Resolving here is what makes the doc comment above true.
+	want, problems, err := a.projectValues(project)
+	if err != nil {
+		return err
+	}
+	for _, n := range names {
+		sec, err := a.st.GetSecret(project, n)
+		if err != nil {
+			return err
+		}
+		if sec == nil {
+			return fmt.Errorf("no secret %s/%s — set it before adding it to a target", project, n)
+		}
+		if _, ok := want[n]; !ok {
+			reason := "it has no value"
+			if perr, broken := problems[n]; broken {
+				reason = perr.Error()
+			}
+			return fmt.Errorf("%s/%s cannot be resolved (%s) — adding it would make `signet sync` refuse the whole rendered target; fix it first", project, n, reason)
+		}
+	}
+
+	res, _, err := store.MutateValue(a.st, func(m *store.Mutation) (addKeyResult, store.AuditRecord, error) {
+		t, err := findRenderTargetTx(m, project, ghRepo, ghEnv, ghSecret)
+		if err != nil {
+			return addKeyResult{}, store.AuditRecord{}, err
+		}
+		t, outcome, err := m.AddRenderKeys(t, names)
+		if err != nil {
+			return addKeyResult{}, store.AuditRecord{}, err
+		}
+		cfg, err := t.GHRenderConfig()
+		if err != nil {
+			return addKeyResult{}, store.AuditRecord{}, err
+		}
+		return addKeyResult{keys: len(cfg.Keys), outcome: outcome}, store.AuditRecord{
+			Actor: cliActor(), Action: "target.render", TargetID: t.ID,
+			Details: fmt.Sprintf("%s render → %s +%s (%d keys)",
+				project, cfg.Destination(), strings.Join(names, ", "), len(cfg.Keys)),
+			EventKind: store.KindTargetConfig, ActorRole: cliRole(),
+			Status: &store.AuditStatus{Outcome: outcome},
+		}, nil
+	})
+	if err != nil {
+		return err
+	}
+	if res.outcome == store.OutcomeUnchanged {
+		fmt.Printf("target unchanged: %s render → %s already manages %s\n", project, ghSecret, strings.Join(names, ", "))
+		return nil
+	}
+	fmt.Printf("target updated: %s render → %s now manages %d keys\n", project, ghSecret, res.keys)
+	fmt.Printf("run `signet sync` to deliver them\n")
+	return nil
+}
+
+// findRenderTargetTx resolves the project's rendered target from as much of the
+// destination as the caller named, inside the caller's transaction.
+//
+// A project will almost always have one, so requiring the full repo and
+// environment on every add-key would be ceremony. Ambiguity is refused rather
+// than resolved by picking the first, because the two candidates are different
+// live environments and delivering a key to the wrong one is silent.
+func findRenderTargetTx(m *store.Mutation, project, ghRepo, ghEnv, ghSecret string) (*store.Target, error) {
+	if ghRepo != "" {
+		t, err := m.FindGHRenderTarget(project, ghRepo, ghEnv, ghSecret)
+		if err != nil {
+			return nil, err
+		}
+		if t == nil {
+			return nil, fmt.Errorf("no rendered target %s → %s in project %s", ghSecret, ghRepo, project)
+		}
+		return t, nil
+	}
+	all, err := m.RenderTargetsForProject(project)
+	if err != nil {
+		return nil, err
+	}
+	var matches []*store.Target
+	var dests []string
+	for i := range all {
+		cfg, err := all[i].GHRenderConfig()
+		if err != nil {
+			return nil, err
+		}
+		if cfg.SecretName != ghSecret {
+			continue
+		}
+		// An explicitly named environment narrows the search rather than being
+		// discarded. Ignoring it would let `--gh-environment prod` resolve to
+		// the one target named PROD_ENV_FILE even when that target is scoped to
+		// staging — delivering a key to a live environment the caller named and
+		// did not get, which is the precise hazard the ambiguity check below
+		// exists to refuse.
+		if ghEnv != "" && cfg.Environment != ghEnv {
+			continue
+		}
+		matches = append(matches, &all[i])
+		dests = append(dests, cfg.Destination())
+	}
+	switch len(matches) {
+	case 0:
+		if ghEnv != "" {
+			return nil, fmt.Errorf("no rendered target %s scoped to environment %s in project %s — `signet target list --project %s` shows what is attached",
+				ghSecret, ghEnv, project, project)
+		}
+		return nil, fmt.Errorf("no rendered target %s in project %s — `signet target list --project %s` shows what is attached", ghSecret, project, project)
+	case 1:
+		return matches[0], nil
+	default:
+		return nil, fmt.Errorf("%d rendered targets in project %s are named %s — name one with --gh-repo and --gh-environment: %s",
+			len(matches), project, ghSecret, strings.Join(dests, ", "))
+	}
+}
+
 func runTargetAdd(args []string) error {
 	fs := flag.NewFlagSet("target add", flag.ExitOnError)
 	ref := fs.String("secret", "", "secret ref project/NAME (required)")
+	renderProject := fs.String("project", "", "project (with --render-as-secret)")
+	renderAsSecret := fs.Bool("render-as-secret", false, "deliver the project's rendered env file as one secret")
+	seedFrom := fs.String("seed-from", "", "file target whose key set to seed a rendered target with")
 	ghRepo := fs.String("gh-repo", "", "GitHub repo owner/name (required)")
+	ghEnv := fs.String("gh-environment", "", "deployment environment to scope the secret to (default: repository secret)")
 	ghSecret := fs.String("gh-secret", "", "destination Actions secret name (default: local name)")
 	noPreflight := fs.Bool("no-preflight", false, "skip the check that the PAT can reach the repo")
 	fs.Parse(args)
-	if *ref == "" || *ghRepo == "" || !strings.Contains(*ghRepo, "/") {
+	if *ghRepo == "" || !strings.Contains(*ghRepo, "/") {
 		return fmt.Errorf("%s", targetUsage)
+	}
+	if *renderAsSecret || *renderProject != "" {
+		return runTargetAddRender(*renderProject, *renderAsSecret, *seedFrom, *ghRepo, *ghEnv, *ghSecret, *noPreflight)
+	}
+	if *ref == "" {
+		return fmt.Errorf("%s", targetUsage)
+	}
+	if *seedFrom != "" {
+		return fmt.Errorf("--seed-from applies to --render-as-secret targets, which take a --project rather than a --secret")
 	}
 	project, name, err := parseSecretRef(*ref)
 	if err != nil {
@@ -1586,32 +2110,43 @@ func runTargetAdd(args []string) error {
 	if dest == "" {
 		dest = name
 	}
+	cfg := store.GHConfig{Repo: *ghRepo, SecretName: dest, Environment: *ghEnv}
 	if _, err := a.st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
 		// Checked inside the transaction that inserts, so the destination
 		// cannot appear between the check and the write. The API refuses the
 		// same duplicate; without this the CLI would quietly attach a second
 		// target pushing the same value to the same place.
-		dup, err := m.FindGHTarget(sec.ID, *ghRepo, dest)
+		dup, err := m.FindGHTarget(sec.ID, *ghRepo, *ghEnv, dest)
 		if err != nil {
 			return store.AuditRecord{}, err
 		}
 		if dup != nil {
-			return store.AuditRecord{}, fmt.Errorf("target already exists: %s/%s → %s (Actions secret %s)", project, name, *ghRepo, dest)
+			return store.AuditRecord{}, fmt.Errorf("target already exists: %s/%s → %s (%s %s)", project, name, *ghRepo, cfg.Scope(), dest)
 		}
-		t, err := m.AddGHTarget(sec.ID, *ghRepo, dest)
+		// dup only sees this secret's own targets, so it cannot see a rendered
+		// target already delivering an env file to the same GitHub secret. Both
+		// would PUT the same path and the last writer would win. See
+		// FindGHDestination.
+		if claimed, err := m.FindGHDestination(*ghRepo, *ghEnv, dest); err != nil {
+			return store.AuditRecord{}, err
+		} else if claimed != nil {
+			return store.AuditRecord{}, fmt.Errorf("%s is already delivered to by a %s target — one GitHub secret holds one value, so two targets would overwrite each other on every sync; detach the existing one first (`signet target list`)",
+				cfg.Destination(), claimed.Kind)
+		}
+		t, err := m.AddGHTarget(sec.ID, *ghRepo, *ghEnv, dest)
 		if err != nil {
 			return store.AuditRecord{}, err
 		}
 		return store.AuditRecord{
 			Actor: cliActor(), Action: "target.add", SecretID: sec.ID, TargetID: t.ID,
-			Details:   fmt.Sprintf("%s/%s → %s · Actions secret %s", project, name, *ghRepo, dest),
+			Details:   fmt.Sprintf("%s/%s → %s · %s %s", project, name, *ghRepo, cfg.Scope(), dest),
 			EventKind: store.KindTargetConfig, ActorRole: cliRole(),
 			Status: &store.AuditStatus{Outcome: store.OutcomeCreated},
 		}, nil
 	}); err != nil {
 		return err
 	}
-	fmt.Printf("target added: %s/%s → %s (Actions secret %s)\n", project, name, *ghRepo, dest)
+	fmt.Printf("target added: %s/%s → %s (%s %s)\n", project, name, *ghRepo, cfg.Scope(), dest)
 	// The add stands either way. A grant that is not in place yet is a normal
 	// order of operations — attach the destination, then widen the PAT — and
 	// refusing here would make the two commands depend on each other's order for
@@ -1620,12 +2155,156 @@ func runTargetAdd(args []string) error {
 	// not the same as failing it, so --no-preflight leaves the path clear.
 	clear := true
 	if !*noPreflight {
-		clear = preflightGHRepo(preflightClient(a), *ghRepo)
+		clear = preflightGHRepo(preflightClient(a), *ghRepo, *ghEnv)
 	}
 	if clear {
 		fmt.Println("run `signet sync` to push")
 	}
 	return nil
+}
+
+// runTargetAddRender attaches a whole-file rendered destination to a project:
+// every key it manages is rendered into env-file content and delivered as the
+// value of one GitHub secret.
+//
+// The key set is seeded from an existing file target rather than defaulting to
+// the whole project. "Every secret in the project" is the wrong default in both
+// directions — it would carry keys the deployed environment has never had into
+// it, and it would make every later `signet set` on the project a silent change
+// to a live environment. Seeding from a file target instead starts the render
+// as a copy of something already true, and widening it stays an explicit act
+// (`target add-key`).
+func runTargetAddRender(project string, renderAsSecret bool, seedFrom, ghRepo, ghEnv, ghSecret string, noPreflight bool) error {
+	switch {
+	case project == "":
+		return fmt.Errorf("--render-as-secret needs a --project (the project whose keys are rendered)")
+	case !renderAsSecret:
+		return fmt.Errorf("--project attaches a rendered target and needs --render-as-secret; a single secret's destination takes --secret <p>/<NAME>")
+	case ghSecret == "":
+		// No local name to fall back on: the value is a whole file, not a
+		// secret whose name could stand in for the destination's.
+		return fmt.Errorf("--render-as-secret needs an explicit --gh-secret (the destination secret name, e.g. PROD_ENV_FILE)")
+	}
+
+	a, err := setup()
+	if err != nil {
+		return err
+	}
+	defer a.close()
+
+	keys, seededFrom, err := seedKeys(a, project, seedFrom)
+	if err != nil {
+		return err
+	}
+
+	cfg := store.GHConfig{Repo: ghRepo, SecretName: ghSecret, Environment: ghEnv}
+	if _, err := a.st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
+		dup, err := m.FindGHRenderTarget(project, ghRepo, ghEnv, ghSecret)
+		if err != nil {
+			return store.AuditRecord{}, err
+		}
+		if dup != nil {
+			return store.AuditRecord{}, fmt.Errorf("target already exists: %s render → %s (%s %s)", project, ghRepo, cfg.Scope(), ghSecret)
+		}
+		// The collision that matters is with the destination, not with the kind.
+		// A gh-actions target already writing this secret would take turns with
+		// this one on every sync, each overwriting the other and each reporting
+		// "in sync" — and the value that survives would be whichever ran last.
+		if claimed, err := m.FindGHDestination(ghRepo, ghEnv, ghSecret); err != nil {
+			return store.AuditRecord{}, err
+		} else if claimed != nil {
+			return store.AuditRecord{}, fmt.Errorf("%s is already delivered to by a %s target — one GitHub secret holds one value, so two targets would overwrite each other on every sync; detach the existing one first (`signet target list`)",
+				cfg.Destination(), claimed.Kind)
+		}
+		t, err := m.AddGHRenderTarget(project, ghRepo, ghEnv, ghSecret, keys)
+		if err != nil {
+			return store.AuditRecord{}, err
+		}
+		return store.AuditRecord{
+			Actor: cliActor(), Action: "target.add", TargetID: t.ID,
+			Details: fmt.Sprintf("%s render (%d keys%s) → %s · %s %s",
+				project, len(keys), seededFrom, ghRepo, cfg.Scope(), ghSecret),
+			EventKind: store.KindTargetConfig, ActorRole: cliRole(),
+			Status: &store.AuditStatus{Outcome: store.OutcomeCreated},
+		}, nil
+	}); err != nil {
+		return err
+	}
+
+	fmt.Printf("target added: %s render → %s (%s %s)\n", project, ghRepo, cfg.Scope(), ghSecret)
+	fmt.Printf("it manages %d keys%s\n", len(keys), seededFrom)
+	if len(keys) == 0 {
+		fmt.Printf("add keys with `signet target add-key --project %s --gh-secret %s --name NAME`\n", project, ghSecret)
+	}
+	// Said before any sync is suggested, because the push is atomic and total:
+	// whatever this target does not manage is simply absent from the delivered
+	// file, and a consumer reads an absent key as an empty one.
+	fmt.Printf("check what it would deliver before the first push:\n")
+	fmt.Printf("  signet render --project %s --check --against /path/to/the/live/.env\n", project)
+	if noPreflight {
+		return nil
+	}
+	if preflightGHRepo(preflightClient(a), ghRepo, ghEnv) {
+		fmt.Println("run `signet sync` to push")
+	}
+	return nil
+}
+
+// seedKeys resolves the key set a new rendered target starts with, and the
+// phrase describing where it came from.
+//
+// A project with exactly one file target needs no argument; anything else has
+// to be named, because guessing wrong here is not a cosmetic mistake. The key
+// set decides the entire content of a live environment, and a target seeded
+// from the wrong file would deliver a plausible env file describing the wrong
+// deployment.
+func seedKeys(a *app, project, seedFrom string) ([]string, string, error) {
+	if seedFrom != "" {
+		abs, err := filepath.Abs(seedFrom)
+		if err != nil {
+			return nil, "", err
+		}
+		t, err := a.st.FindFileTarget(project, abs)
+		if err != nil {
+			return nil, "", err
+		}
+		if t == nil {
+			return nil, "", fmt.Errorf("no file target %s in project %s — `signet target list --project %s` shows what there is to seed from", abs, project, project)
+		}
+		cfg, err := t.FileConfig()
+		if err != nil {
+			return nil, "", err
+		}
+		return cfg.Keys, ", seeded from " + abs, nil
+	}
+	// Only needed for the unnamed case: with --seed-from the target is looked up
+	// directly, and listing the project's file targets to then discard the list
+	// was a query paid for on every add.
+	fts, err := a.st.FileTargetsForProject(project)
+	if err != nil {
+		return nil, "", err
+	}
+	switch len(fts) {
+	case 0:
+		return nil, "", nil
+	case 1:
+		cfg, err := fts[0].FileConfig()
+		if err != nil {
+			return nil, "", err
+		}
+		return cfg.Keys, ", seeded from " + cfg.Path, nil
+	default:
+		var paths []string
+		for _, t := range fts {
+			cfg, err := t.FileConfig()
+			if err != nil {
+				return nil, "", err
+			}
+			paths = append(paths, cfg.Path)
+		}
+		return nil, "", fmt.Errorf("project %s has %d file targets — name the one to seed from with --seed-from: %s",
+			project, len(fts), strings.Join(paths, ", "))
+	}
 }
 
 // preflightTimeout bounds one probe. Per call rather than across a run: a
@@ -1655,13 +2334,13 @@ func preflightClient(a *app) *syncpkg.GHClient {
 // It takes the client rather than building one so a test can point it at a
 // server that answers the way GitHub does. Without that the entire preflight
 // surface would only be reachable by talking to api.github.com for real.
-func preflightGHRepo(gh *syncpkg.GHClient, repo string) bool {
+func preflightGHRepo(gh *syncpkg.GHClient, repo, env string) bool {
 	if gh == nil {
 		return true
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), preflightTimeout)
 	defer cancel()
-	probe := gh.CheckRepoAccess(ctx, repo)
+	probe := gh.CheckRepoAccess(ctx, repo, env)
 	if probe.Access == syncpkg.AccessOK {
 		return true
 	}
@@ -1784,7 +2463,30 @@ func runTargetList(args []string) error {
 			if derr != nil {
 				state = "unresolved"
 			}
-			emit(sec.Project+"/"+sec.Name, t.Kind, cfg.Repo+" · "+cfg.SecretName, state, t.LastPushedAt)
+			emit(sec.Project+"/"+sec.Name, t.Kind, cfg.Destination(), state, t.LastPushedAt)
+
+		case "gh-render":
+			// Project-scoped like a file target, so a secret filter keeps it
+			// only when the render actually carries that key.
+			if wantProject != "" && t.Project != wantProject {
+				continue
+			}
+			cfg, err := t.GHRenderConfig()
+			if err != nil {
+				return err
+			}
+			if wantSecret != nil && !cfg.Manages(wantSecret.Name) {
+				continue
+			}
+			want, err := projectValues(t.Project)
+			if err != nil {
+				return err
+			}
+			owner := t.Project + fmt.Sprintf(" (%d keys)", len(cfg.Keys))
+			if wantSecret != nil {
+				owner = t.Project + "/" + wantSecret.Name
+			}
+			emit(owner, t.Kind, cfg.Destination(), renderState(&t, cfg, want, a.key), t.LastPushedAt)
 
 		case "file":
 			// File targets belong to a project rather than one secret, so a
@@ -1796,7 +2498,7 @@ func runTargetList(args []string) error {
 			if err != nil {
 				return err
 			}
-			if wantSecret != nil && !contains(cfg.Keys, wantSecret.Name) {
+			if wantSecret != nil && !cfg.Manages(wantSecret.Name) {
 				continue
 			}
 			want, err := projectValues(t.Project)
@@ -1822,6 +2524,42 @@ func runTargetList(args []string) error {
 		fmt.Println("no targets matched")
 	}
 	return nil
+}
+
+// anyUnresolved reports whether the target manages a key the project could not
+// resolve. Such a key can compare equal by accident — an unresolvable secret is
+// absent from the wanted map, so a file holding an empty value for it looks
+// like a match — and a file target reported "in sync" on that basis is making
+// the one claim it has no evidence for.
+func anyUnresolved(d syncpkg.FileDrift, problems map[string]error) bool {
+	for _, k := range d.Keys {
+		if _, broken := problems[k.Key]; broken {
+			return true
+		}
+	}
+	return false
+}
+
+// renderState reduces a rendered target's drift to one word.
+//
+// The blob is delivered and compared whole, so there is no per-key state to
+// report: every key it carries shares the destination's currency. What a single
+// key can do is stop the whole render — a managed key the vault cannot supply
+// makes the next push a refusal, and "incomplete" says that before a sync
+// discovers it rather than after.
+func renderState(t *store.Target, cfg store.GHRenderConfig, want map[string]string, key []byte) string {
+	if len(cfg.Keys) == 0 {
+		// Distinct from "incomplete": nothing is missing, the target simply has
+		// no keys yet. Sync refuses it either way, but the fix is a different
+		// one and reporting both as incomplete would send the reader looking
+		// for a value that was never asked for.
+		return "empty"
+	}
+	content, err := syncpkg.RenderBlob(cfg, t.Project, want)
+	if err != nil {
+		return "incomplete"
+	}
+	return t.GHState(nil, vault.ValueDigest(key, content))
 }
 
 // fileState reduces a file target's drift to one word. With key set it reports
@@ -1850,22 +2588,24 @@ func fileState(d syncpkg.FileDrift, key string) string {
 func runTargetRm(args []string) error {
 	fs := flag.NewFlagSet("target rm", flag.ExitOnError)
 	ref := fs.String("secret", "", "secret ref project/NAME (gh targets)")
-	ghRepo := fs.String("gh-repo", "", "GitHub repo owner/name (gh targets)")
+	ghRepo := fs.String("gh-repo", "", "GitHub repo owner/name (gh and rendered targets)")
+	ghEnv := fs.String("gh-environment", "", "deployment environment the secret is scoped to")
 	ghSecret := fs.String("gh-secret", "", "destination Actions secret name (default: local name)")
-	project := fs.String("project", "", "project (file targets)")
+	project := fs.String("project", "", "project (file and rendered targets)")
 	path := fs.String("path", "", "rendered file path (file targets)")
 	fs.Parse(args)
 
-	ghMode := *ref != "" || *ghRepo != ""
-	fileMode := *project != "" || *path != ""
+	ghMode := *ref != "" || (*ghRepo != "" && *project == "")
+	fileMode := *project != "" && *path != ""
+	renderMode := *project != "" && *path == ""
 	switch {
-	case ghMode && fileMode:
-		return fmt.Errorf("choose one: --secret/--gh-repo for a GitHub target, or --project/--path for a file target")
+	case ghMode && (fileMode || renderMode):
+		return fmt.Errorf("choose one: --secret/--gh-repo for a GitHub target, or --project for a file or rendered target")
 	case ghMode && (*ref == "" || *ghRepo == ""):
 		return fmt.Errorf("%s", targetUsage)
-	case fileMode && (*project == "" || *path == ""):
-		return fmt.Errorf("%s", targetUsage)
-	case !ghMode && !fileMode:
+	case renderMode && (*ghRepo == "" || *ghSecret == ""):
+		return fmt.Errorf("removing a rendered target needs --gh-repo and --gh-secret; removing a file target needs --path")
+	case !ghMode && !fileMode && !renderMode:
 		return fmt.Errorf("%s", targetUsage)
 	}
 
@@ -1874,6 +2614,37 @@ func runTargetRm(args []string) error {
 		return err
 	}
 	defer a.close()
+
+	if renderMode {
+		t, err := a.st.FindGHRenderTarget(*project, *ghRepo, *ghEnv, *ghSecret)
+		if err != nil {
+			return err
+		}
+		if t == nil {
+			return fmt.Errorf("no rendered target %s → %s in project %s — `signet target list --project %s` shows what is attached",
+				*ghSecret, *ghRepo, *project, *project)
+		}
+		cfg, err := t.GHRenderConfig()
+		if err != nil {
+			return err
+		}
+		if _, err := a.st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
+			if err := m.RemoveTarget(t.ID); err != nil {
+				return store.AuditRecord{}, err
+			}
+			return store.AuditRecord{
+				Actor: cliActor(), Action: "target.rm", TargetID: t.ID,
+				Details:   fmt.Sprintf("%s render (%d keys) → %s detached", *project, len(cfg.Keys), cfg.Destination()),
+				EventKind: store.KindTargetConfig, ActorRole: cliRole(),
+				Status: &store.AuditStatus{Outcome: store.OutcomeRemoved},
+			}, nil
+		}); err != nil {
+			return err
+		}
+		fmt.Printf("target removed: %s render → %s\n", *project, cfg.Destination())
+		fmt.Printf("the %s %s in %s is left in place — signet just stops updating it\n", cfg.Scope(), cfg.SecretName, cfg.Repo)
+		return nil
+	}
 
 	if fileMode {
 		// Normalized like import's, so the path that registered the target is
@@ -1926,13 +2697,14 @@ func runTargetRm(args []string) error {
 	if dest == "" {
 		dest = n
 	}
-	t, err := a.st.FindGHTarget(sec.ID, *ghRepo, dest)
+	t, err := a.st.FindGHTarget(sec.ID, *ghRepo, *ghEnv, dest)
 	if err != nil {
 		return err
 	}
+	cfg := store.GHConfig{Repo: *ghRepo, SecretName: dest, Environment: *ghEnv}
 	if t == nil {
-		return fmt.Errorf("no target %s/%s → %s (Actions secret %s) — `signet target list --secret %s` shows what is attached",
-			p, n, *ghRepo, dest, *ref)
+		return fmt.Errorf("no target %s/%s → %s (%s %s) — `signet target list --secret %s` shows what is attached",
+			p, n, *ghRepo, cfg.Scope(), dest, *ref)
 	}
 	if _, err := a.st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
 		if err := m.RemoveTarget(t.ID); err != nil {
@@ -1940,15 +2712,15 @@ func runTargetRm(args []string) error {
 		}
 		return store.AuditRecord{
 			Actor: cliActor(), Action: "target.rm", SecretID: sec.ID, TargetID: t.ID,
-			Details:   fmt.Sprintf("%s/%s → %s · Actions secret %s detached", p, n, *ghRepo, dest),
+			Details:   fmt.Sprintf("%s/%s → %s · %s %s detached", p, n, *ghRepo, cfg.Scope(), dest),
 			EventKind: store.KindTargetConfig, ActorRole: cliRole(),
 			Status: &store.AuditStatus{Outcome: store.OutcomeRemoved},
 		}, nil
 	}); err != nil {
 		return err
 	}
-	fmt.Printf("target removed: %s/%s → %s (Actions secret %s)\n", p, n, *ghRepo, dest)
-	fmt.Printf("the Actions secret %s in %s is left in place — signet just stops updating it\n", dest, *ghRepo)
+	fmt.Printf("target removed: %s/%s → %s (%s %s)\n", p, n, *ghRepo, cfg.Scope(), dest)
+	fmt.Printf("the %s %s in %s is left in place — signet just stops updating it\n", cfg.Scope(), dest, *ghRepo)
 	return nil
 }
 
@@ -1958,6 +2730,7 @@ func runSync(args []string) error {
 	fs := flag.NewFlagSet("sync", flag.ExitOnError)
 	ref := fs.String("secret", "", "only sync this secret (project/NAME)")
 	check := fs.Bool("check", false, "preflight every GitHub destination without pushing")
+	allowShrink := fs.Bool("allow-shrink", false, "permit a rendered target to deliver fewer keys than its last push")
 	fs.Parse(args)
 	a, err := setup()
 	if err != nil {
@@ -1998,20 +2771,45 @@ func runSync(args []string) error {
 	if err != nil {
 		return err
 	}
+	// Rendered targets belong to a project rather than a secret, so they are
+	// collected separately. A --secret filter keeps the ones that carry that
+	// key: the blob is delivered whole, so syncing one of its keys means
+	// delivering the file that contains it.
+	renderTargets, err := renderTargetsToSync(a.st, *ref, candidates)
+	if err != nil {
+		return err
+	}
+	// A waiver has to name what it waives. --allow-shrink disarms the one guard
+	// standing between a shortened key set and a live environment, and as a
+	// run-wide switch it disarmed it for every rendered target the run touched
+	// — including the ones the operator was not thinking about. Narrowing the
+	// run is what makes the waiver specific, so it is required rather than
+	// assumed.
+	if *allowShrink && len(renderTargets) > 1 {
+		return fmt.Errorf("--allow-shrink would disarm the shrink guard for all %d rendered targets in this run, not just the one you mean — narrow it with `--secret <project>/<NAME>`", len(renderTargets))
+	}
 
 	if *check {
 		gh, err := checkClient(a)
 		if err != nil {
 			return err
 		}
-		return syncCheck(gh, toSync, allTargets)
+		if err := syncCheck(gh, toSync, allTargets, renderTargets); err != nil {
+			return err
+		}
+		// The grant is only half of what a rendered push needs. Reachability says
+		// the credential may write the destination; it says nothing about whether
+		// there is a complete blob to write, and a run that passes the first and
+		// fails the second is exactly the case --check exists to find before a
+		// deploy does. Rendering here costs nothing over the wire.
+		return checkRenders(a, renderTargets)
 	}
 
 	pushed, failed := 0, 0
 	// The credential is resolved inside this guard, not above it: the fallback
 	// decrypts the vault's root credential, and doing that for a run with no
 	// destinations would record an authentication that never happened.
-	if len(toSync) > 0 {
+	if len(toSync) > 0 || len(renderTargets) > 0 {
 		tok, err := ops.ResolveGHToken(a.st, a.key, a.cfg.GitHubToken, cliActor(), cliRole())
 		if err != nil {
 			return err
@@ -2050,10 +2848,119 @@ func runSync(args []string) error {
 				}
 			}
 		}
+
+		// Resolved once per project rather than once per target: the resolve
+		// decrypts every secret in the project, and two targets on the same
+		// project would pay for that twice to reach the same answer.
+		resolved := map[string]map[string]string{}
+		for i := range renderTargets {
+			t := &renderTargets[i]
+			// Resolved leniently and handed to PushRender, which refuses on any
+			// gap. The strict view would fail the whole run over a broken secret
+			// in the project that this target does not even manage.
+			want, cached := resolved[t.Project]
+			if !cached {
+				v, _, err := a.projectValues(t.Project)
+				if err != nil {
+					return err
+				}
+				resolved[t.Project] = v
+				want = v
+			}
+			res, err := syncpkg.PushRender(ctx, a.st, a.key, gh, t, want,
+				syncpkg.RenderPushOptions{AllowShrink: *allowShrink}, cliActor(), cliRole())
+			if err != nil {
+				return err
+			}
+			if res.State == "in sync" {
+				pushed++
+				fmt.Printf("  ✓ %s render → %s\n", t.Project, res.Dest)
+				if res.Note != "" {
+					fmt.Printf("    note: %s\n", res.Note)
+				}
+				continue
+			}
+			failed++
+			if res.Hint != "" {
+				fmt.Printf("  ✗ %s render → %s: %s\n", t.Project, res.Dest, res.Hint)
+				fmt.Printf("    GitHub said: %s\n", res.Err)
+			} else {
+				fmt.Printf("  ✗ %s render → %s: %s\n", t.Project, res.Dest, res.Err)
+			}
+		}
 	}
 	fmt.Printf("sync complete: %d pushed, %d failed\n", pushed, failed)
 	if failed > 0 {
 		os.Exit(1)
+	}
+	return nil
+}
+
+// renderTargetsToSync selects the rendered targets a run covers. An unfiltered
+// run takes them all; a --secret filter keeps those whose key set contains that
+// secret, because the only way to sync one key of a blob is to deliver the
+// blob.
+func renderTargetsToSync(st *store.Store, ref string, candidates []store.Secret) ([]store.Target, error) {
+	all, err := st.RenderTargets()
+	if err != nil {
+		return nil, err
+	}
+	if ref == "" {
+		return all, nil
+	}
+	// One candidate, because a --secret filter is what put us here.
+	sec := candidates[0]
+	var out []store.Target
+	for _, t := range all {
+		if t.Project != sec.Project {
+			continue
+		}
+		cfg, err := t.GHRenderConfig()
+		if err != nil {
+			return nil, err
+		}
+		if cfg.Manages(sec.Name) {
+			out = append(out, t)
+		}
+	}
+	return out, nil
+}
+
+// checkRenders answers, for every rendered target a run covers, whether there
+// is actually a blob to deliver — the half of the question syncCheck cannot ask
+// because reachability is a property of the credential and completeness is a
+// property of the vault.
+//
+// It reports every failing target rather than stopping at the first: an
+// operator checking before a deploy wants the whole list, and refusing one at a
+// time turns a single fix into as many runs as there are gaps.
+func checkRenders(a *app, renderTargets []store.Target) error {
+	resolved := map[string]map[string]string{}
+	var refused int
+	for i := range renderTargets {
+		t := &renderTargets[i]
+		want, cached := resolved[t.Project]
+		if !cached {
+			v, _, err := a.projectValues(t.Project)
+			if err != nil {
+				return err
+			}
+			resolved[t.Project] = v
+			want = v
+		}
+		cfg, err := t.GHRenderConfig()
+		if err != nil {
+			return err
+		}
+		if _, rerr := syncpkg.RenderBlob(cfg, t.Project, want); rerr != nil {
+			refused++
+			fmt.Printf("  ✗ %s render → %s: %s\n", t.Project, cfg.Destination(), rerr)
+			continue
+		}
+		fmt.Printf("  ✓ %s render → %s (%d keys) would deliver\n", t.Project, cfg.Destination(), len(cfg.Keys))
+	}
+	if refused > 0 {
+		return fmt.Errorf("%d rendered target(s) would be refused by `signet sync` — the destination is reachable, the render is not complete", refused)
 	}
 	return nil
 }
@@ -2081,12 +2988,17 @@ func checkClient(a *app) (*syncpkg.GHClient, error) {
 // Failure comes back as an error rather than an os.Exit so that the caller's
 // deferred close still runs on a vault this command has just written a
 // secret_reveal to, and so the whole thing can be driven from a test.
-func syncCheck(gh *syncpkg.GHClient, toSync []store.Secret, allTargets []store.Target) error {
+func syncCheck(gh *syncpkg.GHClient, toSync []store.Secret, allTargets []store.Target, renderTargets []store.Target) error {
 	wanted := map[string]bool{}
 	for i := range toSync {
 		wanted[toSync[i].ID] = true
 	}
-	counts := map[string]int{}
+	// Keyed by repository *and* environment, because that pair is what the
+	// grant is checked against: an environment has its own sealing key behind
+	// its own path, so a repository that answers cannot vouch for an
+	// environment inside it, and collapsing the two would report a destination
+	// as reachable on the strength of a probe that never touched it.
+	counts := map[ghDest]int{}
 	for _, t := range allTargets {
 		if t.Kind != "gh-actions" || !wanted[t.SecretID] {
 			continue
@@ -2095,48 +3007,60 @@ func syncCheck(gh *syncpkg.GHClient, toSync []store.Secret, allTargets []store.T
 		if err != nil {
 			return err
 		}
-		counts[cfg.Repo]++
+		counts[ghDest{cfg.Repo, cfg.Environment}]++
+	}
+	for _, t := range renderTargets {
+		cfg, err := t.GHRenderConfig()
+		if err != nil {
+			return err
+		}
+		counts[ghDest{cfg.Repo, cfg.Environment}]++
 	}
 	if len(counts) == 0 {
 		fmt.Println("no GitHub destinations to check")
 		return nil
 	}
-	repos := make([]string, 0, len(counts))
-	for repo := range counts {
-		repos = append(repos, repo)
+	dests := make([]ghDest, 0, len(counts))
+	for d := range counts {
+		dests = append(dests, d)
 	}
-	sort.Strings(repos)
+	sort.Slice(dests, func(i, j int) bool {
+		if dests[i].repo != dests[j].repo {
+			return dests[i].repo < dests[j].repo
+		}
+		return dests[i].env < dests[j].env
+	})
 
 	// Blocked and inconclusive are counted apart, because they mean opposite
 	// things: one is a destination that will fail until a person fixes it, the
 	// other is a question GitHub declined to answer just now. Failing the run on
 	// the second would turn a rate limit into a report of misconfigured grants.
 	var blocked, unknown int
-	for _, repo := range repos {
-		probe := probeRepo(gh, repo)
-		// A refused credential is the answer for every remaining repository, and
-		// it is not about any of them — which is why the message deliberately
-		// names no repo, and why nothing is appended here that would.
+	for _, d := range dests {
+		probe := probeRepo(gh, d.repo, d.env)
+		// A refused credential is the answer for every remaining destination,
+		// and it is not about any of them — which is why the message
+		// deliberately names none, and why nothing is appended here that would.
 		if probe.Access == syncpkg.AccessRejected {
-			return fmt.Errorf("%s (stopped before checking the remaining repositories — they would answer the same)", probe.Message())
+			return fmt.Errorf("%s (stopped before checking the remaining destinations — they would answer the same)", probe.Message())
 		}
 		plural := "secrets"
-		if counts[repo] == 1 {
+		if counts[d] == 1 {
 			plural = "secret"
 		}
 		switch {
 		case probe.Access == syncpkg.AccessOK:
-			fmt.Printf("  ✓ %s (%d %s)\n", repo, counts[repo], plural)
+			fmt.Printf("  ✓ %s (%d %s)\n", d, counts[d], plural)
 		case probe.Blocked():
 			blocked++
-			fmt.Printf("  ✗ %s (%d %s): %s\n", repo, counts[repo], plural, probe.Message())
+			fmt.Printf("  ✗ %s (%d %s): %s\n", d, counts[d], plural, probe.Message())
 		default:
 			unknown++
-			fmt.Printf("  ? %s (%d %s): %s\n", repo, counts[repo], plural, probe.Message())
+			fmt.Printf("  ? %s (%d %s): %s\n", d, counts[d], plural, probe.Message())
 		}
 	}
 
-	summary := fmt.Sprintf("preflight complete: %d of %d repositories reachable", len(repos)-blocked-unknown, len(repos))
+	summary := fmt.Sprintf("preflight complete: %d of %d destinations reachable", len(dests)-blocked-unknown, len(dests))
 	if unknown > 0 {
 		summary += fmt.Sprintf(", %d inconclusive", unknown)
 	}
@@ -2145,17 +3069,30 @@ func syncCheck(gh *syncpkg.GHClient, toSync []store.Secret, allTargets []store.T
 	// and left at that: it says nothing about the grant, so failing on it would
 	// make an unrelated GitHub hiccup indistinguishable from a real problem.
 	if blocked > 0 {
-		return fmt.Errorf("%d of %d repositories are unreachable — sync would fail against them", blocked, len(repos))
+		return fmt.Errorf("%d of %d destinations are unreachable — sync would fail against them", blocked, len(dests))
 	}
 	return nil
 }
 
-// probeRepo runs one preflight under its own deadline, so a repository that
+// ghDest is one probed destination: a repository, or an environment within one.
+type ghDest struct {
+	repo string
+	env  string
+}
+
+func (d ghDest) String() string {
+	if d.env == "" {
+		return d.repo
+	}
+	return d.repo + " · " + d.env
+}
+
+// probeRepo runs one preflight under its own deadline, so a destination that
 // hangs costs its own timeout rather than the rest of the run's.
-func probeRepo(gh *syncpkg.GHClient, repo string) syncpkg.RepoProbe {
+func probeRepo(gh *syncpkg.GHClient, repo, env string) syncpkg.RepoProbe {
 	ctx, cancel := context.WithTimeout(context.Background(), preflightTimeout)
 	defer cancel()
-	return gh.CheckRepoAccess(ctx, repo)
+	return gh.CheckRepoAccess(ctx, repo, env)
 }
 
 // ---- status -----------------------------------------------------------------
@@ -2184,7 +3121,12 @@ func runStatus(args []string) error {
 		cfg   store.FileConfig
 		drift syncpkg.FileDrift
 	}
+	type renderInfo struct {
+		cfg   store.GHRenderConfig
+		state string
+	}
 	fileByProject := map[string][]fileInfo{}
+	renderByProject := map[string][]renderInfo{}
 	for p := range projects {
 		// Lenient: status is the view an operator reaches for when something is
 		// wrong, so one unresolvable derivation must not take the whole listing
@@ -2203,6 +3145,17 @@ func runStatus(args []string) error {
 				return err
 			}
 			fileByProject[p] = append(fileByProject[p], fileInfo{cfg, syncpkg.CheckFile(cfg.Path, want, cfg.Keys)})
+		}
+		rts, err := a.st.RenderTargetsForProject(p)
+		if err != nil {
+			return err
+		}
+		for i := range rts {
+			cfg, err := rts[i].GHRenderConfig()
+			if err != nil {
+				return err
+			}
+			renderByProject[p] = append(renderByProject[p], renderInfo{cfg, renderState(&rts[i], cfg, want, a.key)})
 		}
 	}
 
@@ -2242,10 +3195,19 @@ func runStatus(args []string) error {
 			if derr != nil {
 				ghState = "unresolved"
 			}
-			tgt = append(tgt, fmt.Sprintf("gh:%s→%s [%s]", cfg.Repo, cfg.SecretName, ghState))
+			tgt = append(tgt, fmt.Sprintf("gh:%s→%s [%s]", cfg.Repo+dotted(cfg.Environment), cfg.SecretName, ghState))
+		}
+		// A rendered target is delivered whole, so it annotates every secret it
+		// carries with the same state — the blob is current or it is not, and no
+		// key inside it can be current on its own.
+		for _, ri := range renderByProject[sec.Project] {
+			if !ri.cfg.Manages(sec.Name) {
+				continue
+			}
+			tgt = append(tgt, fmt.Sprintf("gh-render:%s→%s [%s]", ri.cfg.Repo+dotted(ri.cfg.Environment), ri.cfg.SecretName, ri.state))
 		}
 		for _, fi := range fileByProject[sec.Project] {
-			if !contains(fi.cfg.Keys, sec.Name) {
+			if !fi.cfg.Manages(sec.Name) {
 				continue
 			}
 			// Shared with `target list` rather than recomputed: this had its own
@@ -2275,9 +3237,13 @@ func expiresIn(expiresAt string) string {
 	return fmt.Sprintf("%s (%dd)", t.Format("2006-01-02"), int(time.Until(t).Hours()/24))
 }
 
-func contains(xs []string, s string) bool {
-	i := sort.SearchStrings(xs, s)
-	return i < len(xs) && xs[i] == s
+// dotted renders an optional environment as a suffix, so status's compact
+// target notation can carry the scope without a separate column.
+func dotted(env string) string {
+	if env == "" {
+		return ""
+	}
+	return "·" + env
 }
 
 // ---- audit ------------------------------------------------------------------

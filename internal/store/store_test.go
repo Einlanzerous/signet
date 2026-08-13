@@ -58,7 +58,7 @@ func mustAddGHTarget(t *testing.T, s *Store, secretID, repo, secretName string) 
 	t.Helper()
 	var tgt *Target
 	if _, err := s.Mutate(func(m *Mutation) (AuditRecord, error) {
-		added, err := m.AddGHTarget(secretID, repo, secretName)
+		added, err := m.AddGHTarget(secretID, repo, "", secretName)
 		if err != nil {
 			return AuditRecord{}, err
 		}
@@ -289,14 +289,14 @@ func TestFindAndRemoveTargets(t *testing.T) {
 	mustAddGHTarget(t, s, sec.ID, "owner/repo", "OTHER_NAME")
 	file, _ := mustUpsertFileTarget(t, s, "proj", "/tmp/x/.env", []string{"KEY"}, "0600")
 
-	found, err := s.FindGHTarget(sec.ID, "owner/repo", "KEY")
+	found, err := s.FindGHTarget(sec.ID, "owner/repo", "", "KEY")
 	if err != nil || found == nil || found.ID != gh.ID {
 		t.Fatalf("gh lookup wrong: %+v err=%v", found, err)
 	}
-	if miss, err := s.FindGHTarget(sec.ID, "owner/repo", "NOPE"); err != nil || miss != nil {
+	if miss, err := s.FindGHTarget(sec.ID, "owner/repo", "", "NOPE"); err != nil || miss != nil {
 		t.Fatalf("unknown secret_name should not match: %+v err=%v", miss, err)
 	}
-	if miss, err := s.FindGHTarget(sec.ID, "other/repo", "KEY"); err != nil || miss != nil {
+	if miss, err := s.FindGHTarget(sec.ID, "other/repo", "", "KEY"); err != nil || miss != nil {
 		t.Fatalf("unknown repo should not match: %+v err=%v", miss, err)
 	}
 	if f, err := s.FindFileTarget("proj", "/tmp/x/.env"); err != nil || f == nil || f.ID != file.ID {
@@ -317,7 +317,7 @@ func TestFindAndRemoveTargets(t *testing.T) {
 	if cfg, _ := remaining[0].GHConfig(); cfg.SecretName != "OTHER_NAME" {
 		t.Fatalf("removed the wrong target: %+v", cfg)
 	}
-	if gone, err := s.FindGHTarget(sec.ID, "owner/repo", "KEY"); err != nil || gone != nil {
+	if gone, err := s.FindGHTarget(sec.ID, "owner/repo", "", "KEY"); err != nil || gone != nil {
 		t.Fatalf("removed target still found: %+v", gone)
 	}
 	// Removing something already gone is an error, not a silent success.
@@ -334,7 +334,7 @@ func TestRemovedTargetKeepsAuditHistory(t *testing.T) {
 
 	var tgt *Target
 	if _, err := s.Mutate(func(m *Mutation) (AuditRecord, error) {
-		added, err := m.AddGHTarget(sec.ID, "owner/repo", "KEY")
+		added, err := m.AddGHTarget(sec.ID, "owner/repo", "", "KEY")
 		if err != nil {
 			return AuditRecord{}, err
 		}
@@ -481,7 +481,7 @@ func TestAuditFailureRollsBackMutation(t *testing.T) {
 		s := testStore(t)
 		sec := mustCreateSecret(t, s, "proj", "KEY", "", true)
 		if _, err := s.Mutate(func(m *Mutation) (AuditRecord, error) {
-			if _, err := m.AddGHTarget(sec.ID, "owner/repo", "KEY"); err != nil {
+			if _, err := m.AddGHTarget(sec.ID, "owner/repo", "", "KEY"); err != nil {
 				return AuditRecord{}, err
 			}
 			return unrecordable, nil
@@ -507,7 +507,7 @@ func TestAuditFailureRollsBackMutation(t *testing.T) {
 			t.Fatal("an unrecordable mutation should fail")
 		}
 		// The worst case: a destination detached with no record of the detach.
-		found, err := s.FindGHTarget(sec.ID, "owner/repo", "KEY")
+		found, err := s.FindGHTarget(sec.ID, "owner/repo", "", "KEY")
 		if err != nil || found == nil {
 			t.Fatalf("target detached without a ledger entry: %+v err=%v", found, err)
 		}
@@ -558,7 +558,7 @@ func TestMutateValueWithholdsValueOnRollback(t *testing.T) {
 	s := testStore(t)
 	sec := mustCreateSecret(t, s, "proj", "KEY", "", true)
 	tgt, _, err := MutateValue(s, func(m *Mutation) (*Target, AuditRecord, error) {
-		added, err := m.AddGHTarget(sec.ID, "owner/repo", "KEY")
+		added, err := m.AddGHTarget(sec.ID, "owner/repo", "", "KEY")
 		if err != nil {
 			return nil, AuditRecord{}, err
 		}
@@ -663,14 +663,14 @@ func TestConcurrentGHTargetAddStaysUnique(t *testing.T) {
 				st = b
 			}
 			_, err := st.Mutate(func(m *Mutation) (AuditRecord, error) {
-				dup, err := m.FindGHTarget(sec.ID, "owner/repo", "KEY")
+				dup, err := m.FindGHTarget(sec.ID, "owner/repo", "", "KEY")
 				if err != nil {
 					return AuditRecord{}, err
 				}
 				if dup != nil {
 					return AuditRecord{}, errors.New("already exists")
 				}
-				if _, err := m.AddGHTarget(sec.ID, "owner/repo", "KEY"); err != nil {
+				if _, err := m.AddGHTarget(sec.ID, "owner/repo", "", "KEY"); err != nil {
 					return AuditRecord{}, err
 				}
 				return testRecord("target add"), nil

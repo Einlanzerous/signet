@@ -39,13 +39,34 @@ type Pair struct {
 // Header is the first line of every env file signet creates.
 const Header = "# managed by signet — managed values are overwritten on render; other lines are kept"
 
+// BlobHeader is the first line of a whole-file render delivered as the value of
+// a single secret (see RenderBlob).
+//
+// It has to differ from Header, because the promise does. A file target is
+// merged into and keeps lines signet does not manage; a blob is regenerated in
+// full on every sync and materialized by whatever consumes the secret, so a
+// hand-edit to the file it lands in survives exactly until the next deploy.
+// Carrying Header onto a blob would put a reassurance about preserved lines at
+// the top of the one file that preserves none.
+const BlobHeader = "# managed by signet — generated in full on every sync; edits to this file are lost on the next deploy"
+
 // priorHeaders is every header signet has ever written, current one first. The
 // line states a promise about what render does to the file, so when the promise
 // changes the stale line is replaced rather than left standing — but only when it
 // is one of these exactly, so a hand-written line is never mistaken for one.
 // Changing Header means adding the old text here, not editing it.
+//
+// BlobHeader is in this list even though it is not a prior spelling of Header,
+// because the two promises are opposites and a file can carry the wrong one. A
+// blob materialized to a path that a file target also renders into arrives
+// saying "edits to this file are lost on the next deploy"; once RenderInto is
+// merging into that path, the opposite is true and the line has to be replaced
+// rather than preserved verbatim. Leaving it would put the most misleading
+// sentence available at the top of a file whose unmanaged lines are in fact
+// being kept.
 var priorHeaders = []string{
 	Header,
+	BlobHeader,
 	"# managed by signet — do not edit by hand",
 }
 
@@ -406,11 +427,24 @@ func RenderInto(path string, pairs []Pair, prune bool) (content string, unmanage
 // It describes an entire file, so it is for files signet is creating. Rendering
 // over a file that already exists goes through RenderInto — this drops
 // everything not in pairs.
-func Render(pairs []Pair) string {
+func Render(pairs []Pair) string { return render(Header, pairs) }
+
+// RenderBlob produces the content of a whole-file render carried as one secret
+// value: the same canonical shape as Render, under BlobHeader.
+//
+// Byte-stability across calls is load bearing here in a way it is not for a
+// file on disk. This output is hashed to decide whether the destination has
+// drifted, and the destination's value can never be read back to check — so a
+// render that reordered keys between two runs would report drift that does not
+// exist, on a destination nobody can inspect to disprove it. Sorting is what
+// makes the digest a fact about the values rather than about map iteration.
+func RenderBlob(pairs []Pair) string { return render(BlobHeader, pairs) }
+
+func render(header string, pairs []Pair) string {
 	sorted := append([]Pair(nil), pairs...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Key < sorted[j].Key })
 	var b strings.Builder
-	b.WriteString(Header + "\n")
+	b.WriteString(header + "\n")
 	for _, p := range sorted {
 		b.WriteString(p.Key)
 		b.WriteByte('=')

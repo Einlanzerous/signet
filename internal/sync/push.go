@@ -10,14 +10,22 @@ import (
 	"github.com/Einlanzerous/signet/internal/store"
 )
 
-// PushResult records the outcome of pushing one gh-actions target.
+// PushResult records the outcome of pushing one GitHub target.
 type PushResult struct {
 	TargetID string `json:"target_id"`
 	Repo     string `json:"repo"`
-	Secret   string `json:"secret_name"`
-	State    string `json:"state"` // in sync | error
-	Note     string `json:"note,omitempty"`
-	Err      string `json:"error,omitempty"`
+	// Environment is the deployment environment the secret was written under,
+	// empty for a repository secret.
+	Environment string `json:"environment,omitempty"`
+	Secret      string `json:"secret_name"`
+	// Dest is the human-readable destination, carried rather than recomposed.
+	// Callers were rebuilding a store.GHConfig from the three fields above for
+	// no reason other than to call Destination() on it, which put the one
+	// formatting rule that must not vary in two more places.
+	Dest  string `json:"destination"`
+	State string `json:"state"` // in sync | error
+	Note  string `json:"note,omitempty"`
+	Err   string `json:"error,omitempty"`
 	// Hint is the fix for a failure signet could attribute to a cause — a
 	// repository missing from the PAT's grant list, most often. It accompanies
 	// Err rather than replacing it: the ledger keeps the transport detail, and
@@ -104,13 +112,13 @@ func PushSecret(ctx context.Context, st *store.Store, key []byte, gh *GHClient, 
 		if err != nil {
 			return nil, err
 		}
-		res := PushResult{TargetID: t.ID, Repo: cfg.Repo, Secret: cfg.SecretName}
+		res := PushResult{TargetID: t.ID, Repo: cfg.Repo, Environment: cfg.Environment, Secret: cfg.SecretName, Dest: cfg.Destination()}
 
 		// Out-of-band change detection before we overwrite. A confirmed
 		// out-of-band change makes this push a reconciliation of a drifted
 		// destination, not a routine fan-out — the ledger records it as such.
 		kind := store.KindSyncPush
-		if drift, derr := gh.CheckGHDrift(ctx, cfg.Repo, cfg.SecretName, t.LastPushedAt); derr == nil && drift == GHOutOfBand && t.LastPushedAt != "" {
+		if drift, derr := gh.CheckGHDrift(ctx, cfg.Repo, cfg.Environment, cfg.SecretName, t.LastPushedAt); derr == nil && drift == GHOutOfBand && t.LastPushedAt != "" {
 			res.Note = "destination changed out-of-band since last push — re-sealing"
 			kind = store.KindDriftReconcile
 		}
@@ -128,17 +136,21 @@ func PushSecret(ctx context.Context, st *store.Store, key []byte, gh *GHClient, 
 		if err != nil {
 			res.State = "error"
 			res.Err = err.Error()
-			res.Hint = AccessHint(cfg.Repo, err)
+			res.Hint = AccessHint(cfg.Repo, cfg.Environment, err)
 			status.Outcome = store.OutcomeFailed
 			recordPush(st, &res, store.AuditRecord{
 				Actor: actor, Action: "sync.push.failed", SecretID: sec.ID, TargetID: t.ID,
-				Details:   fmt.Sprintf("%s → %s/%s: %s", sec.Name, cfg.Repo, cfg.SecretName, err),
+				Details:   fmt.Sprintf("%s → %s: %s", sec.Name, cfg.Destination(), err),
 				EventKind: kind, ActorRole: role, Status: status,
 			}, "error", err.Error(), nil, "")
 		} else {
 			res.State = "in sync"
 			status.Outcome = store.OutcomeDelivered
-			detail := fmt.Sprintf("sealed & pushed %s → %s · Actions secret %s · %s", sec.Name, cfg.Repo, cfg.SecretName, provenance)
+			// Destination() rather than repo + scope + name by hand: the
+			// environment is what makes two otherwise identical destinations
+			// different live secrets, and formatting it here is how it went
+			// missing from the one record that outlives the terminal.
+			detail := fmt.Sprintf("sealed & pushed %s → %s · %s · %s", sec.Name, cfg.Destination(), cfg.Scope(), provenance)
 			if res.Note != "" {
 				detail += " (" + res.Note + ")"
 			}
@@ -158,7 +170,7 @@ func nowRFC3339() string { return time.Now().UTC().Format(time.RFC3339) }
 // call that determined the outcome: the failing request, or the PUT that
 // delivered it. Sealing is local, so a seal failure reports no HTTP status.
 func pushOne(ctx context.Context, gh *GHClient, cfg store.GHConfig, plaintext []byte) (CallStat, error) {
-	pk, stat, err := gh.RepoPublicKey(ctx, cfg.Repo)
+	pk, stat, err := gh.RepoPublicKey(ctx, cfg.Repo, cfg.Environment)
 	if err != nil {
 		return stat, err
 	}
@@ -166,5 +178,5 @@ func pushOne(ctx context.Context, gh *GHClient, cfg store.GHConfig, plaintext []
 	if err != nil {
 		return CallStat{}, err
 	}
-	return gh.PutSecret(ctx, cfg.Repo, cfg.SecretName, sealed, pk.KeyID)
+	return gh.PutSecret(ctx, cfg.Repo, cfg.Environment, cfg.SecretName, sealed, pk.KeyID)
 }

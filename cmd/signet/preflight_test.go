@@ -117,11 +117,11 @@ func TestSyncCheckPassesWhenEveryRepoIsReachable(t *testing.T) {
 	})
 
 	var err error
-	out := captureStdout(t, func() { err = syncCheck(gh, secrets, targets) })
+	out := captureStdout(t, func() { err = syncCheck(gh, secrets, targets, nil) })
 	if err != nil {
 		t.Fatalf("all reachable but check failed: %v", err)
 	}
-	if !strings.Contains(out, "2 of 2 repositories reachable") {
+	if !strings.Contains(out, "2 of 2 destinations reachable") {
 		t.Fatalf("summary wrong: %q", out)
 	}
 }
@@ -136,7 +136,7 @@ func TestSyncCheckFailsOnAMissingGrant(t *testing.T) {
 	})
 
 	var err error
-	out := captureStdout(t, func() { err = syncCheck(gh, secrets, targets) })
+	out := captureStdout(t, func() { err = syncCheck(gh, secrets, targets, nil) })
 	if err == nil {
 		t.Fatal("an unreachable repo did not fail the check")
 	}
@@ -161,7 +161,7 @@ func TestSyncCheckDoesNotFailOnAnInconclusiveProbe(t *testing.T) {
 	gh := fakeGitHub(t, map[string]func(http.ResponseWriter){"o/throttled": throttled})
 
 	var err error
-	out := captureStdout(t, func() { err = syncCheck(gh, secrets, targets) })
+	out := captureStdout(t, func() { err = syncCheck(gh, secrets, targets, nil) })
 	if err != nil {
 		t.Fatalf("an inconclusive probe failed the run: %v", err)
 	}
@@ -188,7 +188,7 @@ func TestSyncCheckStopsOnARefusedCredential(t *testing.T) {
 	gh := fakeGitHub(t, map[string]func(http.ResponseWriter){"o/aaa": reject, "o/bbb": reject})
 
 	var err error
-	captureStdout(t, func() { err = syncCheck(gh, secrets, targets) })
+	captureStdout(t, func() { err = syncCheck(gh, secrets, targets, nil) })
 	if err == nil {
 		t.Fatal("a refused credential did not fail the check")
 	}
@@ -209,7 +209,7 @@ func TestSyncCheckWithNoDestinations(t *testing.T) {
 	gh := fakeGitHub(t, nil)
 
 	var err error
-	out := captureStdout(t, func() { err = syncCheck(gh, secrets, targets) })
+	out := captureStdout(t, func() { err = syncCheck(gh, secrets, targets, nil) })
 	if err != nil {
 		t.Fatalf("nothing to check should not fail: %v", err)
 	}
@@ -236,14 +236,14 @@ func TestPreflightGHRepoClearsOnlyWhenNothingBlocks(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			gh := fakeGitHub(t, map[string]func(http.ResponseWriter){"o/r": tc.respond})
-			if got := preflightGHRepo(gh, "o/r"); got != tc.want {
+			if got := preflightGHRepo(gh, "o/r", ""); got != tc.want {
 				t.Fatalf("clear = %v, want %v", got, tc.want)
 			}
 		})
 	}
 
 	// No credential resolved: nothing was asked, so nothing is known against it.
-	if !preflightGHRepo(nil, "o/r") {
+	if !preflightGHRepo(nil, "o/r", "") {
 		t.Fatal("a skipped preflight should leave the path clear")
 	}
 }

@@ -72,7 +72,7 @@ func TestGHClientPushAndDrift(t *testing.T) {
 	c.BaseURL = srv.URL
 	ctx := context.Background()
 
-	pk, pkStat, err := c.RepoPublicKey(ctx, "o/r")
+	pk, pkStat, err := c.RepoPublicKey(ctx, "o/r", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func TestGHClientPushAndDrift(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	putStat, err := c.PutSecret(ctx, "o/r", "MY_SECRET", sealed, pk.KeyID)
+	putStat, err := c.PutSecret(ctx, "o/r", "", "MY_SECRET", sealed, pk.KeyID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +95,7 @@ func TestGHClientPushAndDrift(t *testing.T) {
 	}
 
 	// Drift: pushed after remote update → in sync.
-	d, err := c.CheckGHDrift(ctx, "o/r", "MY_SECRET", "2026-07-01T12:00:30Z")
+	d, err := c.CheckGHDrift(ctx, "o/r", "", "MY_SECRET", "2026-07-01T12:00:30Z")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,12 +103,12 @@ func TestGHClientPushAndDrift(t *testing.T) {
 		t.Fatalf("want in sync, got %q", d)
 	}
 	// Drift: remote updated well after our push → out of band.
-	d, _ = c.CheckGHDrift(ctx, "o/r", "MY_SECRET", "2026-06-01T00:00:00Z")
+	d, _ = c.CheckGHDrift(ctx, "o/r", "", "MY_SECRET", "2026-06-01T00:00:00Z")
 	if d != GHOutOfBand {
 		t.Fatalf("want drift, got %q", d)
 	}
 	// Missing secret.
-	d, err = c.CheckGHDrift(ctx, "o/r", "ABSENT", "2026-06-01T00:00:00Z")
+	d, err = c.CheckGHDrift(ctx, "o/r", "", "ABSENT", "2026-06-01T00:00:00Z")
 	if err != nil {
 		t.Fatal(err)
 	}

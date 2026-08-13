@@ -93,7 +93,7 @@ func seedGHTarget(t *testing.T, st *store.Store, secretID, repo, secretName stri
 	t.Helper()
 	var tgt *store.Target
 	if _, err := st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
-		added, err := m.AddGHTarget(secretID, repo, secretName)
+		added, err := m.AddGHTarget(secretID, repo, "", secretName)
 		if err != nil {
 			return store.AuditRecord{}, err
 		}
@@ -675,7 +675,7 @@ func TestMirrorNeverReportsAnUnresolvableSecretInSync(t *testing.T) {
 		if err := m.SetDerivation(sec.ID, "postgres://u:{{construct-server/MISSING}}@h/db"); err != nil {
 			return store.AuditRecord{}, err
 		}
-		if _, err := m.AddGHTarget(sec.ID, "owner/repo", "DSN"); err != nil {
+		if _, err := m.AddGHTarget(sec.ID, "owner/repo", "", "DSN"); err != nil {
 			return store.AuditRecord{}, err
 		}
 		return store.AuditRecord{Actor: "test", Action: "seed", SecretID: sec.ID,
