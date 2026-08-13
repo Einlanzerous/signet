@@ -413,3 +413,41 @@ func TestPushRenderRefusesATargetThatManagesNoKeys(t *testing.T) {
 		t.Fatalf("--allow-shrink permitted an empty render: %+v / %q", res, string(*delivered))
 	}
 }
+
+// The ledger is the only account of what reached a destination whose value can
+// never be read back, and an environment is what makes two otherwise identical
+// destinations different live secrets. Recording the scope but not the name
+// wrote two of them down identically.
+func TestASuccessfulRenderRecordsTheEnvironmentItWentTo(t *testing.T) {
+	gh, _, _, _ := renderServer(t)
+	st, key, target := renderFixture(t, gh.BaseURL, []string{"ALPHA"}, map[string]string{"ALPHA": "a"})
+
+	res, err := PushRender(context.Background(), st, key, gh, target,
+		map[string]string{"ALPHA": "a"}, RenderPushOptions{}, "test", store.RoleHuman)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.State != "in sync" {
+		t.Fatalf("push did not succeed: %+v", res)
+	}
+	if !strings.Contains(res.Dest, "home-server") {
+		t.Fatalf("the result does not carry the environment: %q", res.Dest)
+	}
+
+	entries, err := st.ListAudit(50, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var detail string
+	for _, e := range entries {
+		if e.Action == "sync.push" {
+			detail = e.Details
+		}
+	}
+	if detail == "" {
+		t.Fatal("no sync.push entry in the ledger")
+	}
+	if !strings.Contains(detail, "home-server") {
+		t.Fatalf("the ledger entry does not name the environment it wrote to: %q", detail)
+	}
+}

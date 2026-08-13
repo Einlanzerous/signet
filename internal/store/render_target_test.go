@@ -211,3 +211,80 @@ func TestMigrationPreservesExistingTargets(t *testing.T) {
 		t.Fatalf("FileTargetsForProject = %v (err %v)", got, err)
 	}
 }
+
+// A refusal is a local decision that touches nothing at the destination, so it
+// must not stand in front of the fact an operator actually needs: that the
+// environment is holding values the vault has moved on from. Reporting "error"
+// for both left one refused render hiding drift until some later sync happened
+// to succeed.
+func TestARefusedPushDoesNotHideDrift(t *testing.T) {
+	refused := Target{
+		LastState: TargetRefused, LastError: "would drop BETA",
+		LastPushedAt: "2026-08-01T00:00:00Z", LastPushedDigest: "aaaaaaaaaaaa",
+	}
+	if got := refused.GHState(nil, "bbbbbbbbbbbb"); got != "drift" {
+		t.Fatalf("a refused target reports %q, hiding the drift underneath it", got)
+	}
+	if got := refused.GHState(nil, "aaaaaaaaaaaa"); got != "in sync" {
+		t.Fatalf("a refused target whose blob is unchanged reports %q", got)
+	}
+
+	// A delivery that was attempted and failed is a different fact, and still
+	// reports as one.
+	failed := Target{
+		LastState: "error", LastError: "403 from GitHub",
+		LastPushedAt: "2026-08-01T00:00:00Z", LastPushedDigest: "aaaaaaaaaaaa",
+	}
+	if got := failed.GHState(nil, "bbbbbbbbbbbb"); got != "error" {
+		t.Fatalf("a failed push reports %q rather than error", got)
+	}
+}
+
+// One GitHub secret holds one value. Two targets pointing at it overwrite each
+// other on every sync, and each reports "in sync" against its own record — so
+// the deployed value becomes a function of iteration order.
+func TestOneDestinationCannotBeClaimedByTwoTargets(t *testing.T) {
+	s := testStore(t)
+	mustAddRenderTarget(t, s, "csrv", "o/r", "home-server", "PROD_ENV_FILE", []string{"ALPHA"})
+
+	var found *Target
+	if _, err := s.Mutate(func(m *Mutation) (AuditRecord, error) {
+		var err error
+		found, err = m.FindGHDestination("o/r", "home-server", "PROD_ENV_FILE")
+		if err != nil {
+			return AuditRecord{}, err
+		}
+		return AuditRecord{
+			Actor: "test", Action: "noop", Details: "probe",
+			EventKind: KindTargetConfig, ActorRole: RoleHuman,
+		}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if found == nil {
+		t.Fatal("the destination reads as unclaimed while a gh-render target delivers to it")
+	}
+	if found.Kind != "gh-render" {
+		t.Fatalf("claimed by a %s target", found.Kind)
+	}
+
+	// The environment is part of the identity: the same name in another
+	// environment is a different live secret and stays free.
+	var other *Target
+	if _, err := s.Mutate(func(m *Mutation) (AuditRecord, error) {
+		var err error
+		other, err = m.FindGHDestination("o/r", "staging", "PROD_ENV_FILE")
+		if err != nil {
+			return AuditRecord{}, err
+		}
+		return AuditRecord{
+			Actor: "test", Action: "noop", Details: "probe",
+			EventKind: KindTargetConfig, ActorRole: RoleHuman,
+		}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if other != nil {
+		t.Fatalf("a different environment reads as claimed: %+v", other)
+	}
+}

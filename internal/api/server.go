@@ -174,6 +174,15 @@ type SecretView struct {
 type ProjectView struct {
 	Project string       `json:"project"`
 	Secrets []SecretView `json:"secrets"`
+	// Renders lists the project's rendered targets, which belong to the project
+	// rather than to any one secret.
+	//
+	// They are published here as well as beside each secret they carry because
+	// the most dangerous one carries nothing: a target managing no keys would
+	// deliver an empty environment, and annotating secrets is the only way it
+	// reached the mirror before — so the single state Switchyard most needed to
+	// see was the one state that could never appear.
+	Renders []TargetView `json:"renders,omitempty"`
 }
 
 // buildViews assembles the full blind mirror, computing sync state locally
@@ -327,7 +336,7 @@ func (s *Server) buildViews() ([]ProjectView, error) {
 				}
 			}
 			for i, rc := range renders {
-				if !containsKey(rc.cfg.Keys, sec.Name) {
+				if !rc.cfg.Manages(sec.Name) {
 					continue
 				}
 				sv.Targets = append(sv.Targets, TargetView{
@@ -338,15 +347,16 @@ func (s *Server) buildViews() ([]ProjectView, error) {
 			}
 			pv.Secrets = append(pv.Secrets, sv)
 		}
+		for i, rc := range renders {
+			pv.Renders = append(pv.Renders, TargetView{
+				Kind: "gh-render", Repo: rc.cfg.Repo, Environment: rc.cfg.Environment,
+				SecretName: rc.cfg.SecretName, State: rc.state, KeyCount: len(rc.cfg.Keys),
+				LastPushedAt: renderTargets[i].LastPushedAt, LastError: renderTargets[i].LastError,
+			})
+		}
 		out = append(out, pv)
 	}
 	return out, nil
-}
-
-// containsKey reports whether a target's sorted key set carries key.
-func containsKey(keys []string, key string) bool {
-	i := sort.SearchStrings(keys, key)
-	return i < len(keys) && keys[i] == key
 }
 
 // keyState extracts one key's drift state from a file target's report.
@@ -579,7 +589,7 @@ func (s *Server) renderTargetsFor(sec *store.Secret) ([]store.Target, error) {
 		if err != nil {
 			return nil, err
 		}
-		if containsKey(cfg.Keys, sec.Name) {
+		if cfg.Manages(sec.Name) {
 			out = append(out, t)
 		}
 	}

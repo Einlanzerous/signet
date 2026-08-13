@@ -18,9 +18,14 @@ type PushResult struct {
 	// empty for a repository secret.
 	Environment string `json:"environment,omitempty"`
 	Secret      string `json:"secret_name"`
-	State       string `json:"state"` // in sync | error
-	Note        string `json:"note,omitempty"`
-	Err         string `json:"error,omitempty"`
+	// Dest is the human-readable destination, carried rather than recomposed.
+	// Callers were rebuilding a store.GHConfig from the three fields above for
+	// no reason other than to call Destination() on it, which put the one
+	// formatting rule that must not vary in two more places.
+	Dest  string `json:"destination"`
+	State string `json:"state"` // in sync | error
+	Note  string `json:"note,omitempty"`
+	Err   string `json:"error,omitempty"`
 	// Hint is the fix for a failure signet could attribute to a cause — a
 	// repository missing from the PAT's grant list, most often. It accompanies
 	// Err rather than replacing it: the ledger keeps the transport detail, and
@@ -107,7 +112,7 @@ func PushSecret(ctx context.Context, st *store.Store, key []byte, gh *GHClient, 
 		if err != nil {
 			return nil, err
 		}
-		res := PushResult{TargetID: t.ID, Repo: cfg.Repo, Environment: cfg.Environment, Secret: cfg.SecretName}
+		res := PushResult{TargetID: t.ID, Repo: cfg.Repo, Environment: cfg.Environment, Secret: cfg.SecretName, Dest: cfg.Destination()}
 
 		// Out-of-band change detection before we overwrite. A confirmed
 		// out-of-band change makes this push a reconciliation of a drifted
@@ -141,7 +146,11 @@ func PushSecret(ctx context.Context, st *store.Store, key []byte, gh *GHClient, 
 		} else {
 			res.State = "in sync"
 			status.Outcome = store.OutcomeDelivered
-			detail := fmt.Sprintf("sealed & pushed %s → %s · %s %s · %s", sec.Name, cfg.Repo, cfg.Scope(), cfg.SecretName, provenance)
+			// Destination() rather than repo + scope + name by hand: the
+			// environment is what makes two otherwise identical destinations
+			// different live secrets, and formatting it here is how it went
+			// missing from the one record that outlives the terminal.
+			detail := fmt.Sprintf("sealed & pushed %s → %s · %s · %s", sec.Name, cfg.Destination(), cfg.Scope(), provenance)
 			if res.Note != "" {
 				detail += " (" + res.Note + ")"
 			}

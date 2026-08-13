@@ -344,20 +344,35 @@ func TestMirrorDistinguishesAnEmptyRenderFromAnIncompleteOne(t *testing.T) {
 	seedRenderTarget(t, st, "csrv", "o/r", "home-server", "EMPTY_FILE", nil)
 	seedRenderTarget(t, st, "csrv", "o/r", "home-server", "PROD_ENV_FILE", []string{"TOKEN"})
 
-	view := secretDetail(t, srv, "csrv", "TOKEN")
-	// The empty target carries no keys, so it annotates no secret — what must
-	// not happen is it being reported as "incomplete" anywhere it does appear.
-	for _, tv := range view.Targets {
-		if tv.Kind == "gh-render" && tv.SecretName == "EMPTY_FILE" && tv.State != "empty" {
-			t.Fatalf("empty render reported as %q", tv.State)
-		}
-	}
-
 	views, err := srv.buildViews()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(views) == 0 {
-		t.Fatal("no project views")
+	var csrv *ProjectView
+	for i := range views {
+		if views[i].Project == "csrv" {
+			csrv = &views[i]
+		}
+	}
+	if csrv == nil {
+		t.Fatal("no view for project csrv")
+	}
+	// Asserted on the project's rendered targets rather than on a secret's,
+	// because the empty one carries no keys and so annotates no secret. Looking
+	// for it there is what made the previous version of this test pass without
+	// ever finding it.
+	states := map[string]string{}
+	for _, tv := range csrv.Renders {
+		states[tv.SecretName] = tv.State
+	}
+	if got, ok := states["EMPTY_FILE"]; !ok {
+		t.Fatalf("the empty rendered target is absent from the mirror: %+v", csrv.Renders)
+	} else if got != "empty" {
+		t.Fatalf("empty render reported as %q, which names the wrong fix", got)
+	}
+	// The other target manages a key that resolves, so it must not be swept into
+	// the same state: the distinction is the point of the test.
+	if got := states["PROD_ENV_FILE"]; got == "empty" || got == "incomplete" {
+		t.Fatalf("a complete render reported as %q", got)
 	}
 }

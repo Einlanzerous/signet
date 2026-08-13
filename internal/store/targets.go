@@ -129,6 +129,31 @@ func (t *Target) GHRenderConfig() (GHRenderConfig, error) {
 	return c, nil
 }
 
+// Manages reports whether the rendered target carries key.
+//
+// It lives here because the invariant it depends on lives here: every key set
+// this package stores is merged and sorted, which is what makes the binary
+// search correct. Callers that reimplemented the membership test were each
+// asserting that invariant privately, and a linear scan would have kept working
+// if it ever broke — silently, in a place that decides what reaches a live
+// environment.
+func (c GHRenderConfig) Manages(key string) bool { return managesKey(c.Keys, key) }
+
+// Manages reports whether the file target carries key. Same invariant, same
+// reason as GHRenderConfig.Manages.
+func (c FileConfig) Manages(key string) bool { return managesKey(c.Keys, key) }
+
+func managesKey(keys []string, key string) bool {
+	i := sort.SearchStrings(keys, key)
+	return i < len(keys) && keys[i] == key
+}
+
+// TargetRefused is the last_state a push signet declined to attempt records.
+// It is distinct from "error" because the two say different things about the
+// destination: an error means a delivery was tried and failed, a refusal means
+// nothing was sent at all. See GHState.
+const TargetRefused = "refused"
+
 // GHState derives a gh-actions target's sync state. It is derived rather than
 // stored: last_state only ever records what the last push did ("in sync" /
 // "error", or the "never" default), so drift — the vault moving on while the
@@ -142,9 +167,18 @@ func (t *Target) GHRenderConfig() (GHRenderConfig, error) {
 // travelled, a destination reporting health nobody had checked. See
 // vault.ValueDigest.
 func (t *Target) GHState(cur *Version, digest string) string {
-	switch {
-	case t.LastError != "":
+	// A refusal is a decision signet made locally: nothing was sealed and
+	// nothing was sent, so the destination still holds exactly what the last
+	// successful push put there. Treating it as an error state would pin the
+	// target to "error" until some later sync succeeded, hiding the drift
+	// underneath it — and drift is the fact an operator needs, because it is
+	// the one that says the deployed environment is stale. The refusal itself
+	// is not lost: LastError carries its reason, and every view that renders a
+	// state renders that alongside it.
+	if t.LastError != "" && t.LastState != TargetRefused {
 		return "error"
+	}
+	switch {
 	case t.LastPushedAt == "":
 		return "never"
 	case digest != "":
@@ -382,6 +416,46 @@ func findGHTarget(targets []Target, repo, env, secretName string) (*Target, erro
 		cfg, err := targets[i].GHConfig()
 		if err != nil {
 			return nil, err
+		}
+		if cfg.Repo == repo && cfg.Environment == env && cfg.SecretName == secretName {
+			return &targets[i], nil
+		}
+	}
+	return nil, nil
+}
+
+// FindGHDestination returns any target of either kind already delivering to
+// (repo, env, secretName), or nil when the destination is unclaimed.
+//
+// Uniqueness belongs to the destination rather than to a target kind. One
+// GitHub secret is one value, and which kind of signet target writes it is
+// invisible from there: a gh-actions target carrying a credential and a
+// gh-render target carrying a whole env file PUT the same path, so two of them
+// overwrite each other on every sync while each reports "in sync" against its
+// own record. Whichever ran last wins, which makes the deployed value a
+// function of iteration order.
+//
+// Tx-scoped only, because its callers insert on the strength of the answer.
+func (m *Mutation) FindGHDestination(repo, env, secretName string) (*Target, error) {
+	targets, err := m.queryTargets(`WHERE kind IN ('gh-actions', 'gh-render') ORDER BY created_at, id`)
+	if err != nil {
+		return nil, err
+	}
+	for i := range targets {
+		var cfg GHConfig
+		switch targets[i].Kind {
+		case "gh-actions":
+			c, err := targets[i].GHConfig()
+			if err != nil {
+				return nil, err
+			}
+			cfg = c
+		default:
+			c, err := targets[i].GHRenderConfig()
+			if err != nil {
+				return nil, err
+			}
+			cfg = c.GHConfig
 		}
 		if cfg.Repo == repo && cfg.Environment == env && cfg.SecretName == secretName {
 			return &targets[i], nil

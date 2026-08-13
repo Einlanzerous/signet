@@ -295,9 +295,14 @@ A rendered target is the only destination where **an absent key is invisible**.
 GitHub never returns a secret's value, so nothing can diff the destination
 against the vault; and the consumer of an env file interpolates a missing key to
 the empty string, so a short file deploys a half-configured container rather
-than failing. Three production incidents took exactly that shape. Three guards
+than failing. Three production incidents took exactly that shape. Four guards
 sit in front of it:
 
+- **A target that manages no keys refuses the push.** The blob it would deliver
+  is a complete, well-formed env file containing nothing, which the consumer
+  would apply in full — the most destructive thing this code can do, and the one
+  the shrink guard below cannot catch, because a first push has no previous
+  delivery to compare against.
 - **A managed key with no value refuses the whole push.** Not a partial render —
   a shorter env file is still a valid env file, which is precisely the danger.
   `signet render --project <p> --check` reports this as `INCOMPLETE` before a
@@ -305,7 +310,9 @@ sit in front of it:
 - **A render that would deliver fewer keys than the last push is refused**, and
   the refusal is recorded in the ledger. Signet's record of what it last sent is
   the only account of what the destination holds. `--allow-shrink` overrides it
-  when the removal is deliberate.
+  when the removal is deliberate — but only for a run narrowed to one rendered
+  target with `--secret`, so the waiver names the environment it is meant for
+  rather than covering every target the run happens to touch.
 - **`--against` compares the render against a live env file.** This is the only
   guard that covers the *first* push, which has no previous delivery to compare
   with:
@@ -317,6 +324,24 @@ signet render --project construct-server --check --against /opt/construct-server
 It names each key the file has and the render lacks — every one of which would
 go empty in the deployed environment on the next deploy — and counts the ones it
 would add. An empty report is what makes a first push safe.
+
+`--check` **exits non-zero** when it finds anything that would stop a push:
+keys that would be dropped, managed keys the vault cannot resolve, or a target
+that manages nothing at all. The report is printed in full either way, so the
+command is equally usable by eye and as a gate in a deploy script.
+
+`signet sync --check` asks the other half of the question. Reachability is a
+property of the credential; completeness is a property of the vault, and a
+destination the PAT can write is not the same as a blob there is anything to
+write. It renders every target it would push and reports the ones `sync` would
+refuse, without sending anything.
+
+One further rule falls out of the two target kinds sharing a destination: **one
+GitHub secret can be claimed by only one target.** A `gh-actions` target holding
+a credential and a `gh-render` target holding a whole env file write the same
+path, so attaching both would make the deployed value depend on which ran last
+while each reported itself in sync. `target add` refuses the second one,
+whichever kind it is, naming what already holds the destination.
 
 ### The repository grant is a manual step, so signet checks it early
 

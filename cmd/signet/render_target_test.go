@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -141,11 +142,16 @@ func TestRenderCheckAgainstNamesTheKeysAPushWouldDrop(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The error is the point as much as the report is: a deploy script gates on
+	// the exit code, and a check that printed WOULD DROP and exited 0 could not
+	// stop anything.
+	var checkErr error
 	out := captureStdout(t, func() {
-		if err := runRender([]string{"--project", "csrv", "--check", "--against", live}); err != nil {
-			t.Fatal(err)
-		}
+		checkErr = runRender([]string{"--project", "csrv", "--check", "--against", live})
 	})
+	if !errors.Is(checkErr, errRenderCheckBlocked) {
+		t.Fatalf("a check that would drop a key exited clean: %v", checkErr)
+	}
 	if !strings.Contains(out, "WOULD DROP 1 key(s)") || !strings.Contains(out, "AMBER_TAG") {
 		t.Fatalf("check did not name the key that would be dropped:\n%s", out)
 	}
@@ -161,12 +167,13 @@ func TestRenderCheckAgainstNamesTheKeysAPushWouldDrop(t *testing.T) {
 		t.Fatal(err)
 	}
 	out = captureStdout(t, func() {
-		if err := runRender([]string{"--project", "csrv", "--check", "--against", live}); err != nil {
-			t.Fatal(err)
-		}
+		checkErr = runRender([]string{"--project", "csrv", "--check", "--against", live})
 	})
 	if !strings.Contains(out, "covers every key in") {
 		t.Fatalf("check did not clear after the key was added:\n%s", out)
+	}
+	if checkErr != nil {
+		t.Fatalf("a check with nothing to drop still reported a blocking verdict: %v", checkErr)
 	}
 	if strings.Contains(out, "WOULD DROP") {
 		t.Fatalf("check still reports a drop:\n%s", out)
@@ -200,15 +207,34 @@ func TestRenderCheckReportsAnIncompleteRender(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := runTargetAddKey([]string{"--project", "csrv", "--gh-secret", "PROD_ENV_FILE", "--name", "PENDING"}); err != nil {
+	// Attached through the store rather than `target add-key`, which now refuses
+	// an unresolvable key outright. That guard closes one way into this state
+	// but not the state itself: a key seeded from a file target, or one whose
+	// value is removed after it was added, arrives here the same way — and it is
+	// that target `render --check` has to describe honestly.
+	tgt, _ := renderTargetOf(t, st, "csrv")
+	if _, err := st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
+		updated, _, err := m.AddRenderKeys(&tgt, []string{"PENDING"})
+		if err != nil {
+			return store.AuditRecord{}, err
+		}
+		return store.AuditRecord{
+			Actor: "test", Action: "target.render", TargetID: updated.ID, Details: "fixture",
+			EventKind: store.KindTargetConfig, ActorRole: store.RoleHuman,
+			Status: &store.AuditStatus{Outcome: store.OutcomeUpdated},
+		}, nil
+	}); err != nil {
 		t.Fatal(err)
 	}
 
+	var checkErr error
 	out := captureStdout(t, func() {
-		if err := runRender([]string{"--project", "csrv", "--check"}); err != nil {
-			t.Fatal(err)
-		}
+		checkErr = runRender([]string{"--project", "csrv", "--check"})
 	})
+	// An incomplete render is a refusal waiting to happen, so it blocks too.
+	if !errors.Is(checkErr, errRenderCheckBlocked) {
+		t.Fatalf("an incomplete render exited clean: %v", checkErr)
+	}
 	if !strings.Contains(out, "INCOMPLETE") || !strings.Contains(out, "PENDING") {
 		t.Fatalf("check did not report the unresolvable key:\n%s", out)
 	}
@@ -404,7 +430,7 @@ func TestAddKeyRefusesWhenTheNamedEnvironmentDoesNotMatch(t *testing.T) {
 	}
 	// The staging target must be untouched.
 	_, cfg := renderTargetOf(t, st, "csrv")
-	if contains(cfg.Keys, "FOO") {
+	if cfg.Manages("FOO") {
 		t.Fatalf("the key landed in the staging target anyway: %v", cfg.Keys)
 	}
 }
@@ -439,5 +465,232 @@ func TestRenderCheckReportsUnresolvableSecretsAsSuchNotAsDrift(t *testing.T) {
 	// "changed" when its value could not be computed at all.
 	if strings.Contains(out, "cannot be resolved") && !strings.Contains(out, "unresolved") {
 		t.Fatalf("unresolvable secrets reported without marking the affected keys:\n%s", out)
+	}
+}
+
+// A gh-actions target and a gh-render target can name the same GitHub secret,
+// and nothing about the destination distinguishes them: both PUT the same path,
+// so the two take turns overwriting each other while each reports "in sync".
+// The collision belongs to the destination, not to a kind.
+func TestADestinationCannotBeClaimedByBothTargetKinds(t *testing.T) {
+	st := newCLIVault(t)
+	seedProject(t, st, "csrv", map[string]string{"ALPHA": "a"})
+	if err := runSet([]string{"--project", "csrv", "--name", "TOKEN", "--generate"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runTargetAdd([]string{
+		"--secret", "csrv/TOKEN", "--gh-repo", "o/r",
+		"--gh-environment", "home-server", "--gh-secret", "PROD_ENV_FILE", "--no-preflight",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	err := runTargetAdd([]string{
+		"--project", "csrv", "--render-as-secret", "--gh-repo", "o/r",
+		"--gh-environment", "home-server", "--gh-secret", "PROD_ENV_FILE", "--no-preflight",
+	})
+	if err == nil {
+		t.Fatal("a rendered target was attached to a destination a secret already delivers to")
+	}
+	if !strings.Contains(err.Error(), "gh-actions") || !strings.Contains(err.Error(), "home-server") {
+		t.Fatalf("the refusal does not say what already holds the destination: %v", err)
+	}
+
+	// And in the other order: the render target claims it first.
+	st2 := newCLIVault(t)
+	seedProject(t, st2, "csrv", map[string]string{"ALPHA": "a"})
+	if err := runSet([]string{"--project", "csrv", "--name", "TOKEN", "--generate"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runTargetAdd([]string{
+		"--project", "csrv", "--render-as-secret", "--gh-repo", "o/r",
+		"--gh-environment", "home-server", "--gh-secret", "PROD_ENV_FILE", "--no-preflight",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err = runTargetAdd([]string{
+		"--secret", "csrv/TOKEN", "--gh-repo", "o/r",
+		"--gh-environment", "home-server", "--gh-secret", "PROD_ENV_FILE", "--no-preflight",
+	})
+	if err == nil {
+		t.Fatal("a secret was attached to a destination a rendered target already delivers to")
+	}
+	if !strings.Contains(err.Error(), "gh-render") {
+		t.Fatalf("the refusal does not say what already holds the destination: %v", err)
+	}
+}
+
+// --allow-shrink disarms the only guard between a shortened key set and a live
+// environment. As a run-wide switch it disarmed it for every rendered target in
+// the run, including the ones the operator was not thinking about.
+func TestAllowShrinkRefusesToCoverAWholeRun(t *testing.T) {
+	st := newCLIVault(t)
+	seedProject(t, st, "csrv", map[string]string{"ALPHA": "a"})
+	for _, name := range []string{"PROD_ENV_FILE", "STAGING_ENV_FILE"} {
+		if err := runTargetAdd([]string{
+			"--project", "csrv", "--render-as-secret", "--gh-repo", "o/r",
+			"--gh-secret", name, "--no-preflight",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	err := runSync([]string{"--allow-shrink"})
+	if err == nil {
+		t.Fatal("--allow-shrink waived the guard for every rendered target in the run")
+	}
+	if !strings.Contains(err.Error(), "--secret") {
+		t.Fatalf("the refusal does not say how to narrow the waiver: %v", err)
+	}
+}
+
+// `render` writes files. A rendered target delivers over the network, so this
+// command cannot touch it — but reporting success while leaving the environment
+// holding the values the file no longer has is the same silent staleness the
+// target kind exists to prevent.
+func TestRenderWriteSaysTheRenderedTargetsWereNotWritten(t *testing.T) {
+	st := newCLIVault(t)
+	seedProject(t, st, "csrv", map[string]string{"ALPHA": "a"})
+	if err := runTargetAdd([]string{
+		"--project", "csrv", "--render-as-secret", "--gh-repo", "o/r",
+		"--gh-environment", "home-server", "--gh-secret", "PROD_ENV_FILE", "--no-preflight",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	out := captureStdout(t, func() {
+		if err := runRender([]string{"--project", "csrv"}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(out, "were not written") || !strings.Contains(out, "stale") {
+		t.Fatalf("a write said nothing about the rendered target it could not write:\n%s", out)
+	}
+	if !strings.Contains(out, "signet sync") {
+		t.Fatalf("the note does not name the next step:\n%s", out)
+	}
+}
+
+// --against exists to answer one question, and with no rendered target to ask
+// it of the honest answer is not "nothing" — it is that the comparison never
+// ran. Accepting it silently would be the same false all-clear it was added to
+// prevent.
+func TestAgainstIsRefusedWhenThereIsNoRenderedTarget(t *testing.T) {
+	st := newCLIVault(t)
+	seedProject(t, st, "csrv", map[string]string{"ALPHA": "a"})
+	live := filepath.Join(t.TempDir(), "live.env")
+	if err := os.WriteFile(live, []byte("ALPHA=a\nGONE=x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := runRender([]string{"--project", "csrv", "--check", "--against", live})
+	if err == nil {
+		t.Fatal("--against reported a clean check against nothing at all")
+	}
+	if !strings.Contains(err.Error(), "no rendered targets") {
+		t.Fatalf("the refusal does not say why: %v", err)
+	}
+}
+
+// Existence is not the property that matters: a push refuses on any key it
+// cannot resolve, so attaching an unresolvable one arms that refusal for the
+// whole environment rather than for the key.
+func TestAddKeyRefusesAKeyThatCannotBeResolved(t *testing.T) {
+	st := newCLIVault(t)
+	seedProject(t, st, "csrv", map[string]string{"ALPHA": "a"})
+	if err := runTargetAdd([]string{
+		"--project", "csrv", "--render-as-secret", "--gh-repo", "o/r",
+		"--gh-secret", "PROD_ENV_FILE", "--no-preflight",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
+		s, err := m.CreateSecret("csrv", "PENDING", "", false, "")
+		if err != nil {
+			return store.AuditRecord{}, err
+		}
+		return store.AuditRecord{
+			Actor: "test", Action: "secret.create", SecretID: s.ID, Details: "fixture",
+			EventKind: store.KindSecretWrite, ActorRole: store.RoleHuman,
+			Status: &store.AuditStatus{Outcome: store.OutcomeCreated},
+		}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	err := runTargetAddKey([]string{"--project", "csrv", "--gh-secret", "PROD_ENV_FILE", "--name", "PENDING"})
+	if err == nil {
+		t.Fatal("an unresolvable key was attached, arming a refusal of the whole environment")
+	}
+	if !strings.Contains(err.Error(), "PENDING") || !strings.Contains(err.Error(), "refuse") {
+		t.Fatalf("the refusal does not say what it would cost: %v", err)
+	}
+
+	// The target is unchanged, so the environment it would deliver is too.
+	_, cfg := renderTargetOf(t, st, "csrv")
+	if cfg.Manages("PENDING") {
+		t.Fatalf("the key landed on the target anyway: %v", cfg.Keys)
+	}
+}
+
+// Reachability is half the question. `sync --check` probing only the GitHub
+// grant reported a destination ready that `sync` would then refuse for having
+// nothing complete to send — a green check followed by a failed deploy.
+func TestSyncCheckReportsARenderThatWouldBeRefused(t *testing.T) {
+	st := newCLIVault(t)
+	seedProject(t, st, "csrv", map[string]string{"ALPHA": "a"})
+	if err := runTargetAdd([]string{
+		"--project", "csrv", "--render-as-secret", "--gh-repo", "o/r",
+		"--gh-environment", "home-server", "--gh-secret", "PROD_ENV_FILE", "--no-preflight",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// A managed key the vault cannot supply, attached the way one arrives in
+	// practice — seeded, or emptied after the fact.
+	if _, err := st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
+		s, err := m.CreateSecret("csrv", "PENDING", "", false, "")
+		if err != nil {
+			return store.AuditRecord{}, err
+		}
+		return store.AuditRecord{
+			Actor: "test", Action: "secret.create", SecretID: s.ID, Details: "fixture",
+			EventKind: store.KindSecretWrite, ActorRole: store.RoleHuman,
+			Status: &store.AuditStatus{Outcome: store.OutcomeCreated},
+		}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tgt, _ := renderTargetOf(t, st, "csrv")
+	if _, err := st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
+		updated, _, err := m.AddRenderKeys(&tgt, []string{"PENDING"})
+		if err != nil {
+			return store.AuditRecord{}, err
+		}
+		return store.AuditRecord{
+			Actor: "test", Action: "target.render", TargetID: updated.ID, Details: "fixture",
+			EventKind: store.KindTargetConfig, ActorRole: store.RoleHuman,
+			Status: &store.AuditStatus{Outcome: store.OutcomeUpdated},
+		}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	a, err := setup()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.close()
+	targets, err := a.st.RenderTargetsForProject("csrv")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var checkErr error
+	out := captureStdout(t, func() { checkErr = checkRenders(a, targets) })
+	if checkErr == nil {
+		t.Fatalf("the check passed a render that sync would refuse:\n%s", out)
+	}
+	if !strings.Contains(out, "PENDING") {
+		t.Fatalf("the check does not name the key that makes it incomplete:\n%s", out)
 	}
 }

@@ -145,7 +145,7 @@ func PushRender(ctx context.Context, st *store.Store, key []byte, gh *GHClient, 
 	if err != nil {
 		return PushResult{}, err
 	}
-	res := PushResult{TargetID: t.ID, Repo: cfg.Repo, Environment: cfg.Environment, Secret: cfg.SecretName}
+	res := PushResult{TargetID: t.ID, Repo: cfg.Repo, Environment: cfg.Environment, Secret: cfg.SecretName, Dest: cfg.Destination()}
 
 	content, err := RenderBlob(cfg, t.Project, want)
 	if err != nil {
@@ -204,8 +204,8 @@ func PushRender(ctx context.Context, st *store.Store, key []byte, gh *GHClient, 
 	// The key count and digest are what makes this entry auditable after the
 	// fact: the value is unreadable at both ends — encrypted here, write-only
 	// there — so the ledger's account of what was delivered is the only one.
-	detail := fmt.Sprintf("sealed & pushed %s render → %s · %s %s · %d keys · #%s",
-		t.Project, cfg.Repo, cfg.Scope(), cfg.SecretName, len(cfg.Keys), digest)
+	detail := fmt.Sprintf("sealed & pushed %s render → %s · %s · %d keys · #%s",
+		t.Project, cfg.Destination(), cfg.Scope(), len(cfg.Keys), digest)
 	if grown := DroppedKeys(cfg.Keys, previous); previous != nil && len(grown) > 0 {
 		detail += fmt.Sprintf(" (+%d: %s)", len(grown), strings.Join(grown, ", "))
 	}
@@ -240,6 +240,6 @@ func refuse(st *store.Store, res PushResult, t *store.Target, cfg store.GHRender
 		Details:   fmt.Sprintf("%s render → %s declined: %s", t.Project, cfg.Destination(), cause),
 		EventKind: store.KindSyncPush, ActorRole: role,
 		Status: &store.AuditStatus{Outcome: store.OutcomeFailed},
-	}, "error", cause.Error(), nil, "")
+	}, store.TargetRefused, cause.Error(), nil, "")
 	return res
 }
