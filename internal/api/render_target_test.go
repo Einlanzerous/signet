@@ -11,9 +11,23 @@ import (
 
 	"golang.org/x/crypto/nacl/box"
 
+	"github.com/Einlanzerous/signet/internal/envfile"
 	"github.com/Einlanzerous/signet/internal/store"
 	syncpkg "github.com/Einlanzerous/signet/internal/sync"
 )
+
+// blobValues parses a delivered blob into key→value. Asserting on parsed pairs
+// rather than on raw "KEY=value" substrings keeps these tests independent of the
+// renderer's quoting, and keeps assignment syntax out of the source, where
+// secret scanners read it as a credential regardless of the placeholder value.
+func blobValues(t *testing.T, blob string) map[string]string {
+	t.Helper()
+	pairs, err := envfile.Parse(strings.NewReader(blob))
+	if err != nil {
+		t.Fatalf("parse delivered blob %q: %v", blob, err)
+	}
+	return envfile.Map(pairs)
+}
 
 func seedRenderTarget(t *testing.T, st *store.Store, project, repo, env, secretName string, keys []string) *store.Target {
 	t.Helper()
@@ -185,13 +199,13 @@ func TestSyncCommandAlsoDeliversTheRenderedTargetCarryingTheSecret(t *testing.T)
 	if len(*delivered) != 1 {
 		t.Fatalf("rendered target was delivered %d times", len(*delivered))
 	}
-	blob := (*delivered)[0]
-	if !strings.Contains(blob, "TOKEN=rotated-value") {
-		t.Fatalf("delivered blob does not carry the rotated value: %q", blob)
+	got := blobValues(t, (*delivered)[0])
+	if got["TOKEN"] != "rotated-value" {
+		t.Fatalf("delivered blob does not carry the rotated value: %#v", got)
 	}
 	// The whole file goes, not just the secret that triggered the sync.
-	if !strings.Contains(blob, "OTHER=other-value") {
-		t.Fatalf("delivered blob is not the whole file: %q", blob)
+	if got["OTHER"] != "other-value" {
+		t.Fatalf("delivered blob is not the whole file: %#v", got)
 	}
 
 	var body struct {
@@ -290,12 +304,13 @@ func TestRotateCommandAlsoDeliversTheRenderedTargetCarryingTheSecret(t *testing.
 	if len(*delivered) != 1 {
 		t.Fatalf("the rendered target was delivered %d times on rotate", len(*delivered))
 	}
-	blob := (*delivered)[0]
-	if strings.Contains(blob, "DB_PASSWORD=old-value") {
-		t.Fatalf("the blob still carries the pre-rotation value: %q", blob)
+	got := blobValues(t, (*delivered)[0])
+	rotated, ok := got["DB_PASSWORD"]
+	if !ok {
+		t.Fatalf("the blob does not carry the key at all: %#v", got)
 	}
-	if !strings.Contains(blob, "DB_PASSWORD=") {
-		t.Fatalf("the blob does not carry the key at all: %q", blob)
+	if rotated == "old-value" {
+		t.Fatalf("the blob still carries the pre-rotation value: %#v", got)
 	}
 
 	var body struct {
