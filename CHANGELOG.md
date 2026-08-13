@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.8.0](https://github.com/Einlanzerous/signet/compare/v1.7.1...v1.8.0) (2026-08-13)
+
+
+### Features
+
+* **sync:** add GitHub environment secrets and whole-file rendered targets (SGNT-20) ([#30](https://github.com/Einlanzerous/signet/issues/30)) ([b15eea5](https://github.com/Einlanzerous/signet/commit/b15eea577b74a0c557ff3a066fb411fb87589b1f))
+
 ## [1.7.1](https://github.com/Einlanzerous/signet/compare/v1.7.0...v1.7.1) (2026-08-12)
 
 
