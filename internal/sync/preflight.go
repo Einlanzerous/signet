@@ -96,20 +96,26 @@ func (p RepoProbe) Blocked() bool {
 	return false
 }
 
-// Message is what to show for a probe that did not succeed: the fix when there
-// is one, the transport error otherwise. Empty when the probe succeeded.
+// Message is what to show about a probe: the fix when there is one, the
+// transport error otherwise, and "" only when there is genuinely nothing to
+// say.
 //
 // It never returns "" for a failure, which is the property the callers rely on
 // — an unattributable failure has to reach the operator as itself rather than
 // being silently dropped for want of a hint.
+//
+// A successful probe can also have something to say: the write check performs a
+// delete, and on the one path where that delete is not a no-op the operator has
+// to hear about it. Keying emptiness on Err alone hid exactly that case, so
+// callers gate on this being non-empty rather than on the probe having failed.
 func (p RepoProbe) Message() string {
 	switch {
-	case p.Err == nil:
-		return ""
 	case p.Hint != "":
 		return p.Hint
-	default:
+	case p.Err != nil:
 		return p.Err.Error()
+	default:
+		return ""
 	}
 }
 
@@ -117,37 +123,49 @@ func (p RepoProbe) Message() string {
 // secrets, classifying the answer and attaching the fix. env narrows the
 // question to one deployment environment, or "" asks it of the repository.
 //
-// It probes the destination's public key: the cheapest read that needs a grant
-// on the repo at all. Nothing secret is sent and nothing secret comes back — a
-// sealing key is public by definition, and it is discarded here anyway. See
-// AccessOK for what a pass does and does not prove.
+// It runs two probes, because a push needs two grants. First the destination's
+// public key: the cheapest read that needs a grant on the repo at all — nothing
+// secret is sent and nothing secret comes back, a sealing key being public by
+// definition and discarded here anyway. Then, only if that passed, whether a
+// write would be permitted; see CanWriteSecret for how that is asked without
+// writing anything. AccessOK means both succeeded.
 //
 // Probing the environment's key rather than the repository's is what makes an
 // environment target's preflight worth running: the environment has to exist
 // and be reachable for the push to work, and the repository key says nothing
-// about either.
+// about either. The same is true of the write grant, which at environment scope
+// is a different permission from the repository's.
 func (c *GHClient) CheckRepoAccess(ctx context.Context, repo, env string) RepoProbe {
 	_, _, err := c.RepoPublicKey(ctx, repo, env)
 	if err != nil {
-		return RepoProbe{Access: classifyAccess(err), Err: err, Hint: AccessHint(repo, env, err)}
+		// Write is set explicitly rather than left at its zero value: "" is not
+		// a WriteAccess, and a caller reading it would find a fourth state that
+		// means nothing. Nothing was asked about writing, which is precisely
+		// what WriteUnknown says.
+		return RepoProbe{Access: classifyAccess(err), Err: err, Hint: AccessHint(repo, env, err), Write: WriteUnknown}
 	}
-	// The read passed, so the destination exists and is reachable. Whether a
-	// push may actually land there is a separate grant, and asking is the whole
-	// point of a preflight — reporting the read alone is what let a rollout
-	// reach the PUT before finding out.
-	write, _, werr := c.CanWriteSecret(ctx, repo, env)
-	switch write {
+	w := c.CanWriteSecret(ctx, repo, env)
+	switch w.Access {
 	case WriteOK:
-		// werr is non-nil only in the case where the probe name unexpectedly
-		// existed and was deleted. The credential can write, so this is not a
-		// blocking outcome, but it must not be swallowed.
-		return RepoProbe{Access: AccessOK, Write: WriteOK, Err: werr}
+		return RepoProbe{Access: AccessOK, Write: WriteOK, Hint: w.Warning}
 	case WriteDenied:
-		return RepoProbe{Access: AccessReadOnly, Write: WriteDenied, Err: werr, Hint: writeHint(repo, env)}
+		return RepoProbe{Access: AccessReadOnly, Write: WriteDenied, Err: w.Err, Hint: writeHint(repo, env)}
 	default:
-		// Unsettled: report the destination as readable and say the write was
-		// not established, rather than claiming either answer.
-		return RepoProbe{Access: AccessOK, Write: WriteUnknown, Err: werr, Hint: AccessHint(repo, env, werr)}
+		// Unsettled. What the failure says about the *credential* still has to be
+		// classified: a 401 on the write probe means the token is revoked or
+		// expired, which is a fact about every destination and must reach the
+		// caller's short-circuit rather than being reported as one readable
+		// destination among many. Only a failure that says nothing about the
+		// grant leaves the destination readable-but-unverified.
+		access := classifyAccess(w.Err)
+		if access == AccessOK || access == AccessUnknown {
+			access = AccessOK
+		}
+		hint := w.Warning
+		if hint == "" {
+			hint = AccessHint(repo, env, w.Err)
+		}
+		return RepoProbe{Access: access, Write: WriteUnknown, Err: w.Err, Hint: hint}
 	}
 }
 

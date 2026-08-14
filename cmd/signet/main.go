@@ -2341,13 +2341,16 @@ func preflightGHRepo(gh *syncpkg.GHClient, repo, env string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), preflightTimeout)
 	defer cancel()
 	probe := gh.CheckRepoAccess(ctx, repo, env)
-	if probe.Access == syncpkg.AccessOK {
-		return true
+	// Keyed on whether the probe has anything to say rather than on whether it
+	// passed. A probe can succeed and still need reporting — an unsettled write
+	// check, or a delete the probe performed — and returning early on AccessOK
+	// made `target add` the one caller that saw none of it.
+	if msg := probe.Message(); msg != "" {
+		// Reported whether or not signet can attribute it: a probe that failed for
+		// a reason signet has no name for is still something the operator asked
+		// for and did not get.
+		fmt.Fprintf(os.Stderr, "warning: %s\n", msg)
 	}
-	// Reported whether or not signet can attribute it: a probe that failed for a
-	// reason signet has no name for is still something the operator asked for
-	// and did not get.
-	fmt.Fprintf(os.Stderr, "warning: %s\n", probe.Message())
 	return !probe.Blocked()
 }
 
@@ -3059,6 +3062,12 @@ func syncCheck(gh *syncpkg.GHClient, toSync []store.Secret, allTargets []store.T
 			fmt.Printf("  ? %s (%d %s): readable, but the write check did not settle: %s\n", d, counts[d], plural, probe.Message())
 		case probe.Access == syncpkg.AccessOK:
 			fmt.Printf("  ✓ %s (%d %s)\n", d, counts[d], plural)
+			// A pass can still carry something the operator must hear — the write
+			// probe issuing a delete that was not a no-op. Printing only the tick
+			// is what made that report vanish.
+			if msg := probe.Message(); msg != "" {
+				fmt.Printf("    warning: %s\n", msg)
+			}
 		case probe.Blocked():
 			blocked++
 			fmt.Printf("  ✗ %s (%d %s): %s\n", d, counts[d], plural, probe.Message())

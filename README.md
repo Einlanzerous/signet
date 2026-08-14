@@ -353,9 +353,22 @@ out early and say what to do.
 The probe has two halves, because a push needs two grants. It reads the
 destination's Actions public key (public material; no secret is sent or
 returned), and then asks whether a write would be permitted — by requesting the
-deletion of a reserved secret name that never exists. Authorization is resolved
-before the resource is looked up, so `403` means the credential may not write
-here and `404` means it may, and nothing is created or destroyed either way.
+deletion of a reserved secret name (`SIGNET_PREFLIGHT_PROBE_DO_NOT_CREATE`).
+Authorization is resolved before the resource is looked up, so `403` means the
+credential may not write here and `404` means it may. Nothing is created.
+
+The delete is only issued after a read confirms the name is absent, which is
+what makes it non-destructive as a property rather than as a likelihood — if
+the name *is* present, the probe declines to run and says so instead of
+deleting it. On the one path where a delete can still land (the name appearing
+between those two calls), the operator is told what was removed rather than
+seeing a bare tick.
+
+GitHub's REST documentation lists `204` as the only response for this endpoint
+and does not promise the `404`; the behaviour is what the API actually does,
+verified across nine live destinations. If that ever changes, the unexpected
+status is reported as inconclusive — the only branch that reports write access
+is the one that saw the documented-absent answer.
 
 That second half exists because the first cannot stand in for it. Reading a
 sealing key needs *Secrets: read*; delivering a value needs write, and at
@@ -376,12 +389,15 @@ as likely to mean "no such environment" as "no such grant", and the hint says
 so. The mirror's `add-target` reports the same thing as a `preflight` state plus
 a `warning` on its success response.
 
-**What a pass proves, and what it does not.** The sealing key needs fine-grained
-*Secrets: read*; the PUT that delivers a secret needs *read and write*, and
-GitHub offers no way to test a write without performing one. So a repository
-granted read-only passes the probe and still fails at push. That is a narrower
-mistake than the one this catches — a repository never added at all — and its
-403 arrives explained, but the check is not a guarantee the push will work.
+**What a pass proves.** Both grants a push needs: the destination is reachable
+and a write to it is permitted. What it does not prove is that the push will
+succeed for reasons unrelated to access — the destination can still change
+between the check and the push, and preflight is skippable.
+
+A destination that answers reads and refuses writes is reported as `read-only`
+and counted as unreachable, because a push to it will 403. A write check that
+is rate-limited or 5xx's is reported as inconclusive rather than reachable: the
+half that decides whether a push lands is the half that went unanswered.
 
 Adding many destinations at once is better served by `--no-preflight` followed
 by one `sync --check`: each add otherwise decrypts the root PAT and writes a
@@ -488,7 +504,7 @@ half the clients are turned away. List `127.0.0.1:4010,[::1]:4010` to get both.
 | `GET /v1/mirror/audit?limit=n` | newest audit entries + chain verification |
 | `POST /v1/commands/sync` | `{project, name}` — seal & push that secret's gh targets |
 | `POST /v1/commands/rotate` | `{project, name}` — new version for generated secrets (409 otherwise), then fan-out |
-| `POST /v1/commands/add-target` | `{project, name, repo, secret_name?}` — attach a gh-actions target (validated, deduped; run `sync` to push). Reports the grant probe as `preflight` (`ok`/`denied`/`missing`/`rejected`/`unknown`) plus a `warning` when it did not pass |
+| `POST /v1/commands/add-target` | `{project, name, repo, secret_name?}` — attach a gh-actions target (validated, deduped; run `sync` to push). Reports the grant probe as `preflight` (`ok`/`read-only`/`denied`/`missing`/`rejected`/`unknown`) plus a `warning` whenever the probe has something to report — which includes a probe that passed, since the write check can act |
 | `POST /v1/commands/remove-target` | `{project, name, repo, secret_name?}` — detach a gh-actions target; the destination Actions secret is left in place |
 | `POST /v1/commands/set-expiry` | `{project, name, expires_at}` — set/clear expiry (`YYYY-MM-DD`, empty clears) |
 

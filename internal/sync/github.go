@@ -103,7 +103,28 @@ type GHClient struct {
 
 // NewGHClient builds a client with defaults.
 func NewGHClient(token string) *GHClient {
-	return &GHClient{BaseURL: "https://api.github.com", Token: token, HTTP: &http.Client{Timeout: 30 * time.Second}}
+	return &GHClient{
+		BaseURL: "https://api.github.com",
+		Token:   token,
+		HTTP: &http.Client{
+			Timeout: 30 * time.Second,
+			// Redirects are followed for reads and refused for DELETE. Go's
+			// default policy rewrites DELETE to GET across a 301/302/303, which
+			// on a renamed repository would turn the write probe into a read and
+			// score its 404 as write access — the same false green the probe
+			// exists to remove, arriving by a different door. Refusing to follow
+			// surfaces the 301 as itself, which classifies as unsettled.
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if len(via) > 0 && via[0].Method == http.MethodDelete {
+					return http.ErrUseLastResponse
+				}
+				if len(via) >= 10 {
+					return fmt.Errorf("stopped after 10 redirects")
+				}
+				return nil
+			},
+		},
+	}
 }
 
 // PublicKey is a repository's Actions secret sealing key.
@@ -208,44 +229,95 @@ func (c *GHClient) PutSecret(ctx context.Context, repo, env, name, sealedB64, ke
 	return c.do(ctx, http.MethodPut, secretsBase(repo, env)+"/"+name, body, nil)
 }
 
-// probeSecretName is the secret CanWriteSecret asks to delete. It is never
+// ProbeSecretName is the secret CanWriteSecret asks to delete. It is never
 // created, and the name is chosen so that deleting it can only ever be a no-op:
 // if this exists in one of your repositories, something other than signet put it
 // there deliberately to be destroyed.
-const probeSecretName = "SIGNET_PREFLIGHT_PROBE_DO_NOT_CREATE"
+const ProbeSecretName = "SIGNET_PREFLIGHT_PROBE_DO_NOT_CREATE"
+
+// WriteProbe is the outcome of asking whether a credential may write to a
+// destination. Access is the answer; Err and Warning are deliberately separate
+// fields because they mean opposite things — Err says the question went
+// unanswered, Warning says it was answered and something happened on the way
+// that an operator has to be told about.
+type WriteProbe struct {
+	Access  WriteAccess
+	Stat    CallStat
+	Err     error
+	Warning string
+}
 
 // CanWriteSecret reports whether the credential may write secrets at this
-// scope, without writing one.
+// scope, without writing one and without destroying one.
 //
 // It asks GitHub to delete a secret that does not exist. Authorization is
-// resolved before the resource is looked up, so the two answers separate
-// cleanly: 403 means the credential may not write here, and 404 means it may —
-// it got far enough to be told the secret is absent. Nothing is created and
-// nothing can be destroyed, because the name never exists.
+// resolved before the resource is looked up, so the answers separate cleanly:
+// 403 means the credential may not write here, and 404 means it may — it got
+// far enough to be told the secret is absent.
+//
+// The delete is only issued once a read has confirmed the name is absent. That
+// ordering is what makes the probe non-destructive as a property rather than as
+// a likelihood: an earlier version reasoned that the reserved name could never
+// exist and deleted it if it did, which is a guarantee resting on the thing it
+// was supposed to guarantee. If the name is present, the probe declines to run
+// and says so.
 //
 // This is the write half of a preflight, and it exists because the read half
 // cannot stand in for it. Fetching a sealing key needs Secrets: read; the PUT
 // that delivers a value needs write, and at environment scope those are
 // separate grants on the same token — one live rollout passed preflight against
 // an environment it could read and 403'd on the push. See RepoProbe.Write.
-func (c *GHClient) CanWriteSecret(ctx context.Context, repo, env string) (WriteAccess, CallStat, error) {
-	stat, err := c.do(ctx, http.MethodDelete, secretsBase(repo, env)+"/"+probeSecretName, nil, nil)
+//
+// The 404-on-delete behaviour is not promised by GitHub's REST documentation,
+// which lists 204 as the only response for this endpoint. It is what the API
+// actually does, verified across nine live destinations. A future change would
+// surface as WriteUnknown carrying the unexpected status, never as a false
+// pass — the only branch that returns WriteOK is the documented-absent one.
+func (c *GHClient) CanWriteSecret(ctx context.Context, repo, env string) WriteProbe {
+	path := secretsBase(repo, env) + "/" + ProbeSecretName
+
+	// Existence check first. A 404 here is the licence to issue the delete.
+	_, err := c.GetSecretMeta(ctx, repo, env, ProbeSecretName)
 	switch {
-	// A 404 here is the pass: the delete was authorized and found nothing to
-	// do. It cannot be confused with "repository not found", because the read
-	// probe that runs first already established the destination exists.
-	case errors.Is(err, ErrNotFound):
-		return WriteOK, stat, nil
-	case errors.Is(err, ErrForbidden):
-		return WriteDenied, stat, err
-	// A 204 means a secret by that name existed and has just been deleted.
-	// The credential can obviously write, and the operator needs to know what
-	// happened rather than having it recorded as a routine pass.
 	case err == nil:
-		return WriteOK, stat, fmt.Errorf("preflight deleted a pre-existing secret named %s on %s — it should never have existed; recreate it if it was load-bearing", probeSecretName, repo)
-	default:
-		return WriteUnknown, stat, err
+		return WriteProbe{
+			Access: WriteUnknown,
+			Warning: fmt.Sprintf("a secret named %s already exists on %s — preflight will not delete it, so write access could not be established; remove it (signet never creates this name) and re-run",
+				ProbeSecretName, destLabel(repo, env)),
+		}
+	case !errors.Is(err, ErrNotFound):
+		// Could not establish absence — a 403 here means reads are denied, which
+		// the caller's read probe will have classified already; anything else is
+		// unsettled. Either way the delete is not issued.
+		return WriteProbe{Access: WriteUnknown, Err: err}
 	}
+
+	stat, derr := c.do(ctx, http.MethodDelete, path, nil, nil)
+	switch {
+	case errors.Is(derr, ErrNotFound):
+		return WriteProbe{Access: WriteOK, Stat: stat}
+	case errors.Is(derr, ErrForbidden):
+		return WriteProbe{Access: WriteDenied, Stat: stat, Err: derr}
+	case derr == nil:
+		// A 204 after a 404 means the secret was created between the two calls.
+		// Vanishingly unlikely and no longer silent: write access is proven, and
+		// the operator is told what the probe destroyed.
+		return WriteProbe{
+			Access: WriteOK, Stat: stat,
+			Warning: fmt.Sprintf("preflight deleted a secret named %s on %s that appeared mid-probe — signet never creates this name; recreate it if it was load-bearing",
+				ProbeSecretName, destLabel(repo, env)),
+		}
+	default:
+		return WriteProbe{Access: WriteUnknown, Stat: stat, Err: derr}
+	}
+}
+
+// destLabel names a destination for a message: repo, or repo · env.
+func destLabel(repo, env string) string {
+	if env == "" {
+		return repo
+	}
+	return repo + " · " + env
 }
 
 // GetSecretMeta fetches an Actions secret's metadata (ErrNotFound if absent).

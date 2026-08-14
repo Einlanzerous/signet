@@ -200,33 +200,50 @@ func TestNotFoundKeepsTheResponse(t *testing.T) {
 	}
 }
 
-// The probe proves the repo is in the grant list, not that the grant includes
-// write: the sealing key needs Secrets:read and the push needs read and write,
-// and GitHub offers no way to test a write without performing one. A pass must
-// therefore not be recorded as proof the push will work.
-func TestReadOnlyGrantPassesButPushStillExplainsItself(t *testing.T) {
-	pub, _, err := box.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
+// A read-only grant is caught by the probe, not left for the push to discover.
+//
+// This test used to assert the opposite — that a read-only grant passed
+// preflight, justified by a comment saying GitHub offered no way to test a
+// write without performing one. That was the bug, written down as an
+// expectation; SGNT-29 removed it. It is kept pointing the other way so a
+// revert has something to fail against, and it still checks that the push
+// explains itself, because preflight is skippable and a push is not.
+func TestReadOnlyGrantIsCaughtByPreflightNotByThePush(t *testing.T) {
+	read := grantedRepo(t)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /repos/o/r/actions/secrets/public-key", func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(PublicKey{KeyID: "k1", Key: base64.StdEncoding.EncodeToString(pub[:])})
+		read(w)
+	})
+	// The reserved name is absent, which is what licenses the delete.
+	mux.HandleFunc("GET /repos/o/r/actions/secrets/"+ProbeSecretName, func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	})
+	// Read granted, write not: the probe delete is refused exactly as the live
+	// environment refused it.
+	mux.HandleFunc("DELETE /repos/o/r/actions/secrets/"+ProbeSecretName, func(w http.ResponseWriter, r *http.Request) {
+		ungrantedRepo(w)
 	})
 	mux.HandleFunc("PUT /repos/o/r/actions/secrets/TOKEN", func(w http.ResponseWriter, r *http.Request) {
-		ungrantedRepo(w) // read granted, write not
+		ungrantedRepo(w)
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 	c := NewGHClient("tok")
 	c.BaseURL = srv.URL
 
-	if probe := c.CheckRepoAccess(context.Background(), "o/r", ""); probe.Access != AccessOK {
-		t.Fatalf("a read-only grant should still pass the read probe, got %q", probe.Access)
+	probe := c.CheckRepoAccess(context.Background(), "o/r", "")
+	if probe.Access != AccessReadOnly {
+		t.Fatalf("a read-only grant probed as %q — the false green is back", probe.Access)
 	}
-	// The narrower mistake is not caught by the probe, so the push has to be the
-	// thing that explains it.
-	_, err = c.PutSecret(context.Background(), "o/r", "", "TOKEN", "c2VhbGVk", "k1")
+	if !probe.Blocked() {
+		t.Fatal("a destination that will 403 the push was not reported as blocking")
+	}
+	if !strings.Contains(probe.Message(), "read") || !strings.Contains(probe.Message(), "write") {
+		t.Fatalf("the fix does not name both halves of the grant: %q", probe.Message())
+	}
+
+	// And the push still explains itself, since --no-preflight exists.
+	_, err := c.PutSecret(context.Background(), "o/r", "", "TOKEN", "c2VhbGVk", "k1")
 	if err == nil {
 		t.Fatal("write to a read-only grant succeeded")
 	}
@@ -329,16 +346,28 @@ func TestPushSecretExplainsMissingGrant(t *testing.T) {
 	}
 }
 
-// preflightWriteServer answers the read probe and lets the test decide what the
-// write probe gets back, which is the whole variable under test.
-func preflightWriteServer(t *testing.T, deleteStatus int) *GHClient {
+// preflightWriteServer answers the read probe through the same grantedRepo
+// helper the other tests use, and lets the test decide what the write probe
+// gets back — that status is the whole variable under test.
+//
+// probeExists controls whether the reserved name is reported as present, which
+// is the case where the probe must decline to delete rather than proceed.
+func preflightWriteServer(t *testing.T, deleteStatus int, probeExists bool) *GHClient {
 	t.Helper()
-	pub, _, _ := box.GenerateKey(rand.Reader)
+	read := grantedRepo(t)
+	base := "/repos/o/r/environments/home-server/secrets/"
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /repos/o/r/environments/home-server/secrets/public-key", func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(PublicKey{KeyID: "k", Key: base64.StdEncoding.EncodeToString(pub[:])})
+	mux.HandleFunc("GET "+base+"public-key", func(w http.ResponseWriter, r *http.Request) {
+		read(w)
 	})
-	mux.HandleFunc("DELETE /repos/o/r/environments/home-server/secrets/"+probeSecretName, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET "+base+ProbeSecretName, func(w http.ResponseWriter, r *http.Request) {
+		if !probeExists {
+			http.NotFound(w, r)
+			return
+		}
+		json.NewEncoder(w).Encode(SecretMeta{Name: ProbeSecretName, UpdatedAt: "2026-08-01T00:00:00Z"})
+	})
+	mux.HandleFunc("DELETE "+base+ProbeSecretName, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(deleteStatus)
 	})
 	srv := httptest.NewServer(mux)
@@ -352,7 +381,7 @@ func preflightWriteServer(t *testing.T, deleteStatus int) *GHClient {
 // and not write it passed preflight, then 403'd on the PUT. Reading is not a
 // proxy for writing, and at environment scope they are separate grants.
 func TestPreflightCatchesAReadableDestinationItCannotWrite(t *testing.T) {
-	c := preflightWriteServer(t, http.StatusForbidden)
+	c := preflightWriteServer(t, http.StatusForbidden, false)
 
 	probe := c.CheckRepoAccess(context.Background(), "o/r", "home-server")
 	if probe.Access != AccessReadOnly {
@@ -377,7 +406,7 @@ func TestPreflightCatchesAReadableDestinationItCannotWrite(t *testing.T) {
 // The pass: the delete was authorized and found nothing to delete. 404 is the
 // evidence of write access, which is the inference this rests on.
 func TestPreflightAcceptsADestinationItCanWrite(t *testing.T) {
-	c := preflightWriteServer(t, http.StatusNotFound)
+	c := preflightWriteServer(t, http.StatusNotFound, false)
 
 	probe := c.CheckRepoAccess(context.Background(), "o/r", "home-server")
 	if probe.Access != AccessOK || probe.Write != WriteOK {
@@ -391,7 +420,7 @@ func TestPreflightAcceptsADestinationItCanWrite(t *testing.T) {
 // An unsettled write probe must not read as either answer. Reporting it as
 // reachable would reintroduce the false green through the back door.
 func TestPreflightDoesNotGuessWhenTheWriteProbeIsInconclusive(t *testing.T) {
-	c := preflightWriteServer(t, http.StatusInternalServerError)
+	c := preflightWriteServer(t, http.StatusInternalServerError, false)
 
 	probe := c.CheckRepoAccess(context.Background(), "o/r", "home-server")
 	if probe.Write != WriteUnknown {
@@ -410,6 +439,12 @@ func TestWriteProbeSendsOnlyADeleteOfTheReservedName(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		seen = append(seen, r.Method+" "+r.URL.Path)
+		// The reserved name must read as absent, or the probe correctly declines
+		// to delete it and this test would be asserting against a no-op.
+		if strings.HasSuffix(r.URL.Path, ProbeSecretName) {
+			http.NotFound(w, r)
+			return
+		}
 		if r.Method == http.MethodGet {
 			json.NewEncoder(w).Encode(PublicKey{KeyID: "k", Key: base64.StdEncoding.EncodeToString(pub[:])})
 			return
@@ -427,7 +462,7 @@ func TestWriteProbeSendsOnlyADeleteOfTheReservedName(t *testing.T) {
 			t.Fatalf("preflight performed a write: %s", call)
 		}
 	}
-	want := "DELETE /repos/o/r/actions/secrets/" + probeSecretName
+	want := "DELETE /repos/o/r/actions/secrets/" + ProbeSecretName
 	var found bool
 	for _, call := range seen {
 		if call == want {
@@ -436,5 +471,112 @@ func TestWriteProbeSendsOnlyADeleteOfTheReservedName(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("write probe did not delete the reserved name: %v", seen)
+	}
+}
+
+// A 401 on the write probe is a fact about the credential, not about one
+// destination. Landing it in the unsettled branch reported the destination as
+// readable and let a sweep continue against a revoked token, printing a wall of
+// inconclusive lines instead of one stop.
+func TestRejectedCredentialOnTheWriteProbeIsNotReportedAsReadable(t *testing.T) {
+	c := preflightWriteServer(t, http.StatusUnauthorized, false)
+
+	probe := c.CheckRepoAccess(context.Background(), "o/r", "home-server")
+	if probe.Access != AccessRejected {
+		t.Fatalf("a 401 on the write probe classified as %q", probe.Access)
+	}
+	if !probe.Blocked() {
+		t.Fatal("a rejected credential did not block")
+	}
+	if !strings.Contains(probe.Message(), "revoked") {
+		t.Fatalf("message does not describe a credential problem: %q", probe.Message())
+	}
+}
+
+// The probe must never destroy a secret. If the reserved name is present, the
+// delete is not issued at all — the guarantee is the ordering, not the belief
+// that the name cannot exist.
+func TestWriteProbeDeclinesToDeleteAnExistingSecret(t *testing.T) {
+	var deleted bool
+	read := grantedRepo(t)
+	base := "/repos/o/r/environments/home-server/secrets/"
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET "+base+"public-key", func(w http.ResponseWriter, r *http.Request) { read(w) })
+	mux.HandleFunc("GET "+base+ProbeSecretName, func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(SecretMeta{Name: ProbeSecretName, UpdatedAt: "2026-08-01T00:00:00Z"})
+	})
+	mux.HandleFunc("DELETE "+base+ProbeSecretName, func(w http.ResponseWriter, r *http.Request) {
+		deleted = true
+		w.WriteHeader(http.StatusNoContent)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	c := NewGHClient("tok")
+	c.BaseURL = srv.URL
+
+	probe := c.CheckRepoAccess(context.Background(), "o/r", "home-server")
+	if deleted {
+		t.Fatal("preflight deleted a secret that already existed")
+	}
+	if probe.Write != WriteUnknown {
+		t.Fatalf("declining to probe resolved to %q rather than leaving the question open", probe.Write)
+	}
+	// It must say so rather than passing quietly: an unprobed destination that
+	// reads as verified is the whole failure class.
+	if !strings.Contains(probe.Message(), ProbeSecretName) {
+		t.Fatalf("the operator is not told why the write was not established: %q", probe.Message())
+	}
+}
+
+// A pass that performed a delete has to reach the operator. Message() keyed on
+// Err alone returned "" here, and both CLI callers gate on Message().
+func TestAPassThatDeletedSomethingStillReportsIt(t *testing.T) {
+	// Absent at the existence check, present by the delete: the mid-probe race.
+	c := preflightWriteServer(t, http.StatusNoContent, false)
+
+	probe := c.CheckRepoAccess(context.Background(), "o/r", "home-server")
+	if probe.Access != AccessOK || probe.Write != WriteOK {
+		t.Fatalf("access = %q write = %q", probe.Access, probe.Write)
+	}
+	if probe.Message() == "" {
+		t.Fatal("a probe that deleted a secret reported nothing")
+	}
+	if !strings.Contains(probe.Message(), "deleted") {
+		t.Fatalf("the message does not say what happened: %q", probe.Message())
+	}
+}
+
+// Go's default redirect policy rewrites DELETE to GET across a 301, which on a
+// renamed repository would score a read as write access.
+func TestWriteProbeDoesNotFollowARedirectIntoAGet(t *testing.T) {
+	read := grantedRepo(t)
+	base := "/repos/o/r/actions/secrets/"
+	var methods []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET "+base+"public-key", func(w http.ResponseWriter, r *http.Request) { read(w) })
+	mux.HandleFunc("GET "+base+ProbeSecretName, func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	})
+	mux.HandleFunc("DELETE "+base+ProbeSecretName, func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/repos/o/renamed/actions/secrets/"+ProbeSecretName, http.StatusMovedPermanently)
+	})
+	// Where the redirect would land. A GET here would 404 and look like a pass.
+	mux.HandleFunc("/repos/o/renamed/actions/secrets/"+ProbeSecretName, func(w http.ResponseWriter, r *http.Request) {
+		methods = append(methods, r.Method)
+		http.NotFound(w, r)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	c := NewGHClient("tok")
+	c.BaseURL = srv.URL
+
+	probe := c.CheckRepoAccess(context.Background(), "o/r", "")
+	for _, m := range methods {
+		if m == http.MethodGet {
+			t.Fatal("the write probe was followed into a GET and would score a read as write access")
+		}
+	}
+	if probe.Write == WriteOK {
+		t.Fatalf("a 301 was scored as write access: %+v", probe)
 	}
 }
