@@ -350,9 +350,22 @@ with *Secrets: read and write* before a push can work. Signet cannot widen its
 own grant — that is human-in-the-loop by design — so the most it can do is find
 out early and say what to do.
 
-`target add` probes the destination's Actions public key (a read of public
-material; no secret is sent or returned) and warns if the credential cannot
-reach it. **The target is still added**: attaching a destination and widening
+The probe has two halves, because a push needs two grants. It reads the
+destination's Actions public key (public material; no secret is sent or
+returned), and then asks whether a write would be permitted — by requesting the
+deletion of a reserved secret name that never exists. Authorization is resolved
+before the resource is looked up, so `403` means the credential may not write
+here and `404` means it may, and nothing is created or destroyed either way.
+
+That second half exists because the first cannot stand in for it. Reading a
+sealing key needs *Secrets: read*; delivering a value needs write, and at
+environment scope those are separate grants on the same token. A rollout once
+passed preflight against an environment it could read and `403`'d on the PUT —
+`--check` now reports that destination as read-only before you push. A write
+probe that is rate-limited or 5xx's is reported as inconclusive rather than
+reachable, for the same reason.
+
+`target add` warns if the credential cannot reach the destination. **The target is still added**: attaching a destination and widening
 the PAT are two steps in either order, and the check is skippable with
 `--no-preflight` or when no credential resolves. `sync --check` does the same
 across every destination at once, one probe per *destination* — a repository, or

@@ -19,16 +19,20 @@ import (
 type RepoAccess string
 
 const (
-	// AccessOK means the credential fetched the repo's sealing key, so the
-	// repository is in its grant list and Actions secrets are readable.
+	// AccessOK means the credential fetched the destination's sealing key *and*
+	// is permitted to write secrets there — both halves of what a push needs.
 	//
-	// It does NOT prove the push will work. The sealing key needs fine-grained
-	// Secrets: *read*; the PUT that delivers a secret needs read *and write*, and
-	// GitHub offers no way to test a write without performing one. A repository
-	// granted read-only therefore passes this probe and fails at push — which is
-	// a narrower mistake than the one this exists to catch (a repository never
-	// added at all), and one whose 403 still arrives explained.
+	// This used to mean only the first half. The comment here said GitHub
+	// offered no way to test a write without performing one, so the read was
+	// accepted as a proxy for both; a live rollout then passed preflight against
+	// an environment it could read and 403'd on the PUT. CanWriteSecret tests
+	// the write directly and without writing, which is what makes this state
+	// mean what its callers always read it as meaning.
 	AccessOK RepoAccess = "ok"
+	// AccessReadOnly means the credential can read this destination but may not
+	// write secrets to it: the grant covers Secrets: read and not write, or —
+	// at environment scope — Environments: read and not write. A push will 403.
+	AccessReadOnly RepoAccess = "read-only"
 	// AccessDenied means GitHub knows the repo but will not let this credential
 	// touch its secrets — most often a fine-grained PAT with no grant on it.
 	AccessDenied RepoAccess = "denied"
@@ -44,6 +48,23 @@ const (
 	AccessUnknown RepoAccess = "unknown"
 )
 
+// WriteAccess is what a write probe established about the credential's ability
+// to deliver a secret to a destination it can already read.
+type WriteAccess string
+
+const (
+	// WriteOK means a write was authorized — the delete probe got as far as
+	// being told there was nothing to delete.
+	WriteOK WriteAccess = "ok"
+	// WriteDenied means the credential may read this destination and not write
+	// it. This is the state that produces a 403 at push time.
+	WriteDenied WriteAccess = "denied"
+	// WriteUnknown means the probe did not settle the question — a network
+	// failure, a 5xx, or rate limiting. Like AccessUnknown it is not evidence
+	// against the grant, and must not be reported as one.
+	WriteUnknown WriteAccess = "unknown"
+)
+
 // RepoProbe is one preflight's outcome: what the credential reached, the
 // failure that decided it, and the operator-facing fix when signet can name
 // one.
@@ -57,6 +78,10 @@ type RepoProbe struct {
 	Err    error
 	// Hint is the fix, or "" when the failure is not one signet can attribute.
 	Hint string
+	// Write is what the write probe established, and is only meaningful when
+	// the read probe passed — there is nothing to ask about a destination the
+	// credential cannot reach at all.
+	Write WriteAccess
 }
 
 // Blocked reports positive evidence that a push to this repo will fail, as
@@ -65,7 +90,7 @@ type RepoProbe struct {
 // would make an unrelated GitHub hiccup look like a misconfigured PAT.
 func (p RepoProbe) Blocked() bool {
 	switch p.Access {
-	case AccessDenied, AccessMissing, AccessRejected:
+	case AccessDenied, AccessMissing, AccessRejected, AccessReadOnly:
 		return true
 	}
 	return false
@@ -103,10 +128,38 @@ func (p RepoProbe) Message() string {
 // about either.
 func (c *GHClient) CheckRepoAccess(ctx context.Context, repo, env string) RepoProbe {
 	_, _, err := c.RepoPublicKey(ctx, repo, env)
-	if err == nil {
-		return RepoProbe{Access: AccessOK}
+	if err != nil {
+		return RepoProbe{Access: classifyAccess(err), Err: err, Hint: AccessHint(repo, env, err)}
 	}
-	return RepoProbe{Access: classifyAccess(err), Err: err, Hint: AccessHint(repo, env, err)}
+	// The read passed, so the destination exists and is reachable. Whether a
+	// push may actually land there is a separate grant, and asking is the whole
+	// point of a preflight — reporting the read alone is what let a rollout
+	// reach the PUT before finding out.
+	write, _, werr := c.CanWriteSecret(ctx, repo, env)
+	switch write {
+	case WriteOK:
+		// werr is non-nil only in the case where the probe name unexpectedly
+		// existed and was deleted. The credential can write, so this is not a
+		// blocking outcome, but it must not be swallowed.
+		return RepoProbe{Access: AccessOK, Write: WriteOK, Err: werr}
+	case WriteDenied:
+		return RepoProbe{Access: AccessReadOnly, Write: WriteDenied, Err: werr, Hint: writeHint(repo, env)}
+	default:
+		// Unsettled: report the destination as readable and say the write was
+		// not established, rather than claiming either answer.
+		return RepoProbe{Access: AccessOK, Write: WriteUnknown, Err: werr, Hint: AccessHint(repo, env, werr)}
+	}
+}
+
+// writeHint is the fix for a credential that can read a destination but not
+// write it. It is a different sentence from AccessDenied's: the repository is
+// already in the grant list — that is how the read succeeded — so telling the
+// operator to add it sends them to a setting that is already correct.
+func writeHint(repo, env string) string {
+	if env != "" {
+		return fmt.Sprintf("the GitHub credential can read %s · %s but not write to it — environment secrets need Environments: read *and write* on the fine-grained PAT, not read alone; Secrets: read and write on the repository is necessary too but not sufficient here", repo, env)
+	}
+	return fmt.Sprintf("the GitHub credential can read %s's Actions secrets but not write them — the fine-grained PAT grants Secrets: read on this repository and needs read *and write*", repo)
 }
 
 // classifyAccess maps a failed Actions-secrets call to what it says about the
@@ -143,7 +196,7 @@ func AccessHint(repo, env string, err error) string {
 	switch classifyAccess(err) {
 	case AccessDenied:
 		if env != "" {
-			return fmt.Sprintf("the GitHub credential cannot reach environment secrets on %s · %s — the repository must be in the fine-grained PAT's repository list with Secrets: read and write, and environment secrets additionally need Environments: read; an org SAML/IP policy answers the same 403", repo, env)
+			return fmt.Sprintf("the GitHub credential cannot reach environment secrets on %s · %s — the repository must be in the fine-grained PAT's repository list with Secrets: read and write, and environment secrets additionally need Environments: read *and write*; an org SAML/IP policy answers the same 403", repo, env)
 		}
 		return fmt.Sprintf("the GitHub credential cannot reach Actions Secrets on %s — usually the repository is missing from the fine-grained PAT's repository list (Secrets: read and write); an archived repo, disabled Actions, or an org SAML/IP policy answers the same 403", repo)
 	case AccessMissing:

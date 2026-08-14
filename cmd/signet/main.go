@@ -3049,6 +3049,14 @@ func syncCheck(gh *syncpkg.GHClient, toSync []store.Secret, allTargets []store.T
 			plural = "secret"
 		}
 		switch {
+		// A read that passed while the write probe was rate-limited or 5xx'd is
+		// not a green destination: the half that decides whether a push lands is
+		// exactly the half that went unanswered. Counted as inconclusive rather
+		// than reachable, which is the distinction this whole check exists to
+		// keep.
+		case probe.Access == syncpkg.AccessOK && probe.Write == syncpkg.WriteUnknown:
+			unknown++
+			fmt.Printf("  ? %s (%d %s): readable, but the write check did not settle: %s\n", d, counts[d], plural, probe.Message())
 		case probe.Access == syncpkg.AccessOK:
 			fmt.Printf("  ✓ %s (%d %s)\n", d, counts[d], plural)
 		case probe.Blocked():

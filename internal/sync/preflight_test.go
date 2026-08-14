@@ -328,3 +328,113 @@ func TestPushSecretExplainsMissingGrant(t *testing.T) {
 		t.Fatal("ledger has no sync.push.failed entry carrying the GitHub body")
 	}
 }
+
+// preflightWriteServer answers the read probe and lets the test decide what the
+// write probe gets back, which is the whole variable under test.
+func preflightWriteServer(t *testing.T, deleteStatus int) *GHClient {
+	t.Helper()
+	pub, _, _ := box.GenerateKey(rand.Reader)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /repos/o/r/environments/home-server/secrets/public-key", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(PublicKey{KeyID: "k", Key: base64.StdEncoding.EncodeToString(pub[:])})
+	})
+	mux.HandleFunc("DELETE /repos/o/r/environments/home-server/secrets/"+probeSecretName, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(deleteStatus)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := NewGHClient("tok")
+	c.BaseURL = srv.URL
+	return c
+}
+
+// The live failure this exists for: a credential that can read an environment
+// and not write it passed preflight, then 403'd on the PUT. Reading is not a
+// proxy for writing, and at environment scope they are separate grants.
+func TestPreflightCatchesAReadableDestinationItCannotWrite(t *testing.T) {
+	c := preflightWriteServer(t, http.StatusForbidden)
+
+	probe := c.CheckRepoAccess(context.Background(), "o/r", "home-server")
+	if probe.Access != AccessReadOnly {
+		t.Fatalf("a destination that refuses writes probed as %q", probe.Access)
+	}
+	if probe.Write != WriteDenied {
+		t.Fatalf("write = %q", probe.Write)
+	}
+	if !probe.Blocked() {
+		t.Fatal("a destination that will 403 the push is not reported as blocking")
+	}
+	// The fix has to name write, because read is what the operator already
+	// granted — the previous message sent them to exactly that setting.
+	if !strings.Contains(probe.Message(), "write") {
+		t.Fatalf("the hint does not name the missing permission: %q", probe.Message())
+	}
+	if !strings.Contains(probe.Message(), "Environments") {
+		t.Fatalf("the hint does not name the environment permission: %q", probe.Message())
+	}
+}
+
+// The pass: the delete was authorized and found nothing to delete. 404 is the
+// evidence of write access, which is the inference this rests on.
+func TestPreflightAcceptsADestinationItCanWrite(t *testing.T) {
+	c := preflightWriteServer(t, http.StatusNotFound)
+
+	probe := c.CheckRepoAccess(context.Background(), "o/r", "home-server")
+	if probe.Access != AccessOK || probe.Write != WriteOK {
+		t.Fatalf("a writable destination probed as %q/%q", probe.Access, probe.Write)
+	}
+	if probe.Blocked() {
+		t.Fatal("a writable destination reported as blocking")
+	}
+}
+
+// An unsettled write probe must not read as either answer. Reporting it as
+// reachable would reintroduce the false green through the back door.
+func TestPreflightDoesNotGuessWhenTheWriteProbeIsInconclusive(t *testing.T) {
+	c := preflightWriteServer(t, http.StatusInternalServerError)
+
+	probe := c.CheckRepoAccess(context.Background(), "o/r", "home-server")
+	if probe.Write != WriteUnknown {
+		t.Fatalf("an unsettled write probe resolved to %q", probe.Write)
+	}
+	if probe.Blocked() {
+		t.Fatal("an inconclusive probe was treated as evidence against the grant")
+	}
+}
+
+// The probe must never write. A delete is the only verb it may use, and only
+// against a name that cannot exist.
+func TestWriteProbeSendsOnlyADeleteOfTheReservedName(t *testing.T) {
+	var seen []string
+	pub, _, _ := box.GenerateKey(rand.Reader)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.Method+" "+r.URL.Path)
+		if r.Method == http.MethodGet {
+			json.NewEncoder(w).Encode(PublicKey{KeyID: "k", Key: base64.StdEncoding.EncodeToString(pub[:])})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	c := NewGHClient("tok")
+	c.BaseURL = srv.URL
+
+	c.CheckRepoAccess(context.Background(), "o/r", "")
+	for _, call := range seen {
+		if strings.HasPrefix(call, "PUT ") || strings.HasPrefix(call, "POST ") {
+			t.Fatalf("preflight performed a write: %s", call)
+		}
+	}
+	want := "DELETE /repos/o/r/actions/secrets/" + probeSecretName
+	var found bool
+	for _, call := range seen {
+		if call == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("write probe did not delete the reserved name: %v", seen)
+	}
+}
