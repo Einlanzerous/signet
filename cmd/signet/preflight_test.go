@@ -22,29 +22,7 @@ import (
 // paths build no client of their own.
 func fakeGitHub(t *testing.T, byRepo map[string]func(http.ResponseWriter)) *syncpkg.GHClient {
 	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// The write probe's reserved name must read as absent. The prefix match
-		// below is deliberately broad, and left alone it answered the probe's
-		// existence check with a public key — so every "reachable" test here was
-		// driving the branch where preflight deletes a live secret, and passing.
-		// A destination that is reachable for reads answers this with 404 and the
-		// probe's delete then reports write access.
-		if strings.HasSuffix(r.URL.Path, syncpkg.ProbeSecretName) {
-			http.NotFound(w, r)
-			return
-		}
-		for repo, respond := range byRepo {
-			if strings.HasPrefix(r.URL.Path, "/repos/"+repo+"/") {
-				respond(w)
-				return
-			}
-		}
-		http.NotFound(w, r)
-	}))
-	t.Cleanup(srv.Close)
-	c := syncpkg.NewGHClient("tok")
-	c.BaseURL = srv.URL
-	return c
+	return fakeGitHubProbe(t, byRepo, nil)
 }
 
 func reachable(t *testing.T) func(http.ResponseWriter) {
@@ -280,12 +258,20 @@ func TestTargetAddNoPreflightStillPointsAtTheNextStep(t *testing.T) {
 
 // fakeGitHubProbe answers reads for every repo and lets the test choose what the
 // write probe's delete gets back per repo, which is the only variable the new
-// syncCheck branches turn on.
+// syncCheck branches turn on. deleteStatus may be nil, in which case every
+// delete answers 404 — write permitted — which is what fakeGitHub wants.
+//
+// It is the one builder in this file: the read-only variant delegates here
+// rather than repeating the routing, because the last time these two matchers
+// diverged, the broad one answered the probe's delete with a public key and
+// every "reachable" test in the file silently drove the branch where preflight
+// deletes a live secret.
 func fakeGitHubProbe(t *testing.T, read map[string]func(http.ResponseWriter), deleteStatus map[string]int) *syncpkg.GHClient {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The write probe's reserved name must read as absent, or the probe
+		// correctly declines to delete it and the test asserts against a no-op.
 		if strings.HasSuffix(r.URL.Path, syncpkg.ProbeSecretName) {
-			// Absent on the existence check; the delete answers per repo.
 			if r.Method == http.MethodDelete {
 				for repo, status := range deleteStatus {
 					if strings.HasPrefix(r.URL.Path, "/repos/"+repo+"/") {
