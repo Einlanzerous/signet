@@ -712,7 +712,13 @@ func validGHSecretName(name string) bool {
 // addTargetPreflightTimeout bounds the grant probe on add-target. It is short
 // on purpose: the target row is already committed by the time it runs, so the
 // probe must never be the reason a client gives up on the response.
-const addTargetPreflightTimeout = 5 * time.Second
+// A preflight is now up to three sequential round trips, not one: the sealing
+// key, then the existence check that licenses the write probe, then the probe.
+// The budget covers the sequence rather than a single call, because the deadline
+// is meant to bound how slow this request can get — and a limit sized for one
+// call would turn a healthy three-call probe into a reported "unknown", which
+// reads as a problem with the destination rather than with the clock.
+const addTargetPreflightTimeout = 12 * time.Second
 
 // errTargetExists carries "this destination is already attached" out of the
 // transaction that discovered it, so the handler can answer 409 rather than

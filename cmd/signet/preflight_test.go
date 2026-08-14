@@ -22,19 +22,7 @@ import (
 // paths build no client of their own.
 func fakeGitHub(t *testing.T, byRepo map[string]func(http.ResponseWriter)) *syncpkg.GHClient {
 	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		for repo, respond := range byRepo {
-			if strings.HasPrefix(r.URL.Path, "/repos/"+repo+"/") {
-				respond(w)
-				return
-			}
-		}
-		http.NotFound(w, r)
-	}))
-	t.Cleanup(srv.Close)
-	c := syncpkg.NewGHClient("tok")
-	c.BaseURL = srv.URL
-	return c
+	return fakeGitHubProbe(t, byRepo, nil)
 }
 
 func reachable(t *testing.T) func(http.ResponseWriter) {
@@ -265,5 +253,119 @@ func TestTargetAddNoPreflightStillPointsAtTheNextStep(t *testing.T) {
 	}
 	if !strings.Contains(out, "run `signet sync` to push") {
 		t.Fatalf("--no-preflight suppressed the next step: %q", out)
+	}
+}
+
+// fakeGitHubProbe answers reads for every repo and lets the test choose what the
+// write probe's delete gets back per repo, which is the only variable the new
+// syncCheck branches turn on. deleteStatus may be nil, in which case every
+// delete answers 404 — write permitted — which is what fakeGitHub wants.
+//
+// It is the one builder in this file: the read-only variant delegates here
+// rather than repeating the routing, because the last time these two matchers
+// diverged, the broad one answered the probe's delete with a public key and
+// every "reachable" test in the file silently drove the branch where preflight
+// deletes a live secret.
+func fakeGitHubProbe(t *testing.T, read map[string]func(http.ResponseWriter), deleteStatus map[string]int) *syncpkg.GHClient {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The write probe's reserved name must read as absent, or the probe
+		// correctly declines to delete it and the test asserts against a no-op.
+		if strings.HasSuffix(r.URL.Path, syncpkg.ProbeSecretName) {
+			if r.Method == http.MethodDelete {
+				for repo, status := range deleteStatus {
+					if strings.HasPrefix(r.URL.Path, "/repos/"+repo+"/") {
+						w.WriteHeader(status)
+						return
+					}
+				}
+			}
+			http.NotFound(w, r)
+			return
+		}
+		for repo, respond := range read {
+			if strings.HasPrefix(r.URL.Path, "/repos/"+repo+"/") {
+				respond(w)
+				return
+			}
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	c := syncpkg.NewGHClient("tok")
+	c.BaseURL = srv.URL
+	return c
+}
+
+// The destination signet could read and not write is the one the live rollout
+// hit. It has to be reported as blocking, with a fix that names write.
+func TestSyncCheckReportsADestinationItCanReadButNotWrite(t *testing.T) {
+	st := newCLIVault(t)
+	seedGHTarget(t, "csrv", "API_TOKEN", "o/readonly")
+	secrets, targets := vaultState(t, st)
+	gh := fakeGitHubProbe(t,
+		map[string]func(http.ResponseWriter){"o/readonly": reachable(t)},
+		map[string]int{"o/readonly": http.StatusForbidden},
+	)
+
+	var err error
+	out := captureStdout(t, func() { err = syncCheck(gh, secrets, targets, nil) })
+	if err == nil {
+		t.Fatal("a destination that will 403 the push passed the check")
+	}
+	if !strings.Contains(out, "✗ o/readonly") {
+		t.Fatalf("read-only destination not reported as failing: %q", out)
+	}
+	if !strings.Contains(out, "write") {
+		t.Fatalf("the report does not name the missing permission: %q", out)
+	}
+}
+
+// An unsettled write probe is not a green destination: the half that decides
+// whether a push lands is the half that went unanswered.
+func TestSyncCheckCountsAnUnsettledWriteProbeAsInconclusive(t *testing.T) {
+	st := newCLIVault(t)
+	seedGHTarget(t, "csrv", "API_TOKEN", "o/flaky")
+	secrets, targets := vaultState(t, st)
+	gh := fakeGitHubProbe(t,
+		map[string]func(http.ResponseWriter){"o/flaky": reachable(t)},
+		map[string]int{"o/flaky": http.StatusInternalServerError},
+	)
+
+	var err error
+	out := captureStdout(t, func() { err = syncCheck(gh, secrets, targets, nil) })
+	if err != nil {
+		t.Fatalf("an inconclusive probe failed the run: %v", err)
+	}
+	if strings.Contains(out, "✓ o/flaky") {
+		t.Fatalf("an unverified write was reported as reachable: %q", out)
+	}
+	if !strings.Contains(out, "? o/flaky") || !strings.Contains(out, "did not settle") {
+		t.Fatalf("inconclusive destination not reported as such: %q", out)
+	}
+	if !strings.Contains(out, "inconclusive") {
+		t.Fatalf("summary does not count it: %q", out)
+	}
+}
+
+// A revoked credential is a fact about every destination. Landing a 401 from the
+// write probe in the unsettled branch reported it as one readable destination
+// among many and let the sweep continue.
+func TestSyncCheckStopsWhenTheWriteProbeSaysTheCredentialIsRejected(t *testing.T) {
+	st := newCLIVault(t)
+	seedGHTarget(t, "csrv", "API_TOKEN", "o/one")
+	secrets, targets := vaultState(t, st)
+	gh := fakeGitHubProbe(t,
+		map[string]func(http.ResponseWriter){"o/one": reachable(t)},
+		map[string]int{"o/one": http.StatusUnauthorized},
+	)
+
+	var err error
+	captureStdout(t, func() { err = syncCheck(gh, secrets, targets, nil) })
+	if err == nil {
+		t.Fatal("a rejected credential did not stop the check")
+	}
+	if !strings.Contains(err.Error(), "revoked") {
+		t.Fatalf("the stop does not describe a credential problem: %v", err)
 	}
 }
