@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.8.1](https://github.com/Einlanzerous/signet/compare/v1.8.0...v1.8.1) (2026-08-14)
+
+
+### Bug Fixes
+
+* **sync:** preflight the write, not just the read (SGNT-29) ([#32](https://github.com/Einlanzerous/signet/issues/32)) ([13be6dd](https://github.com/Einlanzerous/signet/commit/13be6dd3ab6fb24a4269c0c649cd92904779d1b8))
+
 ## [1.8.0](https://github.com/Einlanzerous/signet/compare/v1.7.1...v1.8.0) (2026-08-13)
 
 
