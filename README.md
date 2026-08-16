@@ -24,6 +24,8 @@ signet sync --check                                  # can the PAT reach every r
 signet sync                                          # seal & push to GitHub Actions
 signet render --project lyceum --check               # drift-check the env file
 signet render --project lyceum                       # write it
+signet exec --project lyceum -- ./deploy.sh          # inject; never printed
+signet exec --project lyceum --redact -- ./probe.sh  # and filter what comes back
 signet status
 signet audit --verify
 signet serve                                         # HTTP mirror for Switchyard
@@ -176,14 +178,92 @@ Consequences worth knowing:
 Hashing transforms (`scrypt`, `bcrypt`, `base64`) are **not** implemented;
 `derive` composes only. See SGNT-18.
 
+## Running a command with secrets — `signet exec`
+
+```sh
+signet exec --project construct-server -- ./deploy.sh
+signet exec --secret construct-server/PURSER_CF_API_TOKEN -- ./cf-probe.sh
+signet exec --project drydock --redact -- pytest -q
+```
+
+The values are resolved, placed in the child's environment keyed by secret
+name, and never written to a terminal. `--secret` is repeatable and wins over
+`--project` for the same key, which is how one value is swapped out of an
+otherwise ordinary project environment.
+
+The invariant this serves is **"plaintext never enters the transcript"** — not
+"only certain commands may read secrets". Those are different, and only the
+first is achievable: a permission rule matches a tool invocation, not the
+processes it spawns, so a script that calls `signet reveal` internally runs
+unprompted while the honest direct path is refused. Gating the verb costs the
+capability without buying the guarantee. `exec` is the shape that does buy it,
+and it is the same one `op run`, `aws-vault exec`, `chamber exec` and
+`doppler run` arrived at.
+
+Details worth knowing:
+
+- **A secret that cannot be resolved is an error**, not an omission. The child
+  would otherwise start with the variable unset and read it as empty. A secret
+  registered but never given a value is skipped by a `--project` sweep, since
+  that is absent rather than broken.
+- **Injected values override inherited ones.** An inherited variable of the same
+  name is the stale copy signet exists to replace.
+- **The child's exit code is signet's exit code.** `signet exec -- pytest` is
+  asked to run pytest, and a wrapper needs pytest's answer.
+- **SIGINT and SIGTERM are forwarded**, so a supervisor or CI cancel does not
+  kill the wrapper and orphan the command holding the credentials.
+- **Every injection is audited per secret**, under the same event kind as
+  `reveal` — including the inputs of a derived secret, whose values it carries.
+  `signet audit --secret <input>` shows the disclosure.
+
+### `--redact`
+
+Filters the child's stdout and stderr, replacing any value signet manages with
+`«redacted:project/NAME»`:
+
+```
+$ signet exec --project construct-server --redact -- ./probe.sh
+signet: redacting 96 value(s) from the child's output; 2 shorter than 8 chars are NOT redacted: construct-server/AMBER_TAG, construct-server/DRYDOCK_TAG
+Authorization: Bearer «redacted:construct-server/PURSER_CF_API_TOKEN»
+```
+
+This flips the guarantee from *"the caller did not echo it"* to *"the stream was
+filtered on the way out"*. An accidental `echo $TOKEN`, a curl dumping request
+headers on error, a stack trace carrying the environment — all become
+non-events. No generic secret tool can do this, because none of them know the
+value set.
+
+The filter covers **every value the vault can resolve**, not only what this
+invocation injected: a command that reads a credential from a file signet also
+manages leaks a value signet knows perfectly well.
+
+**Its limits, which are not incidental:**
+
+- **It bounds accidents, not intent.** `signet exec -- printenv` still exists.
+  Redaction matches literal values, so a secret that has been base64'd,
+  line-wrapped, or otherwise transformed passes through untouched. Reading
+  `--redact` as a boundary against a hostile process would be the same false
+  guarantee as the permission rule it replaces.
+- **Values shorter than 8 characters are not redacted**, and are named on the
+  summary line. Redacting `5432` or `true` would replace ordinary text
+  throughout the output, and an operator who learns to read past
+  `«redacted:…»` will read past the one that mattered.
+- **Do not use it when the command's output is the artifact.** The filter
+  applies to stdout, so a command whose job is to *produce* a file containing
+  credentials will produce one full of placeholders.
+- **The child loses its terminal**, since its output goes through a pipe.
+  Progress bars, colour, and anything asking `isatty` will behave as though
+  redirected. This is why it is a flag rather than the default.
+
 ## Boundary
 
 - **The HTTP API never returns plaintext.** It serves metadata, version hashes
   (`#a3f9c1` = first 6 hex of SHA-256(nonce‖ciphertext) — never derived from
   plaintext alone), sync state, and the audit chain. The Switchyard admin UI is
   a *blind mirror* built on exactly this surface.
-- Plaintext leaves the vault in two audited ways only: `signet reveal` (stdout)
-  and rendered env-file targets.
+- Plaintext leaves the vault in three audited ways only: `signet reveal`
+  (stdout), `signet exec` (a child process's environment), and rendered
+  env-file targets.
 - **Ledger attribution**: CLI writes record `human` unless `SIGNET_ACTOR_ROLE`
   says otherwise. Agents driving allowlisted verbs should set it to
   `rule_engine`, or their changes are indistinguishable from a person's in a
@@ -575,3 +655,11 @@ make vet
 ```
 
 Pure-Go SQLite (modernc.org/sqlite) — no CGO, cross-compiles cleanly.
+
+**A new verb needs a permission decision before it ships.** Signet is driven by
+agents under a `Bash(signet <verb>:*)` allowlist, and nothing prompts for that
+decision — `derive` shipped in v1.6.0 and sat outside the rules for a week
+before anyone noticed. When adding a `case` to the dispatch switch, say in the
+PR whether the verb should be allowlisted and why. The question is not only
+"does it mutate": `exec` mutates nothing and discloses plaintext, which is the
+property that actually matters.

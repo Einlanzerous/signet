@@ -8,6 +8,7 @@
 //	signet set --project csrv --name API_TOKEN          # value on stdin
 //	signet rotate --secret csrv/API_TOKEN [--expires D] # new value + fan-out
 //	signet derive --project drydock --name DSN --from 'u:{{csrv/PW}}@h'
+//	signet exec --project csrv [--redact] -- ./deploy.sh  # injected, never printed
 //	signet reveal --project csrv --name API_TOKEN  # audited
 //	signet render --project lyceum [--check] [--prune]  # write / drift-check file targets
 //	signet target list [--secret csrv/NAME] [--project csrv]
@@ -89,6 +90,8 @@ func main() {
 		err = runRotate(args)
 	case "derive":
 		err = runDerive(args)
+	case "exec":
+		err = runExec(args)
 	case "sync":
 		err = runSync(args)
 	case "status":
@@ -106,13 +109,23 @@ func main() {
 		usage(os.Stderr)
 		os.Exit(2)
 	}
+	// A child's exit status is passed through rather than collapsed into
+	// log.Fatal's 1. `signet exec -- pytest` is asked to run pytest, and a
+	// script wrapping it needs pytest's answer; reporting 1 for every non-zero
+	// exit would make the wrapper lossy in exactly the place it is transparent
+	// everywhere else. Nothing is logged either: the child has already said
+	// whatever it had to say.
+	var ec *exitError
+	if errors.As(err, &ec) {
+		os.Exit(ec.code)
+	}
 	if err != nil {
 		log.Fatal(err)
 	}
 }
 
 func usage(w io.Writer) {
-	fmt.Fprintln(w, "commands: init, import, set, generate, rotate, derive, reveal, render, target, sync, status, audit, serve, version")
+	fmt.Fprintln(w, "commands: init, import, set, generate, rotate, derive, exec, reveal, render, target, sync, status, audit, serve, version")
 }
 
 func isFlag(s string) bool { return len(s) > 0 && s[0] == '-' }
