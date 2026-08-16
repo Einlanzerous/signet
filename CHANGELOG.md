@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.9.0](https://github.com/Einlanzerous/signet/compare/v1.8.1...v1.9.0) (2026-08-16)
+
+
+### Features
+
+* **exec:** run a command with secrets injected, never revealed (SGNT-32) ([#35](https://github.com/Einlanzerous/signet/issues/35)) ([63b8a91](https://github.com/Einlanzerous/signet/commit/63b8a91ce761abdbce74af7682e3b260ee92c9f9))
+
+
+### Bug Fixes
+
+* **render:** check whether a rendered target is stale before saying so (SGNT-31) ([#34](https://github.com/Einlanzerous/signet/issues/34)) ([d03ef5d](https://github.com/Einlanzerous/signet/commit/d03ef5dfcf1e2834827f81f8528f1e5b4d3fed3f))
+
 ## [1.8.1](https://github.com/Einlanzerous/signet/compare/v1.8.0...v1.8.1) (2026-08-14)
 
 
