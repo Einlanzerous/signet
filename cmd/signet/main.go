@@ -1461,18 +1461,68 @@ func runRender(args []string) error {
 	// cannot touch it — but staying silent let `render` report success while
 	// leaving the environment holding the values the file no longer has. The
 	// operator's next step is a sync, and nothing else was going to say so.
+	//
+	// What it must not do is assert that without checking. Writing a file target
+	// does not make a rendered one stale; the vault having moved on since its
+	// last push does, and renderState is what answers that — the same answer
+	// `--check` and `status` report, so the three cannot describe one target
+	// three ways.
 	if len(renderTargets) > 0 {
 		fmt.Printf("%d rendered target(s) in %s were not written — they deliver to GitHub, not to disk:\n", len(renderTargets), *project)
+		undelivered := 0
 		for i := range renderTargets {
 			cfg, err := renderTargets[i].GHRenderConfig()
 			if err != nil {
 				return err
 			}
-			fmt.Printf("  %s (%d keys) — now stale\n", cfg.Destination(), len(cfg.Keys))
+			note, wantsSync := renderedTargetNote(&renderTargets[i], renderState(&renderTargets[i], cfg, want, a.key))
+			if wantsSync {
+				undelivered++
+			}
+			fmt.Printf("  %s (%d keys) — %s\n", cfg.Destination(), len(cfg.Keys), note)
 		}
-		fmt.Printf("run `signet sync` to deliver them\n")
+		// Suggested only when a sync would actually do something. A next step
+		// printed after a report that says nothing is pending is how an operator
+		// learns to skip the line, including on the run where it matters.
+		if undelivered > 0 {
+			fmt.Printf("run `signet sync` to deliver them\n")
+		}
 	}
 	return nil
+}
+
+// renderedTargetNote words a rendered target's state for the end of a write,
+// and reports whether a sync is the operator's next step.
+//
+// The states divide in two, and the division is the point: "empty" and
+// "incomplete" are conditions sync *refuses*, so telling the operator to run one
+// sends them at a command that will decline. The rest are conditions sync
+// resolves. Only the second group earns the suggestion.
+func renderedTargetNote(t *store.Target, state string) (string, bool) {
+	switch state {
+	case "empty":
+		return "manages no keys — sync refuses it rather than deliver an empty environment", false
+	case "incomplete":
+		return "INCOMPLETE — managed key(s) have no value in the vault, so sync refuses it; `signet render --check` names them", false
+	case "never":
+		// Not "stale", which would claim this render made it so. It has never
+		// been delivered at all, and that is a different first step: the
+		// --against comparison, which is the only guard on a first push.
+		return "never pushed — the environment does not have these values yet", true
+	case "drift":
+		return "now stale", true
+	case "unknown":
+		return "delivered once, before signet recorded fingerprints — currency unknown until the next push", true
+	case "error":
+		// The reason is carried rather than summarized: "error" alone sends the
+		// reader to `target list` for the one fact they need.
+		if t.LastError != "" {
+			return fmt.Sprintf("last push failed (%s)", t.LastError), true
+		}
+		return "last push failed", true
+	default:
+		return fmt.Sprintf("%s — this render changed nothing it delivers", state), false
+	}
 }
 
 // projectValues resolves every current value of a project into a map, and
@@ -1619,7 +1669,12 @@ func printRenderCheck(t *store.Target, project string, want map[string]string, p
 			fmt.Printf("    %-40s %s\n", k, reason)
 		}
 	} else {
-		fmt.Printf("  state: %s\n", t.GHState(nil, vault.ValueDigest(key, mustRenderBlob(cfg, project, want))))
+		// renderState rather than an inline GHState: `status`, this report and
+		// the note at the end of a write all answer "is this destination
+		// current?", and a second copy of the answer is how they would come to
+		// disagree. The branches above have already excluded the two states it
+		// reports that this one words for itself.
+		fmt.Printf("  state: %s\n", renderState(t, cfg, want, key))
 	}
 
 	if against == "" {
@@ -1667,19 +1722,6 @@ func printRenderCheck(t *store.Target, project string, want map[string]string, p
 		fmt.Printf("  and would add %d key(s) that %s does not have\n", added, against)
 	}
 	return blocking, nil
-}
-
-// mustRenderBlob renders a target whose keys have already been confirmed
-// resolvable. The error path is unreachable — the caller checked for exactly
-// the one condition that produces it — and returning "" on it is harmless: it
-// would yield a digest that matches no recorded push, so the state reads as
-// drift rather than as a false "in sync".
-func mustRenderBlob(cfg store.GHRenderConfig, project string, want map[string]string) string {
-	content, err := syncpkg.RenderBlob(cfg, project, want)
-	if err != nil {
-		return ""
-	}
-	return content
 }
 
 // printDrift reports one file target's state. With prune set the report is the

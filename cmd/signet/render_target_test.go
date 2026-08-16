@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"github.com/Einlanzerous/signet/internal/store"
+	syncpkg "github.com/Einlanzerous/signet/internal/sync"
+	"github.com/Einlanzerous/signet/internal/vault"
 )
 
 // seedProject builds a project with an env file on disk, imports it so the
@@ -544,10 +546,40 @@ func TestAllowShrinkRefusesToCoverAWholeRun(t *testing.T) {
 	}
 }
 
+// markRenderTargetPushed records the push the destination would hold if a sync
+// had just delivered the project's current values — the digest computed exactly
+// as the push path computes it, so GHState answers "in sync" rather than by
+// coincidence of an empty column.
+func markRenderTargetPushed(t *testing.T, st *store.Store, project string) {
+	t.Helper()
+	a, err := setup()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.close()
+	want, err := a.projectValuesStrict(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tgt, cfg := renderTargetOf(t, st, project)
+	content, err := syncpkg.RenderBlob(cfg, project, want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateTargetPush(tgt.ID, "in sync", "",
+		&store.PushProvenance{Digest: vault.ValueDigest(a.key, content), Keys: cfg.Keys},
+		"2026-08-15T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // `render` writes files. A rendered target delivers over the network, so this
 // command cannot touch it — but reporting success while leaving the environment
 // holding the values the file no longer has is the same silent staleness the
 // target kind exists to prevent.
+//
+// A target that has never been pushed is the case that wants the warning most:
+// nothing has ever reached the environment.
 func TestRenderWriteSaysTheRenderedTargetsWereNotWritten(t *testing.T) {
 	st := newCLIVault(t)
 	seedProject(t, st, "csrv", map[string]string{"ALPHA": "a"})
@@ -563,11 +595,77 @@ func TestRenderWriteSaysTheRenderedTargetsWereNotWritten(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
-	if !strings.Contains(out, "were not written") || !strings.Contains(out, "stale") {
+	if !strings.Contains(out, "were not written") || !strings.Contains(out, "never pushed") {
 		t.Fatalf("a write said nothing about the rendered target it could not write:\n%s", out)
 	}
 	if !strings.Contains(out, "signet sync") {
 		t.Fatalf("the note does not name the next step:\n%s", out)
+	}
+}
+
+// The warning used to be printed unconditionally, so it was wrong exactly when
+// things were fine — and a warning that cries wolf on every clean run is one an
+// operator learns to skip, including on the run where it is right. Writing a
+// file target does not make a rendered target stale; only the vault moving on
+// since its last push does. Observed 2026-08-15 during a rotation, on a target
+// that had been pushed minutes earlier (SGNT-31).
+func TestRenderWriteDoesNotCallAnInSyncRenderedTargetStale(t *testing.T) {
+	st := newCLIVault(t)
+	seedProject(t, st, "csrv", map[string]string{"ALPHA": "a"})
+	if err := runTargetAdd([]string{
+		"--project", "csrv", "--render-as-secret", "--gh-repo", "o/r",
+		"--gh-environment", "home-server", "--gh-secret", "PROD_ENV_FILE", "--no-preflight",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	markRenderTargetPushed(t, st, "csrv")
+
+	out := captureStdout(t, func() {
+		if err := runRender([]string{"--project", "csrv"}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if strings.Contains(out, "stale") {
+		t.Fatalf("a rendered target that is in sync was reported stale:\n%s", out)
+	}
+	// The suggestion is the actionable half of the bug: the operator ran the
+	// sync it asked for and it had already happened.
+	if strings.Contains(out, "signet sync") {
+		t.Fatalf("a sync was suggested with nothing to deliver:\n%s", out)
+	}
+	if !strings.Contains(out, "in sync") {
+		t.Fatalf("the report does not say the target is current:\n%s", out)
+	}
+}
+
+// The other half of the same guarantee: once the vault moves on, the warning
+// must come back. Without this the fix could have been "never warn".
+func TestRenderWriteSaysStaleOnceTheVaultMovesOn(t *testing.T) {
+	st := newCLIVault(t)
+	seedProject(t, st, "csrv", map[string]string{"ALPHA": "a"})
+	if err := runTargetAdd([]string{
+		"--project", "csrv", "--render-as-secret", "--gh-repo", "o/r",
+		"--gh-environment", "home-server", "--gh-secret", "PROD_ENV_FILE", "--no-preflight",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	markRenderTargetPushed(t, st, "csrv")
+	// Minting a new value is the cheapest way to move the vault on without a
+	// network push; what the value becomes is irrelevant, only that it changed.
+	if err := runGenerate([]string{"--project", "csrv", "--name", "ALPHA", "--replace"}); err != nil {
+		t.Fatal(err)
+	}
+
+	out := captureStdout(t, func() {
+		if err := runRender([]string{"--project", "csrv"}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(out, "now stale") {
+		t.Fatalf("the vault moved on and the rendered target was not reported stale:\n%s", out)
+	}
+	if !strings.Contains(out, "signet sync") {
+		t.Fatalf("a stale target was reported without naming the next step:\n%s", out)
 	}
 }
 
