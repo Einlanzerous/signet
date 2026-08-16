@@ -8,6 +8,7 @@
 //	signet set --project csrv --name API_TOKEN          # value on stdin
 //	signet rotate --secret csrv/API_TOKEN [--expires D] # new value + fan-out
 //	signet derive --project drydock --name DSN --from 'u:{{csrv/PW}}@h'
+//	signet exec --project csrv [--redact] -- ./deploy.sh  # injected, never printed
 //	signet reveal --project csrv --name API_TOKEN  # audited
 //	signet render --project lyceum [--check] [--prune]  # write / drift-check file targets
 //	signet target list [--secret csrv/NAME] [--project csrv]
@@ -89,6 +90,8 @@ func main() {
 		err = runRotate(args)
 	case "derive":
 		err = runDerive(args)
+	case "exec":
+		err = runExec(args)
 	case "sync":
 		err = runSync(args)
 	case "status":
@@ -106,13 +109,23 @@ func main() {
 		usage(os.Stderr)
 		os.Exit(2)
 	}
+	// A child's exit status is passed through rather than collapsed into
+	// log.Fatal's 1. `signet exec -- pytest` is asked to run pytest, and a
+	// script wrapping it needs pytest's answer; reporting 1 for every non-zero
+	// exit would make the wrapper lossy in exactly the place it is transparent
+	// everywhere else. Nothing is logged either: the child has already said
+	// whatever it had to say.
+	var ec *exitError
+	if errors.As(err, &ec) {
+		os.Exit(ec.code)
+	}
 	if err != nil {
 		log.Fatal(err)
 	}
 }
 
 func usage(w io.Writer) {
-	fmt.Fprintln(w, "commands: init, import, set, generate, rotate, derive, reveal, render, target, sync, status, audit, serve, version")
+	fmt.Fprintln(w, "commands: init, import, set, generate, rotate, derive, exec, reveal, render, target, sync, status, audit, serve, version")
 }
 
 func isFlag(s string) bool { return len(s) > 0 && s[0] == '-' }
@@ -716,27 +729,9 @@ func runReveal(args []string) error {
 		return err
 	}
 
-	// Revealing a derived secret prints its inputs' plaintext, so each input's
-	// own ledger has to record that its value was disclosed. Without this the
-	// entry above is the only trace, and `signet audit --secret <input>` shows
-	// nothing — a read channel that crosses projects and leaves no mark on the
-	// credential actually exposed. The vault's premise is that plaintext leaves
-	// only in audited ways; "audited" has to mean audited where someone
-	// investigating that credential would look.
-	inputs, err := resolve.Inputs(a.st, sec)
-	if err != nil {
+	if err := a.auditDerivedInputs(sec, "secret.reveal",
+		fmt.Sprintf("value disclosed via reveal of %s/%s, which derives from it", *project, *name)); err != nil {
 		return err
-	}
-	for _, in := range inputs {
-		if _, err := a.st.AppendAudit(store.AuditRecord{
-			Actor: cliActor(), Action: "secret.reveal", SecretID: in.ID,
-			Details: fmt.Sprintf("value disclosed via reveal of %s/%s, which derives from it",
-				*project, *name),
-			EventKind: store.KindSecretReveal, ActorRole: cliRole(),
-			Status: &store.AuditStatus{Outcome: store.OutcomeDelivered},
-		}); err != nil {
-			return err
-		}
 	}
 	// The provenance goes to stderr so `reveal` stays pipeable: the value alone
 	// is on stdout, exactly as before, and a reader piping it into a file does
@@ -745,6 +740,42 @@ func runReveal(args []string) error {
 		fmt.Fprintf(os.Stderr, "%s/%s is derived from: %s\n", *project, *name, sec.Derivation)
 	}
 	fmt.Println(plain)
+	return nil
+}
+
+// auditDerivedInputs records a disclosure against the inputs of a derived
+// secret, whose plaintext its value carries.
+//
+// The rule — *a disclosure of a derived secret is a disclosure of its inputs* —
+// belongs to the derivation graph, not to any one channel that reads it.
+// `reveal` and `exec` both disclose, and a third will; stated once per verb it
+// is restated or forgotten, which is how the gap this closes existed for
+// `reveal` in the first place.
+//
+// Without it the entry on the derived secret is the only trace, and
+// `signet audit --secret <input>` shows nothing for a read that crossed
+// projects and exposed that credential. The vault's premise is that plaintext
+// leaves only in audited ways; "audited" has to mean audited where someone
+// investigating that credential would look.
+//
+// detail is the caller's, because what an investigator needs differs between a
+// reveal to a terminal and an injection into a process — but the traversal and
+// the kind are not negotiable, and are therefore not the caller's to get wrong.
+func (a *app) auditDerivedInputs(sec *store.Secret, action, detail string) error {
+	inputs, err := resolve.Inputs(a.st, sec)
+	if err != nil {
+		return err
+	}
+	for _, in := range inputs {
+		if _, err := a.st.AppendAudit(store.AuditRecord{
+			Actor: cliActor(), Action: action, SecretID: in.ID,
+			Details:   detail,
+			EventKind: store.KindSecretReveal, ActorRole: cliRole(),
+			Status: &store.AuditStatus{Outcome: store.OutcomeDelivered},
+		}); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
