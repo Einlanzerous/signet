@@ -638,6 +638,115 @@ func TestRenderWriteDoesNotCallAnInSyncRenderedTargetStale(t *testing.T) {
 	}
 }
 
+// EMPTY and INCOMPLETE are the states sync *refuses*, so pointing the operator
+// at one sends them at a command that will decline — the same misdirection the
+// unconditional "now stale" was, in a new place. Nothing covered this before:
+// flipping either state to wantsSync left the suite green.
+func TestRenderWriteWithholdsTheSyncSuggestionForStatesSyncRefuses(t *testing.T) {
+	st := newCLIVault(t)
+	seedProject(t, st, "csrv", map[string]string{"ALPHA": "a"})
+	if err := runTargetAdd([]string{
+		"--project", "csrv", "--render-as-secret", "--gh-repo", "o/r",
+		"--gh-environment", "home-server", "--gh-secret", "PROD_ENV_FILE", "--no-preflight",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// A secret created but never given a value, attached to the render target
+	// through the store — `target add-key` refuses an unresolvable key, which
+	// closes one way into this state but not the state itself. A key seeded
+	// from a file target, or one whose value is removed later, arrives here the
+	// same way.
+	if _, err := st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
+		s, err := m.CreateSecret("csrv", "PENDING", "", false, "")
+		if err != nil {
+			return store.AuditRecord{}, err
+		}
+		return store.AuditRecord{
+			Actor: "test", Action: "secret.create", SecretID: s.ID, Details: "fixture",
+			EventKind: store.KindSecretWrite, ActorRole: store.RoleHuman,
+			Status: &store.AuditStatus{Outcome: store.OutcomeCreated},
+		}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tgt, _ := renderTargetOf(t, st, "csrv")
+	if _, err := st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
+		updated, _, err := m.AddRenderKeys(&tgt, []string{"PENDING"})
+		if err != nil {
+			return store.AuditRecord{}, err
+		}
+		return store.AuditRecord{
+			Actor: "test", Action: "target.render", TargetID: updated.ID, Details: "fixture",
+			EventKind: store.KindTargetConfig, ActorRole: store.RoleHuman,
+			Status: &store.AuditStatus{Outcome: store.OutcomeUpdated},
+		}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	out := captureStdout(t, func() {
+		if err := runRender([]string{"--project", "csrv"}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(out, "INCOMPLETE") {
+		t.Fatalf("an unpushable target was not reported as incomplete:\n%s", out)
+	}
+	if strings.Contains(out, "run `signet sync`") {
+		t.Fatalf("a sync was suggested for a target sync would refuse:\n%s", out)
+	}
+	if strings.Contains(out, "stale") {
+		t.Fatalf("an incomplete target was reported as stale:\n%s", out)
+	}
+}
+
+// A never-pushed target's next step is the --against comparison, not a sync:
+// the first push is the one no other guard covers, since there is no previous
+// delivery to compare against and the destination cannot be read back. The
+// group's trailing `signet sync` line cannot say that, so the target has to.
+func TestRenderWriteSendsANeverPushedTargetToTheAgainstCheck(t *testing.T) {
+	st := newCLIVault(t)
+	seedProject(t, st, "csrv", map[string]string{"ALPHA": "a"})
+	if err := runTargetAdd([]string{
+		"--project", "csrv", "--render-as-secret", "--gh-repo", "o/r",
+		"--gh-environment", "home-server", "--gh-secret", "PROD_ENV_FILE", "--no-preflight",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	out := captureStdout(t, func() {
+		if err := runRender([]string{"--project", "csrv"}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(out, "--against") {
+		t.Fatalf("a first push was not sent at the only guard it has:\n%s", out)
+	}
+	// printRenderCheck names the same step for the same target; the two
+	// commands disagreeing about a first push is what routing both through
+	// renderState was meant to prevent.
+	if !strings.Contains(out, "--check --against") {
+		t.Fatalf("the hint does not name the check that performs it:\n%s", out)
+	}
+}
+
+// A state renderedTargetNote has not been taught must read as itself and count
+// as undelivered. Folding it into the in-sync wording would make an unchecked
+// word an all-clear and suppress the suggestion — this bug exactly, one state
+// along, which is how it would come back.
+func TestAnUnknownRenderStateIsNotReportedAsAnAllClear(t *testing.T) {
+	note := renderedTargetNote(&store.Target{}, "refused")
+	if !note.wantsSync {
+		t.Fatal("an unrecognized state suppressed the sync suggestion")
+	}
+	if strings.Contains(note.text, "changed nothing") {
+		t.Fatalf("an unrecognized state was worded as an all-clear: %q", note.text)
+	}
+	if note.text != "refused" {
+		t.Fatalf("the state was not reported as itself: %q", note.text)
+	}
+}
+
 // The other half of the same guarantee: once the vault moves on, the warning
 // must come back. Without this the fix could have been "never warn".
 func TestRenderWriteSaysStaleOnceTheVaultMovesOn(t *testing.T) {
