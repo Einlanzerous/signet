@@ -244,10 +244,19 @@ manages leaks a value signet knows perfectly well.
   line-wrapped, or otherwise transformed passes through untouched. Reading
   `--redact` as a boundary against a hostile process would be the same false
   guarantee as the permission rule it replaces.
+- **The injected values are visible to other processes.** While the child runs,
+  anything running as the same user can read `/proc/<pid>/environ`. That is
+  inherent to environment injection and true of every tool in this class, but it
+  is worth stating in the agent case, where other commands genuinely do run as
+  the same user.
 - **Values shorter than 8 characters are not redacted**, and are named on the
   summary line. Redacting `5432` or `true` would replace ordinary text
   throughout the output, and an operator who learns to read past
   `«redacted:…»` will read past the one that mattered.
+- **The coverage summary is on stderr**, because on stdout it would corrupt
+  anything being piped. So `--redact 2>/dev/null` gives you a filtered stdout
+  with no record of what was *not* filtered. If you discard stderr, you discard
+  the caveat that qualifies the guarantee.
 - **Do not use it when the command's output is the artifact.** The filter
   applies to stdout, so a command whose job is to *produce* a file containing
   credentials will produce one full of placeholders.

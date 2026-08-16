@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os/exec"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/Einlanzerous/signet/internal/store"
@@ -95,6 +96,26 @@ func TestExecPropagatesTheChildsExitCode(t *testing.T) {
 	}
 	if ec.code != 42 {
 		t.Fatalf("exit code = %d, want 42", ec.code)
+	}
+}
+
+// A child killed by a signal must report 128+N, not the 255 that
+// ExitError.ExitCode's -1 turns into. This is the case forwardSignals
+// deliberately creates: when a CI cancel or a Ctrl-C reaches the child, it dies
+// on a signal, and 255 would be indistinguishable from the command choosing to
+// fail — losing the one fact the exit code was carrying.
+func TestExecReportsASignalledChildAsAShellWould(t *testing.T) {
+	requireShell(t)
+	newCLIVault(t)
+	seedValue(t, "csrv", "API_TOKEN", "s3cret-token-value")
+
+	err := runExec(append([]string{"--secret", "csrv/API_TOKEN"}, shell("kill -TERM $$")...))
+	var ec *exitError
+	if !errors.As(err, &ec) {
+		t.Fatalf("err = %v, want an exitError", err)
+	}
+	if ec.code != 128+int(syscall.SIGTERM) {
+		t.Fatalf("exit code = %d, want %d", ec.code, 128+int(syscall.SIGTERM))
 	}
 }
 

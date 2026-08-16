@@ -173,6 +173,44 @@ func TestDuplicateValuesResolveDeterministically(t *testing.T) {
 	}
 }
 
+// Longest-wins has to hold across writes, not merely within whatever happens
+// to be buffered. Where one managed value is a strict prefix of another — which
+// `derive` produces whenever a template opens with its reference — a write
+// ending exactly at the shorter value's last byte used to take the short match
+// and forward the longer value's remaining bytes as plaintext.
+//
+// The result was worse than not redacting: a «redacted:…» telling the reader
+// the filter ran, immediately followed by the tail of a credential it missed.
+func TestAShortValueThatPrefixesALongerOneDoesNotLeakItsTail(t *testing.T) {
+	short := "tok-abcdefgh"
+	long := short + "IJKLMNOP"
+	f := filterOf(
+		Value{Name: "p/SHORT", Plain: short},
+		Value{Name: "p/LONG", Plain: long},
+	)
+
+	// The split lands exactly on the shorter value's final byte.
+	got := run(t, f, "start "+short, "IJKLMNOP end")
+	if strings.Contains(got, "IJKLMNOP") {
+		t.Fatalf("the longer value's tail was forwarded in clear: %q", got)
+	}
+	if got != "start «redacted:p/LONG» end" {
+		t.Fatalf("got %q", got)
+	}
+
+	// And the same input in one write must agree, or the filter's answer
+	// depends on how the kernel happened to chunk the stream.
+	if one := run(t, f, "start "+long+" end"); one != got {
+		t.Fatalf("split and whole disagree: %q vs %q", got, one)
+	}
+
+	// The shorter value must still be matched on its own, or the fix would
+	// have been "hold everything forever".
+	if alone := run(t, f, "start "+short+" end"); alone != "start «redacted:p/SHORT» end" {
+		t.Fatalf("the shorter value stopped matching on its own: %q", alone)
+	}
+}
+
 // Output that cannot match anything must not be held back. The loose
 // implementation — always reserve maxLen bytes — stalls a child's interactive
 // output behind a buffer waiting on a match that will never come.

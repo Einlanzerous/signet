@@ -135,9 +135,29 @@ func runExec(args []string) error {
 
 	var ee *exec.ExitError
 	if errors.As(waitErr, &ee) {
-		return &exitError{code: ee.ExitCode()}
+		return &exitError{code: exitStatus(ee)}
 	}
 	return waitErr
+}
+
+// exitStatus reduces a child's wait status to the number a shell would report.
+//
+// ExitCode returns -1 when the child died on a signal, and os.Exit(-1) becomes
+// 255 — a generic failure, indistinguishable from the command itself deciding
+// to fail. That collapses exactly the case this command deliberately creates:
+// forwardSignals exists so a CI cancel or a Ctrl-C reaches the child, and when
+// it works the child dies on a signal. Reporting 255 there would make the
+// README's "the child's exit code is signet's exit code" false in precisely the
+// case the sentence two lines below it describes.
+//
+// 128+N is the convention every shell uses, so `signet exec -- …` cancelled
+// with SIGTERM answers 143 the way the same command answers 143 without the
+// wrapper.
+func exitStatus(ee *exec.ExitError) int {
+	if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+		return 128 + int(ws.Signal())
+	}
+	return ee.ExitCode()
 }
 
 // execEnv resolves what the selectors name, keyed by the environment variable
@@ -300,24 +320,12 @@ func (a *app) auditExec(inject map[string]injected, command string, redacted boo
 			return err
 		}
 		// A derived secret's value carries its inputs', so injecting it
-		// discloses them too. Without this, `signet audit --secret <input>`
-		// shows nothing for a disclosure that crossed projects — the same gap
-		// closed for `reveal`, and the same reasoning: audited has to mean
-		// audited where someone investigating that credential would look.
-		inputs, err := resolve.Inputs(a.st, &in.secret)
-		if err != nil {
+		// discloses them too — see auditDerivedInputs for why the traversal
+		// lives there rather than here.
+		if err := a.auditDerivedInputs(&in.secret, "secret.exec",
+			fmt.Sprintf("value disclosed to %q via exec of %s/%s, which derives from it",
+				command, in.secret.Project, in.secret.Name)); err != nil {
 			return err
-		}
-		for _, dep := range inputs {
-			if _, err := a.st.AppendAudit(store.AuditRecord{
-				Actor: cliActor(), Action: "secret.exec", SecretID: dep.ID,
-				Details: fmt.Sprintf("value disclosed to %q via exec of %s/%s, which derives from it",
-					command, in.secret.Project, in.secret.Name),
-				EventKind: store.KindSecretReveal, ActorRole: cliRole(),
-				Status: &store.AuditStatus{Outcome: store.OutcomeDelivered},
-			}); err != nil {
-				return err
-			}
 		}
 	}
 	return nil

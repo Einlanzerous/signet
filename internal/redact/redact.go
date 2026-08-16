@@ -192,15 +192,30 @@ func (f *Filter) scan(buf []byte, eof bool) (out, keep []byte) {
 	out = make([]byte, 0, len(buf))
 	i := 0
 	for i < len(buf) {
+		// Held back BEFORE a match is accepted, not after one fails.
+		//
+		// Checking matchAt first makes the guarantee "longest wins within
+		// whatever happens to be buffered", which is not the property this type
+		// needs. Where one managed value is a strict prefix of another — which
+		// `derive` produces whenever a template opens with its reference — a
+		// write ending exactly at the shorter value's last byte would take the
+		// short match, emit its placeholder, and forward the longer value's
+		// remaining bytes as plaintext on the next write.
+		//
+		// That output is worse than not redacting at all: it carries a
+		// «redacted:…» that tells the reader the filter ran, immediately
+		// followed by part of a credential it did not catch.
+		//
+		// couldStart requires the tail to be a *strict* prefix, so a complete
+		// match with no longer candidate behind it is not held; and the eof
+		// path resolves longest-wins over the full remainder.
+		if !eof && len(buf)-i < f.maxLen && f.couldStart(buf[i:]) {
+			break
+		}
 		if c, ok := f.matchAt(buf, i); ok {
 			out = append(out, c.placeholder...)
 			i += len(c.plain)
 			continue
-		}
-		// Not a complete match. If what remains could still become one once
-		// more bytes arrive, stop here and keep the rest.
-		if !eof && len(buf)-i < f.maxLen && f.couldStart(buf[i:]) {
-			break
 		}
 		out = append(out, buf[i])
 		i++
