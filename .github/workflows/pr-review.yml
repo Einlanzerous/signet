@@ -35,15 +35,28 @@ jobs:
   pr-review:
     uses: Einlanzerous/construct-server/.github/workflows/pr-review-reusable.yml@main
     with:
-      # NARROWED, deliberately (SGNT-36). This was `^(internal/|cmd/|...)`, which
-      # is every Go file in the repo — 47 of 47. A tier that selects everything
-      # selects nothing: every PR paid for the deeper pass and the escalation
-      # stopped carrying information. The shared workflow cannot catch that for
-      # you; the regex is valid and non-empty, it is just not a decision.
+      # Narrowed from `^(internal/|cmd/|...)`, which was every Go file in the
+      # repo. But the honest headline is not the file count, and the first
+      # version of this comment got it wrong by quoting one:
       #
-      # This list is a decision. Signet is a secrets daemon, so the sensitive
-      # share is legitimately high — 34 of 47 — but it is now selected rather
-      # than assumed:
+      # THE TIER STILL DOES NOT DISCRIMINATE BETWEEN THIS REPO'S PRs. Replayed
+      # against the last 12 merged PRs, old regex and new: 7 of 7 non-release PRs
+      # classify `high` either way. The other 5 are release PRs, skipped before
+      # the tier is decided. 41-of-47 *files* is a real narrowing and it changes
+      # nothing at PR granularity, because `cmd/signet/main.go` is 3,540 lines —
+      # every CLI verb in one file — and it alone drives the `high` on 5 of the
+      # 7, and on #34 (a render-staleness fix touching no crypto, no ledger, no
+      # destination) it is the only thing driving it.
+      #
+      # No reachable regex fixes that: dropping main.go entirely moves only #34,
+      # leaving 6 of 7. Discriminating below this requires splitting main.go,
+      # which is a source change and a separate ticket, not a CI input. Recorded
+      # here rather than papered over, because the failure mode SGNT-36 names —
+      # a selector that matches everything carries no information — is still
+      # present at PR granularity, and a comment claiming otherwise is how it
+      # stays unexamined.
+      #
+      # What it selects, and why:
       #
       #   vault/ redact/ derive/    hold, hide and derive secret material
       #   sync/ envfile/            deliver secrets to targets and to disk
@@ -53,15 +66,42 @@ jobs:
       #                             the wrong place
       #   config/                   env loading, where "empty read as configured"
       #                             bugs live (SWY-172, estate-wide)
+      #   resolve/                  REVIEW.md's always-check list, verbatim:
+      #                             "Reads of a secret's value go through
+      #                             internal/resolve". Its own doc comment calls
+      #                             a reader that resolves independently "the bug
+      #                             this package exists to prevent". Demoting it
+      #                             was wrong: a change to when ErrNoVersion is
+      #                             returned decides whether render/status skip a
+      #                             secret while reveal/push must fail — the one
+      #                             change class that reaches every destination.
       #   ops/ghtoken, ops/rotate   the vault's own credential, and what may be
       #                             rotated
+      #   ops/import                REVIEW.md names it for the repo's
+      #                             most-repeated defect — "the provenance column
+      #                             was written by set but not by import" — and
+      #                             it is still a version-minting write path,
+      #                             making the Issued-vs-Minted call that decides
+      #                             whether an externally-issued credential
+      #                             becomes rotatable
       #   cmd/signet/main.go        includes `reveal`
       #   cmd/signet/exec.go        runs a child process with secrets in its env
       #
-      # Tests for those packages are IN, on switchyard's authz-guard lesson:
-      # deleting a guard's invocation was caught, gutting its logic was not.
-      # Out: resolve/, version/, logtest/, ops/import, and cmd tests.
-      sensitive_paths: '^(internal/(vault|redact|derive|sync|envfile|api|store|config)/|internal/ops/(ghtoken|rotate)|cmd/signet/(main|exec)\.go|\.github/workflows/|REVIEW\.md|CLAUDE\.md|\.github/review-prompt\.md|\.github/review-ignore)'
+      # Tests included, on switchyard's authz-guard lesson: deleting a guard's
+      # invocation was caught, gutting its logic was not. `cmd/signet/(main|exec)`
+      # is deliberately unanchored so it covers exec_test.go, which holds
+      # TestExecRedactsTheChildsOutput and TestExecRedactsSecretsItDidNotInject —
+      # the guards for the path above it. Anchoring to `\.go` excluded exactly
+      # those, applying the stated rule to internal/ and then not to cmd/.
+      #
+      # `.github/review-prompt.md` is NOT here any more: this PR deletes it and
+      # the procedure is fetched from construct-server, so no future PR can touch
+      # that path and the alternative could never match again.
+      # `.github/review-ignore` stays for the opposite reason — it legitimately
+      # does not exist yet, and a PR adding one should escalate.
+      #
+      # Out: version/, logtest/, and the four cmd tests that guard no secret path.
+      sensitive_paths: '^(internal/(vault|redact|derive|sync|envfile|api|store|config|resolve)/|internal/ops/(ghtoken|rotate|import)|cmd/signet/(main|exec)|\.github/workflows/|REVIEW\.md|CLAUDE\.md|\.github/review-ignore)'
     secrets:
       claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
       switchyard_token: ${{ secrets.SWITCHYARD_REVIEWER_TOKEN }}
