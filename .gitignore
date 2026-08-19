@@ -8,3 +8,9 @@
 
 # one-shot local bring-up helper
 import-estate.sh
+
+# PR reviewer scratch, written into the workspace by the shared reviewer workflow.
+.review-scope/
+review-verdict.json
+review-body.md
+ticket-comment.md
