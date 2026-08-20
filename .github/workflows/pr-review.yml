@@ -15,7 +15,11 @@ name: PR Review
 # assertion that catches "verdict written but review never posted".
 #
 # `.github/review-prompt.md` is deleted — the shared workflow fetches the
-# procedure from construct-server at the exact commit it is running.
+# procedure from construct-server (`prompt_repo`/`prompt_ref`, defaulting to
+# `@main`), so a local copy could only ever drift out of use. It is NOT fetched
+# at the workflow's own commit — `job_workflow_sha` would have given that and is
+# empty on this Actions version, which is what 404'd the fetch on #37 — so
+# pinning `uses: ...@<tag>` means pinning `prompt_ref` to match.
 
 on:
   pull_request:
