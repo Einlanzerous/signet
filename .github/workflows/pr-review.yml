@@ -1,33 +1,21 @@
 name: PR Review
 
-# Fresh-context review of every pull request (SERV-59).
+# Fresh-context review of every pull request (SGNT-21), via the shared definition
+# in construct-server (SERV-92). This was 465 lines of hand-copied workflow.
 #
-# Signet is the credential vault, which makes it the repo with the least margin
-# for an unreviewed merge and the one where CI proves the least: `ci.yml` runs
-# gofmt, vet, `go test -race` and a build, and none of those observe the
-# properties that matter here — that plaintext does not escape, that a mutation
-# and its ledger entry stay atomic, that a destination is not reported healthy
-# without being checked. Every finding this reviewer is here for has been found
-# after a green suite (SGNT-21).
+# It had none of SERV-87's fixes, and this is the repo where that cost the most:
+# SGNT-32 merged with seven changed files and three green `review` checks, none
+# of which reviewed anything, and SGNT-30 merged unreviewed after the reviewer
+# exhausted `--max-turns 40` and posted nothing. Signet is the repo SGNT-21
+# adopted the reviewer for on the grounds that it has "the least margin for an
+# unreviewed merge".
 #
-# The point of running this in CI rather than asking for it in a session is that
-# the reviewer structurally cannot share context with whatever wrote the code,
-# and it fires whether or not anyone remembers to ask for it.
+# Two things this repo contributed upstream, now in the shared definition rather
+# than only here: the release-PR skip, and the count-reviews-before/after
+# assertion that catches "verdict written but review never posted".
 #
-# Auth is a Claude subscription token, not an API key. At current throughput
-# (800+ tickets a quarter, 1-3 review cycles each) per-token billing would run
-# into four figures a quarter for the same work the subscription already covers.
-# Swapping to `anthropic_api_key` is a one-line change if that calculus shifts.
-# SERV-64 tracks moving the backend to local gemma, which drops the cost to zero
-# and is why the reviewer itself lives in `.github/review-prompt.md` rather than
-# inline here — the prompt is the deliverable, the model behind it is config.
-#
-# Runs on the self-hosted runner so the reviewer sits on `construct_net` and can
-# reach Switchyard and Ollama directly, without negotiating the access edge.
-#
-# Triggering is risk-based rather than uniform. Reviewing every push at every
-# depth is the expensive default; instead docs-only diffs are skipped, sensitive
-# paths get a deeper pass, and re-review on push is opt-in per PR via a label.
+# `.github/review-prompt.md` is deleted — the shared workflow fetches the
+# procedure from construct-server at the exact commit it is running.
 
 on:
   pull_request:
@@ -35,431 +23,85 @@ on:
   issue_comment:
     types: [created]
 
-# The reviewer reads code and writes comments. It never needs to write contents,
-# and withholding that is what actually stops it from pushing — the instruction
-# in the prompt is belt to this braces.
+# A called workflow cannot be granted more than its caller holds.
 permissions:
   contents: read
   pull-requests: write
   issues: read
 
-concurrency:
-  # A rapid push series should cost one review, not one per push — but the
-  # trigger is part of the key so a `synchronize` cannot cancel an in-flight
-  # `@claude review`. Sharing the group let a push kill a requested review whose
-  # replacement then skipped at triage, producing a green check and no review:
-  # the same silent pass the Gate step exists to prevent, through another door.
-  # The action is in the key as well as the event: `opened` and `synchronize`
-  # are both `pull_request`, so keying on the event alone still let a fixup
-  # pushed minutes after opening cancel the opening review — whose replacement
-  # then skipped at triage for lacking the label, green and unreviewed. That is
-  # the same silent pass, third variant; it was closed for the manual path and
-  # left open on the path that runs for every PR.
-  group: pr-review-${{ github.event.pull_request.number || github.event.issue.number }}-${{ github.event_name }}-${{ github.event.action }}
-  cancel-in-progress: true
+# No `concurrency:` — the shared workflow owns it.
 
 jobs:
-  review:
-    # `pull_request` on a self-hosted runner is the classic fork-execution hole.
-    # This repo is private and single-author so it is largely theoretical, but
-    # inheriting it silently is how it stops being theoretical later.
-    #
-    # Both paths end up holding PR code: checkout with no `ref:` takes
-    # github.ref, which for a pull_request is refs/pull/N/merge. The extra
-    # checkout step exists because issue_comment leaves github.ref on the
-    # default branch, not because the pull_request path avoids PR content.
-    #
-    # So the reviewer's own procedure — .github/review-prompt.md, cat'd from the
-    # workspace — is the PR's copy on both paths, and this review is running
-    # under it. That is not a widening: the gate below admits same-repo PRs
-    # only, and for pull_request GitHub runs the head's copy of this workflow
-    # anyway, so anyone who could rewrite the prompt could rewrite this file
-    # beside it. What the guards actually do is decide whether a fork's code is
-    # checked out at all (head-repo check) and who may ask for a review
-    # (author_association). Unlike CLAUDE.md, review-prompt.md is not restored
-    # from base; if it should be, read it with `git show origin/BASE:...`.
-    if: >-
-      (github.event_name == 'pull_request' &&
-       github.event.pull_request.head.repo.full_name == github.repository) ||
-      (github.event_name == 'issue_comment' &&
-       github.event.issue.pull_request != null &&
-       startsWith(github.event.comment.body, '@claude review') &&
-       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
-                github.event.comment.author_association))
-    runs-on: self-hosted
-    timeout-minutes: 30
-
-    # gh resolves the repository from --repo, then GH_REPO, then the working
-    # directory's git remotes — it does not read GITHUB_REPOSITORY. The fork
-    # guard below deliberately runs BEFORE Checkout, so on a fresh runner
-    # workspace it has no .git to read and every gh call in it fails. Setting it
-    # here rather than on that step means no later step has to remember: the
-    # first `@claude review` on a wiped workspace is exactly the case a
-    # per-step fix would have missed.
-    env:
-      GH_REPO: ${{ github.repository }}
-
-    steps:
-      # First, because every later step depends on these. The runner is a systemd
-      # service with a bare system PATH, so anything installed under $HOME is
-      # invisible to it — the trap SERV-62 hit twice, whose lesson is to fail
-      # with a clear reason rather than as `command not found` three layers down.
-      # This step sat after four steps that already used gh and curl, so it could
-      # only ever have caught a missing jq. It is unconditional: it is three
-      # `command -v` calls, and gating it on triage would put it back after the
-      # first gh call.
-      - name: Preflight
-        run: |
-          set -euo pipefail
-          for tool in gh jq curl; do
-            if ! command -v "$tool" >/dev/null; then
-              echo "$tool is not on the runner PATH: $PATH" >&2
-              exit 1
-            fi
-          done
-          echo "gh $(gh --version | head -1), jq $(jq --version)"
-
-      - name: Resolve the pull request
-        id: pr
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          if [ "${{ github.event_name }}" = "issue_comment" ]; then
-            N="${{ github.event.issue.number }}"
-            # The comment payload carries no head repo, so resolve it before
-            # anything can check out PR code onto this runner.
-            HEAD=$(gh pr view "$N" --json headRepositoryOwner,headRepository \
-                     --jq '"\(.headRepositoryOwner.login)/\(.headRepository.name)"')
-            if [ "$HEAD" != "$GITHUB_REPOSITORY" ]; then
-              echo "::error::PR #$N head is $HEAD, not $GITHUB_REPOSITORY — refusing to check out fork code on a self-hosted runner."
-              exit 1
-            fi
-            echo "number=$N" >> "$GITHUB_OUTPUT"
-            # An explicit ask overrides every skip rule below, including drafts.
-            echo "manual=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
-            echo "manual=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      # No workspace-integrity assertion here, deliberately — and twice now it has
-      # looked like there should be. checkout defaults to `clean: true`
-      # (`git clean -ffdx` + `git reset --hard`), so a stale file from a previous
-      # job on this long-lived runner is already gone before any later step could
-      # see it. And the config swap that does matter — claude-code-action
-      # restoring CLAUDE.md from base — happens inside the Review step, after any
-      # step here could observe it. The prompt handles that by reading both
-      # copies knowingly (SERV-67). A guard here can only ever pass.
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          # The reviewer reads history on the changed paths to spot changes that
-          # re-break something already fixed.
-          fetch-depth: 0
-
-      - name: Check out the PR head
-        if: steps.pr.outputs.manual == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh pr checkout "${{ steps.pr.outputs.number }}"
-
-      - name: Triage — should this be reviewed, and how deeply
-        id: triage
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ steps.pr.outputs.number }}
-          MANUAL: ${{ steps.pr.outputs.manual }}
-          IS_DRAFT: ${{ github.event.pull_request.draft }}
-          ACTION: ${{ github.event.action }}
-          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
-          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
-        run: |
-          set -euo pipefail
-
-          skip() { echo "review=false" >> "$GITHUB_OUTPUT"; echo "→ skipping: $1"; exit 0; }
-
-          if [ "$MANUAL" != "true" ]; then
-            if [ "$IS_DRAFT" = "true" ]; then
-              skip "draft PR (comment '@claude review' to force one)"
-            fi
-
-            # Re-reviewing on every push is the single largest cost multiplier,
-            # and most pushes are a typo fix on a PR that was already read. Opt
-            # in per PR with the label when a change is worth watching closely.
-            if [ "$ACTION" = "synchronize" ] && [[ ",$LABELS," != *",review:always,"* ]]; then
-              skip "push to a PR without the 'review:always' label"
-            fi
-          fi
-
-          FILES=$(gh pr diff "$PR_NUMBER" --name-only)
-          if [ -z "$FILES" ]; then
-            skip "empty diff"
-          fi
-
-          # A release PR is a generated CHANGELOG and a version manifest, opened
-          # by the release bot. There is nothing for a fresh-context reviewer to
-          # say about it, and claude-code-action refuses a bot-initiated run
-          # outright ("Workflow initiated by non-human actor ... Add bot to
-          # allowed_bots"), so without this the check is red on every release --
-          # permanently, and on exactly the PRs that most need to look
-          # trustworthy at a glance. The BLOCKING note below says a check that is
-          # wrong and immovable trains you to bypass it.
-          #
-          # The docs-only rule nearly covers this and does not: CHANGELOG.md is
-          # .md, .release-please-manifest.json is not.
-          #
-          # Keyed on the branch AND the file list, not the branch alone. The
-          # justification above is a claim about content, and today nothing
-          # enforced it: adding `extra-files` to release-please-config.json --
-          # the usual reason being to stamp the version into a source file
-          # rather than at link time -- would put code in a release PR and skip
-          # it unreviewed and green, with nothing in the log to distinguish that
-          # from a correct skip. A release branch carrying anything else now
-          # falls through to a normal review and says so.
-          #
-          # Skipped only on the automatic path. `@claude review` still works,
-          # because the initiating actor is then the person who commented.
-          if [ "$MANUAL" != "true" ] && [[ "$HEAD_BRANCH" == release-please--* ]]; then
-            RELEASE_FILES=$(printf '%s\n' 'CHANGELOG.md' '.release-please-manifest.json' | sort)
-            if [ "$(sort <<<"$FILES")" = "$RELEASE_FILES" ]; then
-              skip "release PR (generated changelog and version manifest)"
-            fi
-            echo "→ release branch carrying more than the changelog and manifest; reviewing it"
-          fi
-
-          # Docs-only changes get nothing out of a correctness reviewer. Written
-          # as "is anything here NOT docs?" rather than a negated -q test: with
-          # -q, grep short-circuits and reports no selection even when a
-          # non-matching line exists, which silently skipped any PR that touched
-          # code and a .md file together.
-          CODE=$(grep -vE '(^docs/|^graphify-out/|\.md$)' <<<"$FILES" || true)
-          # The reviewer's own standards are .md but are not documentation.
-          STANDARDS=$(grep -E '^(REVIEW\.md|CLAUDE\.md|\.github/review-prompt\.md)$' <<<"$FILES" || true)
-          if [ -z "$CODE" ] && [ -z "$STANDARDS" ] && [ "$MANUAL" != "true" ]; then
-            skip "documentation only"
-          fi
-
-          # Paths where a mistake widens access, loses data, leaks a secret, or
-          # compromises the runner. These get the deeper pass.
-          # REVIEW.md / CLAUDE.md / review-prompt.md are the reviewer's own
-          # standards: a PR that loosens them is a governance change, not docs.
-          # For a credential vault the usual "sensitive subset" is nearly the
-          # whole tree: internal/vault is the crypto, internal/store the audit
-          # chain and its cross-process lock, internal/sync the outbound push of
-          # secret material, internal/api the bearer-authed surface,
-          # internal/derive and internal/resolve the value that reaches every
-          # destination. Rather than pretend to a distinction that does not
-          # exist here, everything under internal/ and cmd/ gets the deep pass;
-          # the shallow one is left for docs and workflow-adjacent files.
-          SENSITIVE='^(internal/|cmd/|\.github/workflows/|REVIEW\.md|CLAUDE\.md|\.github/review-prompt\.md)'
-          if grep -qE "$SENSITIVE" <<<"$FILES"; then
-            echo "effort=high"   >> "$GITHUB_OUTPUT"
-            echo "model=opus"    >> "$GITHUB_OUTPUT"
-            echo "→ sensitive paths touched; reviewing at high effort"
-          else
-            echo "effort=medium" >> "$GITHUB_OUTPUT"
-            echo "model=sonnet"  >> "$GITHUB_OUTPUT"
-            echo "→ reviewing at medium effort"
-          fi
-          echo "review=true" >> "$GITHUB_OUTPUT"
-
-      # Half the job is "did this do what the ticket asked", which needs the
-      # ticket. Resolved here rather than in the prompt so it is deterministic
-      # and visible in the log. Convention is the key in the PR title —
-      # `fix(signet): ... (SERV-62)` — with the branch as a fallback. Not every
-      # PR has one (#74 did not), and that is not an error.
-      - name: Resolve the Switchyard ticket
-        id: ticket
-        if: steps.triage.outputs.review == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ steps.pr.outputs.number }}
-          SWITCHYARD_URL: http://localhost:4002
-          SWITCHYARD_TOKEN: ${{ secrets.SWITCHYARD_REVIEWER_TOKEN }}
-        run: |
-          set -euo pipefail
-          TITLE=$(gh pr view "$PR_NUMBER" --json title --jq .title)
-          BRANCH=$(gh pr view "$PR_NUMBER" --json headRefName --jq .headRefName)
-
-          # Anchored on an opening bracket so a bare token like UTF-8 in a title
-          # is not mistaken for a key, and not on the closing one so the
-          # multi-ticket form `(SERV-33/40)` still resolves to its first key.
-          # Both delimiters are in use across the estate: construct-server
-          # writes `(SERV-62)`, switchyard writes `[SWY-198]`.
-          KEY=$(grep -oE '[(\[][A-Z]+-[0-9]+' <<<"$TITLE" | tr -d '([' | head -1 || true)
-          SOURCE=title
-          if [ -z "$KEY" ]; then
-            KEY=$(grep -oiE '\b[a-z]+-[0-9]+\b' <<<"$BRANCH" | head -1 | tr '[:lower:]' '[:upper:]' || true)
-            SOURCE=branch
-          fi
-
-          # A branch-derived key can be a false positive: `claude/pr-review-2026`
-          # yields REVIEW-2026, so confirm the key names a real ticket. Branch on
-          # the status, NOT on curl's exit: `curl -sf` returns 22 for both 404 and
-          # 401, so the first version of this dropped a perfectly good key when the
-          # token was wrong or Switchyard was mid-restart — which happens on every
-          # deploy of this repo, since migrations run at container start. The
-          # review then stated there was no ticket when the title named one, and
-          # skipped ticket fidelity entirely. An absent secret lands here too: it
-          # arrives as an empty string rather than unset, so `set -u` does not
-          # catch it and the request goes out as `Bearer ` and 401s — the SWY-172
-          # blank-read-as-configured shape, in the workflow instead of env.ts.
-          #
-          # Only a 404 means "this ticket does not exist". Anything else keeps the
-          # key and lets the reviewer report the fetch failure as a caveat, which
-          # .github/review-prompt.md already instructs it to do.
-          if [ -n "$KEY" ]; then
-            # curl already writes 000 when it cannot connect, so no `|| echo 000`
-            # here — that appended a second one and reported status 000000.
-            STATUS=$(curl -s -o /dev/null -m 10 -w '%{http_code}' \
-                       -H "Authorization: Bearer $SWITCHYARD_TOKEN" \
-                       "$SWITCHYARD_URL/v1/tickets/$KEY" 2>/dev/null) || true
-            [ -n "$STATUS" ] || STATUS=000
-            case "$STATUS" in
-              200) ;;
-              404) echo "→ $KEY does not exist in Switchyard; treating as no ticket"; KEY="" ;;
-              *)
-                # Keeping the key on a non-200 is right for a title-derived key
-                # and wrong for a branch-name guess: `claude/pr-review-2026`
-                # yields REVIEW-2026, and with Switchyard down the reviewer would
-                # report a caveat about a ticket that never existed — which
-                # REVIEW.md explicitly forbids inventing from a branch name.
-                if [ "$SOURCE" = "branch" ]; then
-                  echo "→ Switchyard returned $STATUS and $KEY is only a branch-name guess; treating as no ticket"
-                  KEY=""
-                else
-                  echo "::warning::Switchyard returned $STATUS for $KEY — keeping the title-derived key; the reviewer will report the fetch failure."
-                fi ;;
-            esac
-          fi
-
-          if [ -z "$KEY" ]; then
-            echo "→ no ticket key in title or branch; reviewing the diff on its own terms"
-          else
-            echo "→ ticket $KEY"
-          fi
-          echo "key=$KEY" >> "$GITHUB_OUTPUT"
-
-      - name: Assemble the reviewer prompt
-        id: prompt
-        if: steps.triage.outputs.review == 'true'
-        env:
-          PR_NUMBER: ${{ steps.pr.outputs.number }}
-        run: |
-          set -euo pipefail
-          {
-            echo 'text<<REVIEW_PROMPT_EOF'
-            cat .github/review-prompt.md
-            echo
-            echo "## This run"
-            echo
-            echo "- \`PR_NUMBER\` is ${PR_NUMBER}."
-            echo "- \`GITHUB_REPOSITORY\` is ${GITHUB_REPOSITORY}."
-            echo 'REVIEW_PROMPT_EOF'
-          } >> "$GITHUB_OUTPUT"
-
-      # What the Gate compares against. Counted before the reviewer runs, because
-      # the Gate's question is "did a review reach the PR", and the only honest
-      # way to answer it is to see one appear.
-      - name: Count reviews before
-        id: before
-        if: steps.triage.outputs.review == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ steps.pr.outputs.number }}
-        run: |
-          set -euo pipefail
-          # --paginate, because the default page is 30: a PR that accumulates
-          # that many reviews would otherwise read the same count before and
-          # after and red this check permanently, on a run where the review is
-          # sitting right there.
-          N=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/reviews" --jq '.[].id' | wc -l)
-          echo "count=$N" >> "$GITHUB_OUTPUT"
-          echo "reviews before: $N"
-
-      - name: Review
-        if: steps.triage.outputs.review == 'true'
-        uses: anthropics/claude-code-action@v1
-        env:
-          PR_NUMBER: ${{ steps.pr.outputs.number }}
-          TICKET_KEY: ${{ steps.ticket.outputs.key }}
-          # Switchyard is on this host, so the reviewer reads tickets over
-          # localhost rather than negotiating the Cloudflare Access edge. The
-          # token is scoped tickets:read + comments:write — deliberately not
-          # tickets:write, so a reviewer cannot transition or edit what it reads.
-          SWITCHYARD_URL: http://localhost:4002
-          SWITCHYARD_TOKEN: ${{ secrets.SWITCHYARD_REVIEWER_TOKEN }}
-        with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          github_token: ${{ github.token }}
-          prompt: ${{ steps.prompt.outputs.text }}
-          # Tools must be granted explicitly: the first run denied 17 calls and
-          # produced nothing while still reporting success, because every step of
-          # the prompt is Bash (cat the standards, curl the ticket, gh for the
-          # diff and the review post) and Bash was never allowed.
-          #
-          # Edit/Write stay denied so the reviewer cannot drift into authoring,
-          # but the boundary that actually holds is the job token being
-          # contents:read — a tool list is a guardrail, not a permission model.
-          claude_args: >-
-            --effort ${{ steps.triage.outputs.effort }}
-            --model ${{ steps.triage.outputs.model }}
-            --max-turns 40
-            --allowedTools Bash,Read,Grep,Glob
-            --disallowedTools Edit,Write,NotebookEdit
-
-      - name: Gate
-        if: steps.triage.outputs.review == 'true'
-        env:
-          # Left off until the finding quality is trusted: a reviewer that wedges
-          # merges while it is still being tuned trains you to bypass it. Set the
-          # repository variable to 'true' to make Important findings blocking.
-          BLOCKING: ${{ vars.PR_REVIEW_BLOCKING || 'false' }}
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ steps.pr.outputs.number }}
-          BEFORE: ${{ steps.before.outputs.count }}
-        run: |
-          set -euo pipefail
-
-          # A missing verdict is a reviewer malfunction, not a clean review, and
-          # it is deliberately fatal regardless of PR_REVIEW_BLOCKING. The first
-          # run on switchyard exited green having posted nothing at all; a check
-          # that goes green when no review happened is worse than no check.
-          # PR_REVIEW_BLOCKING gates on *findings* — this gates on the reviewer
-          # having run.
-          if [ ! -f review-verdict.json ]; then
-            echo "::error::Reviewer produced no verdict file — the review did not complete."
-            echo "Check the Review step for permission denials or a truncated run." >&2
-            exit 1
-          fi
-
-          # The verdict file alone does not answer the question above.
-          # review-prompt.md §5 tells the reviewer to write it *even if posting
-          # the review failed*, so the one artifact this step inspected is
-          # written on both sides of the outcome it cares about — a review that
-          # never reached the PR would have gone green. Ask GitHub instead.
-          #
-          # A count, not an identity, so two runs overlapping on one PR can
-          # still satisfy each other: A posts, B fails to post, B sees the total
-          # rise and passes. Closing that needs the reviewer to record the id
-          # its POST returned, which lives in review-prompt.md and is shared
-          # across four repos — SGNT-28.
-          AFTER=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/reviews" --jq '.[].id' | wc -l)
-          if [ "$AFTER" -le "$BEFORE" ]; then
-            echo "::error::Reviewer produced a verdict but no review appeared on the PR (${BEFORE} before, ${AFTER} after)."
-            echo "The findings are in the Review step log; the review was written but not posted." >&2
-            exit 1
-          fi
-
-          IMPORTANT=$(jq -r '.important // 0' review-verdict.json)
-          NIT=$(jq -r '.nit // 0' review-verdict.json)
-          echo "Findings: ${IMPORTANT} important, ${NIT} nit"
-
-          if [ "$IMPORTANT" -gt 0 ]; then
-            if [ "$BLOCKING" = "true" ]; then
-              echo "::error::${IMPORTANT} important finding(s); see the PR review."
-              exit 1
-            fi
-            echo "::warning::${IMPORTANT} important finding(s); not blocking (PR_REVIEW_BLOCKING is off)."
-          fi
+  pr-review:
+    uses: Einlanzerous/construct-server/.github/workflows/pr-review-reusable.yml@main
+    with:
+      # Narrowed from `^(internal/|cmd/|...)`, which was every Go file in the
+      # repo. But the honest headline is not the file count, and the first
+      # version of this comment got it wrong by quoting one:
+      #
+      # THE TIER STILL DOES NOT DISCRIMINATE BETWEEN THIS REPO'S PRs. Replayed
+      # against the last 12 merged PRs, old regex and new: 7 of 7 non-release PRs
+      # classify `high` either way. The other 5 are release PRs, skipped before
+      # the tier is decided. 41-of-47 *files* is a real narrowing and it changes
+      # nothing at PR granularity, because `cmd/signet/main.go` is 3,540 lines —
+      # every CLI verb in one file — and it alone drives the `high` on 5 of the
+      # 7, and on #34 (a render-staleness fix touching no crypto, no ledger, no
+      # destination) it is the only thing driving it.
+      #
+      # No reachable regex fixes that: dropping main.go entirely moves only #34,
+      # leaving 6 of 7. Discriminating below this requires splitting main.go,
+      # which is a source change and a separate ticket, not a CI input. Recorded
+      # here rather than papered over, because the failure mode SGNT-36 names —
+      # a selector that matches everything carries no information — is still
+      # present at PR granularity, and a comment claiming otherwise is how it
+      # stays unexamined.
+      #
+      # What it selects, and why:
+      #
+      #   vault/ redact/ derive/    hold, hide and derive secret material
+      #   sync/ envfile/            deliver secrets to targets and to disk
+      #   api/                      the daemon's network surface
+      #   store/                    persistence, migrations, audit and targets —
+      #                             a destination bug sends the right secret to
+      #                             the wrong place
+      #   config/                   env loading, where "empty read as configured"
+      #                             bugs live (SWY-172, estate-wide)
+      #   resolve/                  REVIEW.md's always-check list, verbatim:
+      #                             "Reads of a secret's value go through
+      #                             internal/resolve". Its own doc comment calls
+      #                             a reader that resolves independently "the bug
+      #                             this package exists to prevent". Demoting it
+      #                             was wrong: a change to when ErrNoVersion is
+      #                             returned decides whether render/status skip a
+      #                             secret while reveal/push must fail — the one
+      #                             change class that reaches every destination.
+      #   ops/ghtoken, ops/rotate   the vault's own credential, and what may be
+      #                             rotated
+      #   ops/import                REVIEW.md names it for the repo's
+      #                             most-repeated defect — "the provenance column
+      #                             was written by set but not by import" — and
+      #                             it is still a version-minting write path,
+      #                             making the Issued-vs-Minted call that decides
+      #                             whether an externally-issued credential
+      #                             becomes rotatable
+      #   cmd/signet/main.go        includes `reveal`
+      #   cmd/signet/exec.go        runs a child process with secrets in its env
+      #
+      # Tests included, on switchyard's authz-guard lesson: deleting a guard's
+      # invocation was caught, gutting its logic was not. `cmd/signet/(main|exec)`
+      # is deliberately unanchored so it covers exec_test.go, which holds
+      # TestExecRedactsTheChildsOutput and TestExecRedactsSecretsItDidNotInject —
+      # the guards for the path above it. Anchoring to `\.go` excluded exactly
+      # those, applying the stated rule to internal/ and then not to cmd/.
+      #
+      # `.github/review-prompt.md` is NOT here any more: this PR deletes it and
+      # the procedure is fetched from construct-server, so no future PR can touch
+      # that path and the alternative could never match again.
+      # `.github/review-ignore` stays for the opposite reason — it legitimately
+      # does not exist yet, and a PR adding one should escalate.
+      #
+      # Out: version/, logtest/, and the four cmd tests that guard no secret path.
+      sensitive_paths: '^(internal/(vault|redact|derive|sync|envfile|api|store|config|resolve)/|internal/ops/(ghtoken|rotate|import)|cmd/signet/(main|exec)|\.github/workflows/|REVIEW\.md|CLAUDE\.md|\.github/review-ignore)'
+    secrets:
+      claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      switchyard_token: ${{ secrets.SWITCHYARD_REVIEWER_TOKEN }}
