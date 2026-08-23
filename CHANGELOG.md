@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.9.1](https://github.com/Einlanzerous/signet/compare/v1.9.0...v1.9.1) (2026-08-23)
+
+
+### Bug Fixes
+
+* **health:** report a bare version and a sha on /healthz (SGNT-38) ([#39](https://github.com/Einlanzerous/signet/issues/39)) ([df2b21d](https://github.com/Einlanzerous/signet/commit/df2b21dcca9f7b006a905a183d7b0bbccca40a8d))
+
 ## [1.9.0](https://github.com/Einlanzerous/signet/compare/v1.8.1...v1.9.0) (2026-08-16)
 
 
