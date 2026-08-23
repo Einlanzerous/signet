@@ -1,7 +1,9 @@
 // Package version carries this build's identity: the release it was cut from
 // and the commit it was built at.
 //
-// Both are injected at link time by deploy/Dockerfile:
+// Both are injected at link time. Signet ships as a host binary via systemd and
+// has no image, so unlike its sibling services there is no Dockerfile here — the
+// two injectors are `.github/workflows/release.yml` and the `Makefile`:
 //
 //	-ldflags "-X github.com/Einlanzerous/signet/internal/version.Version=1.9.0 \
 //	          -X github.com/Einlanzerous/signet/internal/version.Commit=<40-char sha>"
@@ -25,17 +27,38 @@ const DevVersion = "dev"
 // Version is the release this binary was built from — bare semver, no "v"
 // prefix. Overwritten at link time; "dev" for a local `go build`.
 //
-// The bare form is load-bearing rather than cosmetic. Switchyard compares this
-// string with strict equality against `org.opencontainers.image.version`, which
-// docker/metadata-action stamps WITHOUT the prefix. Report "v1.9.0" against a
-// label of "1.9.0" and every deploy report is filed `claimed_not_confirmed`
-// for ever — a permanent red row on the one page whose job is to be believed.
+// The bare form is estate-wide consistency, not a mismatch this repo can
+// actually suffer. Everywhere else, a "v" here would be compared with strict
+// equality against `org.opencontainers.image.version` — which
+// docker/metadata-action stamps WITHOUT the prefix — and file every deploy
+// report as `claimed_not_confirmed` for ever.
+//
+// Signet has no image and no such label, so nothing REPORTS it and there is
+// nothing for a prefixed version to disagree with; it is observed only. The
+// reason to match anyway is that a rule the estate keeps in nine places and
+// breaks in one is a rule nobody trusts — and the two spellings would still
+// disagree with each other across `signet version`, /healthz and the ledger.
 var Version = DevVersion
 
 // Commit is the full 40-character commit sha this binary was built at, or ""
 // when the build supplied none. Reported verbatim: abbreviating it here would
 // turn the cross-service comparison into a prefix problem.
 var Commit = ""
+
+// ── Read these through Get(), never directly ──────────────────────────────
+//
+// `Version` and `Commit` are the RAW linker inputs, and a blank build links an
+// empty string into both — over the defaults above, not instead of them. Only
+// `Get()` applies the blank-to-dev rule, so a caller that reads `Version`
+// directly reports "" where it means "dev".
+//
+// That is not hypothetical: every reader in this repo was doing exactly that
+// before the health contract landed, and it was invisible while the Docker ARG
+// still defaulted to a non-empty placeholder. Emptying that default is what
+// made the bypass reachable.
+//
+// They stay exported because `Get()`'s rule has to be exercised from sibling
+// packages' tests. Treat that as a seam for tests, not a public read path.
 
 // Identity is the (version, sha) pair as /healthz reports it.
 //
