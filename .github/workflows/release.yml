@@ -71,14 +71,23 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # The ldflag stamps VERSION, not TAG (SGNT-38). `tag_name` is `v1.9.0` and
+      # `version` is `1.9.0`; the daemon reported the former on /healthz, which
+      # Switchyard's delivery reconciler reads and compares against other
+      # versions with strict equality. Bare semver is the estate-wide form.
+      #
+      # TAG is gone from this step's env: nothing in the run block references it
+      # any more, and the Attach step below declares its own.
       - name: Build linux/amd64
         env:
-          TAG: ${{ needs.release-please.outputs.tag_name }}
           VERSION: ${{ needs.release-please.outputs.version }}
+          GIT_SHA: ${{ github.sha }}
         run: |
           asset="signet-${VERSION}-linux-amd64"
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
-            -ldflags "-s -w -X github.com/Einlanzerous/signet/internal/version.Version=${TAG}" \
+            -ldflags "-s -w \
+              -X github.com/Einlanzerous/signet/internal/version.Version=${VERSION} \
+              -X github.com/Einlanzerous/signet/internal/version.Commit=${GIT_SHA}" \
             -o "${asset}" ./cmd/signet
           sha256sum "${asset}" > "${asset}.sha256"
 

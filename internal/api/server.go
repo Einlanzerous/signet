@@ -27,7 +27,6 @@ import (
 	"github.com/Einlanzerous/signet/internal/store"
 	syncpkg "github.com/Einlanzerous/signet/internal/sync"
 	"github.com/Einlanzerous/signet/internal/vault"
-	"github.com/Einlanzerous/signet/internal/version"
 )
 
 // Server wires the store, vault key, and GitHub client behind HTTP handlers.
@@ -49,9 +48,7 @@ func New(st *store.Store, key []byte, gh *syncpkg.GHClient, apiToken string) (*S
 // Handler returns the routed HTTP handler.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "version": version.Version})
-	})
+	mux.HandleFunc("GET /healthz", handleHealthz)
 	mux.Handle("GET /v1/mirror/summary", s.auth(s.handleSummary))
 	mux.Handle("GET /v1/mirror/secrets", s.auth(s.handleSecrets))
 	mux.Handle("GET /v1/mirror/secrets/{project}/{name}", s.auth(s.handleSecretDetail))

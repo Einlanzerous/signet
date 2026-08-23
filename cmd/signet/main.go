@@ -101,7 +101,7 @@ func main() {
 	case "serve":
 		err = runServe()
 	case "version":
-		fmt.Println(version.Version)
+		fmt.Println(version.Get().Version)
 	case "help", "-h", "--help":
 		usage(os.Stdout)
 	default:
