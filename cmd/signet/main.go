@@ -2721,11 +2721,36 @@ func anyUnresolved(d syncpkg.FileDrift, problems map[string]error) bool {
 //	        is guaranteed present and the word never says what it was.
 //	drift   the refusal case. GHState routes a declined push here deliberately,
 //	        so the word is true about currency and silent about the decision.
-//	        Guarded on LastState so a target that has drifted for ordinary
-//	        reasons since its refusal was resolved is not still quoting it.
 //
-// Every other state either says its own reason (`empty`, `incomplete`) or means
-// the refusal is over (`never`, `in sync`, `unknown`).
+// The LastState test on `drift` is a restatement, not a filter: GHState returns
+// `error` whenever LastError is set and LastState is not `refused`, so inside
+// this branch the two are already equivalent. It is spelled out because the
+// reader of this function is asking which states can carry a reason, and
+// "refused pushes land in drift" is the non-obvious half of the answer.
+//
+// ── What this does NOT do, and cannot ──────────────────────────────────────
+//
+// A reason is a HISTORICAL record of the last push decision. Nothing recomputes
+// whether it still holds, so a `drift*` note can name a condition the operator
+// has already fixed: set the missing key a MissingKeysError named, and the
+// render resolves, differs from the delivered blob, and reports `drift` with
+// that same refusal quoted under it.
+//
+// That is milder than the states excluded below — the target really is stale
+// and `sync` really is the next step, so the mark is earned even when its text
+// is out of date — but it is not nothing, and an earlier version of this
+// comment claimed the LastState test prevented it. It does not. stateReason
+// words the refusal as past tense for this reason, so the imperative tail of a
+// quoted refusal reads as what signet said then rather than as an instruction
+// now. Recomputing currency would mean re-deriving each refusal kind here, and
+// the transport failures behind `error` cannot be re-derived at all.
+//
+// The states below are excluded because in them the refusal is genuinely over:
+// `never` and `in sync` and `unknown` all mean the vault and the destination
+// agree or have never disagreed. `empty` and `incomplete` are excluded because
+// they are conditions, not history — though only `render --check` currently
+// spells them out, and `target list` and `status` print them bare, which is
+// this ticket's own complaint one state over and is not fixed here.
 func stateHidesItsReason(t *store.Target, state string) bool {
 	if t.LastError == "" {
 		return false
@@ -2802,11 +2827,17 @@ func (n *stateNotes) print() {
 // the last good push left, while "failed" means a delivery was attempted and
 // did not land. An operator reading "push declined" knows the environment is
 // intact and stale; reading "push failed" they do not.
+// Both are past tense on purpose. A refusal's text frequently ends in an
+// imperative — "set them, or drop them from the target", "re-add them, or pass
+// --allow-shrink" — and the reason is not re-derived, so that tail can outlive
+// the condition it describes. "the last push was declined" frames what follows
+// as a quotation of what signet said at the time; "push declined" read as a
+// statement about now, and told operators to do things they had already done.
 func stateReason(t *store.Target) string {
 	if t.LastState == store.TargetRefused {
-		return "push declined: " + t.LastError
+		return "the last push was declined: " + t.LastError
 	}
-	return "last push failed: " + t.LastError
+	return "the last push failed: " + t.LastError
 }
 
 // renderState reduces a rendered target's drift to one word.

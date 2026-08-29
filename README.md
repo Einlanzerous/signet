@@ -450,8 +450,20 @@ push was refused. The recorded reason outlives the refusal (nothing clears it
 short of a later successful push), so marking on its presence alone would show
 an operator who *fixed* a refusal a `never*` or `in sync*` still quoting the
 refusal they just fixed, at the moment they were checking whether the fix took.
-Every other state either says its own reason (`empty`, `incomplete`) or means
-the refusal is over.
+
+**A reason is history, and is worded as history.** Nothing recomputes whether it
+still holds, so a `drift*` note can name a condition already fixed — set the key
+a refusal asked for and the render resolves, differs from what was delivered,
+and reports `drift` with that refusal still quoted. The mark is earned (the
+target *is* stale, and `sync` *is* the next step) but the text may be out of
+date, which is why it reads "the last push was declined: …" rather than an
+imperative. Recomputing currency would mean re-deriving every refusal kind in
+the view, and the transport failures behind `error` cannot be re-derived at all.
+
+`empty` and `incomplete` are unmarked because they are conditions rather than
+history. Note that only `render --check` currently spells them out; `target
+list` and `status` print the bare word, which is this section's own complaint
+one state over and is not addressed here.
 
 **The table keeps its five columns.** A reason is free text of unbounded length
 — the shrink guard's runs to three lines — and a column for it would make every

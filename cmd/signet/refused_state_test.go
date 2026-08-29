@@ -68,7 +68,7 @@ func TestTargetListSaysWhyARefusedTargetIsStale(t *testing.T) {
 	if !strings.Contains(out, "drift*") {
 		t.Errorf("a refused target's state is not marked as carrying a reason:\n%s", out)
 	}
-	if !strings.Contains(out, "push declined") {
+	if !strings.Contains(out, "was declined") {
 		t.Errorf("`target list` does not say the push was declined:\n%s", out)
 	}
 	if !strings.Contains(out, "--allow-shrink") {
@@ -106,12 +106,12 @@ func TestStatusSaysWhyARefusedTargetIsStale(t *testing.T) {
 	if !strings.Contains(out, "drift*") {
 		t.Errorf("`status` does not mark the refused target's state:\n%s", out)
 	}
-	if !strings.Contains(out, "push declined") {
+	if !strings.Contains(out, "was declined") {
 		t.Errorf("`status` does not say the push was declined:\n%s", out)
 	}
 	// One note, not one per secret the render carries. A 95-key render would
 	// otherwise repeat its refusal 95 times and bury the table it annotates.
-	if n := strings.Count(out, "push declined"); n != 1 {
+	if n := strings.Count(out, "was declined"); n != 1 {
 		t.Errorf("the refusal is repeated %d times, once per secret the render carries", n)
 	}
 }
@@ -131,7 +131,7 @@ func TestRenderCheckSaysWhyARefusedTargetIsStale(t *testing.T) {
 	if !strings.Contains(out, "drift*") {
 		t.Errorf("`render --check` does not mark the refused target's state:\n%s", out)
 	}
-	if !strings.Contains(out, "push declined") {
+	if !strings.Contains(out, "was declined") {
 		t.Errorf("`render --check` does not say the push was declined:\n%s", out)
 	}
 }
@@ -169,7 +169,7 @@ func TestAHealthyTargetIsNotMarked(t *testing.T) {
 		if strings.Contains(out, "*") {
 			t.Errorf("%s marked a target that has no reason to show:\n%s", tc.name, out)
 		}
-		if strings.Contains(out, "push declined") || strings.Contains(out, "last push failed") {
+		if strings.Contains(out, "was declined") || strings.Contains(out, "push failed") {
 			t.Errorf("%s reported a refusal that did not happen:\n%s", tc.name, out)
 		}
 	}
@@ -182,10 +182,10 @@ func TestARefusalAndAFailureAreWordedDifferently(t *testing.T) {
 	refused := &store.Target{LastState: store.TargetRefused, LastError: "boom"}
 	failed := &store.Target{LastState: "error", LastError: "boom"}
 
-	if got := stateReason(refused); !strings.HasPrefix(got, "push declined") {
+	if got := stateReason(refused); !strings.HasPrefix(got, "the last push was declined") {
 		t.Errorf("a refusal reads as %q", got)
 	}
-	if got := stateReason(failed); !strings.HasPrefix(got, "last push failed") {
+	if got := stateReason(failed); !strings.HasPrefix(got, "the last push failed") {
 		t.Errorf("a failure reads as %q", got)
 	}
 	if markState(&store.Target{}, "drift") != "drift" {
@@ -246,7 +246,7 @@ func TestAResolvedRefusalStopsBeingReported(t *testing.T) {
 		if strings.Contains(out, "never*") {
 			t.Errorf("%s marked a state whose refusal is resolved:\n%s", tc.name, out)
 		}
-		if strings.Contains(out, "push declined") {
+		if strings.Contains(out, "was declined") {
 			t.Errorf("%s quoted a refusal the operator had already fixed:\n%s", tc.name, out)
 		}
 	}
@@ -271,15 +271,62 @@ func TestOnlyErrorAndARefusedDriftHideTheirReason(t *testing.T) {
 		{refused, "never", false},
 		{refused, "in sync", false},
 		{refused, "unknown", false},
-		// These say their own reason, so a marker would add nothing.
+		// Conditions rather than history, so a stale reason would mislead.
 		{refused, "empty", false},
 		{refused, "incomplete", false},
-		// A target that drifted for ordinary reasons after its refusal cleared.
+		// A target carrying no reason at all is never marked, whatever its
+		// state. Note this is NOT "drifted for ordinary reasons after the
+		// refusal cleared" — an earlier version of this test claimed that, and
+		// no such case exists: GHState returns `error` whenever LastError is
+		// set and LastState is not `refused`, so inside `drift` the two are
+		// equivalent and the LastState test is a restatement, not a filter.
 		{clean, "drift", false},
+		{clean, "error", false},
 	} {
 		if got := stateHidesItsReason(tc.target, tc.state); got != tc.want {
 			t.Errorf("stateHidesItsReason(last_state=%q, state=%q) = %v, want %v",
 				tc.target.LastState, tc.state, got, tc.want)
 		}
+	}
+}
+
+// The limit of the mark, asserted rather than left to a comment (found by the
+// round-2 review on #44).
+//
+// A reason is a historical record of the last push decision; nothing recomputes
+// whether it still holds. So a refusal the operator has already fixed CAN still
+// be quoted — in `drift`, and only there, because that is the one marked state
+// a resolved refusal can land in. The mark is still earned (the target really
+// is stale, and `sync` really is the next step) but the text is out of date,
+// and the fix is that the wording reads as history rather than as an order.
+//
+// This test exists to stop the next reader believing the LastState test filters
+// this out. It does not — inside `drift` it is a restatement of what GHState
+// already guarantees.
+func TestADriftedTargetStillQuotesAResolvedRefusalAsHistory(t *testing.T) {
+	st := newCLIVault(t)
+	seedRefusedRender(t, st)
+
+	out := captureStdout(t, func() {
+		if err := runTargetList([]string{"--project", "demo"}); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	// Still marked and still quoted: this is the accepted behaviour, not a bug
+	// that slipped through. If a future change starts recomputing currency,
+	// this test should be replaced rather than deleted.
+	if !strings.Contains(out, "drift*") {
+		t.Fatalf("a drifted target that was refused is no longer marked:\n%s", out)
+	}
+	// Past tense is what makes the stale quotation honest. A refusal's text
+	// ends in an imperative — "re-add them, or pass --allow-shrink" — and
+	// framing it as a report of what signet said stops that reading as an
+	// instruction the operator has not yet followed.
+	if !strings.Contains(out, "the last push was declined:") {
+		t.Errorf("the reason is not worded as history, so its imperative tail reads as an order:\n%s", out)
+	}
+	if strings.Contains(out, "* o/r · home-server · PROD_ENV_FILE — push declined") {
+		t.Errorf("present-tense wording survived:\n%s", out)
 	}
 }
