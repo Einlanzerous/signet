@@ -179,7 +179,7 @@ func PushSecret(ctx context.Context, st *store.Store, key []byte, gh *GHClient, 
 			auditPushedInputs(st, &res, sec, store.AuditRecord{
 				Actor: actor, Action: "sync.push", TargetID: t.ID,
 				Details: fmt.Sprintf("value delivered to %s via push of %s/%s, which derives from it %s",
-					cfg.Destination(), sec.Project, sec.Name, pushCitation(seq)),
+					cfg.Destination(), sec.Project, sec.Name, carriedBy(seq)),
 				EventKind: kind, ActorRole: role, Status: status,
 			})
 		}

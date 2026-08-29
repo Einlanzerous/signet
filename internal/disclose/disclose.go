@@ -26,12 +26,17 @@
 // Each was an unaudited read channel in a vault whose premise is that plaintext
 // leaves only in audited ways.
 //
-// All six cite their own direct entry by ledger SEQUENCE — `(reveal #N)`,
-// `(exec #N)`, `(render #N)`, `(push #N)`, `(read #N)`. A digest or a
-// provenance was tried first and is not a join key: both are functions of the
-// VALUE, so a secret pushed on every deploy with nothing rotating between them
-// wrote byte-identical rows against its inputs for ever. The sequence is the
-// only thing that names a delivery rather than a value.
+// Every input entry cites, by ledger SEQUENCE, the entry that carried its
+// value: `(carried by #N)`. A digest or a provenance was tried first and is not
+// a join key — both are functions of the VALUE, so a secret pushed on every
+// deploy with nothing rotating between them wrote byte-identical rows against
+// its inputs for ever. Only the sequence names a delivery rather than a value.
+//
+// `(render #N)` and `(push #N)` are the OTHER hop, on a per-secret row, and
+// point at the channel's own root entry — the KindRender or per-target record
+// of the whole operation. Two tokens because they resolve to two kinds of
+// entry; one token for both sent a reader following it off an input row to a
+// per-secret row where they expected the account of the render.
 //
 // The count is load-bearing and has now been wrong here twice — "four" while
 // ops.ResolveGHToken was a fifth, then "five" while PushSecret was a sixth, in

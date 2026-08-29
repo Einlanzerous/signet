@@ -325,7 +325,7 @@ func (a *app) auditExec(inject map[string]injected, command string, redacted boo
 		// lives there rather than here.
 		if err := a.auditDerivedInputs(&in.secret, store.AuditRecord{
 			Action: "secret.exec",
-			Details: fmt.Sprintf("value disclosed to %q via exec of %s/%s, which derives from it (exec #%d)",
+			Details: fmt.Sprintf("value disclosed to %q via exec of %s/%s, which derives from it (carried by #%d)",
 				command, in.secret.Project, in.secret.Name, disclosed.Seq),
 		}); err != nil {
 			return err

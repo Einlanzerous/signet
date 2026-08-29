@@ -85,7 +85,7 @@ func TestRenderAuditsTheInputsOfADerivedSecret(t *testing.T) {
 		if e.TargetID == "" {
 			t.Error("an input's entry carries no TargetID, so it cannot be tied back to the render")
 		}
-		if !strings.Contains(e.Details, "(render #") {
+		if !strings.Contains(e.Details, "(carried by #") {
 			t.Errorf("an input's entry does not cite the render it belonged to: %q", e.Details)
 		}
 		return

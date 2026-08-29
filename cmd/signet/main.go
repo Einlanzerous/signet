@@ -736,7 +736,7 @@ func runReveal(args []string) error {
 	// ledger reads the same after three reveals as after one.
 	if err := a.auditDerivedInputs(sec, store.AuditRecord{
 		Action: "secret.reveal",
-		Details: fmt.Sprintf("value disclosed via reveal of %s/%s, which derives from it (reveal #%d)",
+		Details: fmt.Sprintf("value disclosed via reveal of %s/%s, which derives from it (carried by #%d)",
 			*project, *name, revealed.Seq),
 	}); err != nil {
 		return err
@@ -1714,10 +1714,16 @@ func (a *app) auditRenderedSecrets(targetID, path string, seq int64, keys []stri
 		// internal/sync/audit.go builds for the same event delivered to GitHub,
 		// and the two render channels should not answer an investigator
 		// differently.
+		//
+		// `carried by`, not `render`, because the two hops resolve to different
+		// kinds of entry: `(render #N)` on the key's own row points at the
+		// KindRender account of the whole render, and this points at that key's
+		// per-secret row. One token for both sent a reader following it off an
+		// input entry to a per-secret row where they expected the render.
 		if err := a.auditDerivedInputs(&sec, store.AuditRecord{
 			Action:   "secret.render",
 			TargetID: targetID,
-			Details: fmt.Sprintf("value written to %s via render of %s/%s, which derives from it (render #%d)",
+			Details: fmt.Sprintf("value written to %s via render of %s/%s, which derives from it (carried by #%d)",
 				path, sec.Project, sec.Name, written.Seq),
 		}); err != nil {
 			return err

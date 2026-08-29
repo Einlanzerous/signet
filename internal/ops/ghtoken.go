@@ -182,7 +182,7 @@ func ResolveGHTokenFor(st *store.Store, key []byte, envToken, actor string, role
 		// the value, so an unrotated PAT produced byte-identical rows on its
 		// inputs for ever — a wall of rows that named the credential and not
 		// which read they belonged to.
-		Details: fmt.Sprintf("value read to %s via %s, which derives from it (read #%d)",
+		Details: fmt.Sprintf("value read to %s via %s, which derives from it (carried by #%d)",
 			purpose, ref, entry.Seq),
 		EventKind: store.KindSecretReveal, ActorRole: role,
 		Status: &store.AuditStatus{Outcome: store.OutcomeDelivered},

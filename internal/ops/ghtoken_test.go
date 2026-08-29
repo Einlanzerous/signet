@@ -469,7 +469,7 @@ func TestResolveGHTokenAuditsTheInputsOfADerivedPAT(t *testing.T) {
 		// distinguish it from the last leaves a wall of identical rows. A
 		// provenance would not fix that — it is a function of the value — so
 		// this cites the direct entry by ledger sequence.
-		if !strings.Contains(e.Details, "(read #") {
+		if !strings.Contains(e.Details, "(carried by #") {
 			t.Errorf("the input's entry does not cite the read it belonged to: %q", e.Details)
 		}
 		return

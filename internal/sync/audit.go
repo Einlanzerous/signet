@@ -77,6 +77,23 @@ func pushCitation(seq int64) string {
 	return fmt.Sprintf("(push #%d)", seq)
 }
 
+// carriedBy renders an input's back-reference to the entry one level up the
+// chain — the per-secret entry whose disclosure carried this input's value.
+//
+// Spelled differently from pushCitation on purpose. Both used to render
+// `(push #N)`, so the same token named two different referents: the push's own
+// entry from a per-key row, and a per-key row from an input row. An
+// investigator following `(push #N)` off an input entry expecting the account
+// of the push — key count, scope, keys added — landed on another per-secret
+// row instead. One confused hop rather than a wrong answer, but the citation
+// format is the thing this took three rounds to make mean exactly one thing.
+func carriedBy(seq int64) string {
+	if seq == 0 {
+		return "(carrying entry not recorded)"
+	}
+	return fmt.Sprintf("(carried by #%d)", seq)
+}
+
 // auditRenderedKeys records a rendered-target push against every secret whose
 // plaintext the delivered blob carried.
 //
@@ -138,10 +155,11 @@ func auditRenderedKeys(st *store.Store, res *PushResult, t *store.Target, cfg st
 		}
 		// This key's own entry is what an input's entry points back to, by
 		// sequence — so an investigator who arrives at the input can reach the
-		// key that carried it, and from there the push. See the note above on
-		// why this is not the digest.
+		// key that carried it, and from there the push. A different token from
+		// the per-key row's own `(push #N)`, because they resolve to different
+		// kinds of entry. See the note above on why neither is the digest.
 		rec.Details = fmt.Sprintf("value delivered to %s in the %s render of %s/%s, which derives from it %s",
-			cfg.Destination(), t.Project, sec.Project, sec.Name, pushCitation(keyed.Seq))
+			cfg.Destination(), t.Project, sec.Project, sec.Name, carriedBy(keyed.Seq))
 		auditPushedInputs(st, res, sec, rec)
 	}
 }

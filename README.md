@@ -296,9 +296,12 @@ manages leaks a value signet knows perfectly well.
   (`#a3f9c1` = first 6 hex of SHA-256(nonce‖ciphertext) — never derived from
   plaintext alone), sync state, and the audit chain. The Switchyard admin UI is
   a *blind mirror* built on exactly this surface.
-- Plaintext leaves the vault in three audited ways only: `signet reveal`
-  (stdout), `signet exec` (a child process's environment), and rendered
-  env-file targets.
+- Plaintext leaves the vault in five audited ways only: `signet reveal`
+  (stdout), `signet exec` (a child process's environment), rendered env-file
+  targets, the sealed push to GitHub Actions, and signet's own read of the
+  GitHub PAT. Every one records against the credential — see "Where plaintext
+  leaves, and what the ledger records" for what that means and why the count is
+  worth keeping current here rather than only there.
 - **Ledger attribution**: CLI writes record `human` unless `SIGNET_ACTOR_ROLE`
   says otherwise. Agents driving allowlisted verbs should set it to
   `rule_engine`, or their changes are indistinguishable from a person's in a

@@ -48,7 +48,13 @@ func TestPushRenderIsAuditedPerSecret(t *testing.T) {
 		if !strings.Contains(entries[0].Details, "o/r") {
 			t.Errorf("%s's entry does not name the destination: %q", name, entries[0].Details)
 		}
-		if !strings.Contains(entries[0].Details, "#") {
+		// `· #` rather than `#`, which the citation assertion below already
+		// guarantees — so the digest half pinned nothing. Confirmed by deleting
+		// `· #%s` and the digest argument from auditRenderedKeys: the suite
+		// stayed green. The digest answers "did the blob change" and the
+		// sequence answers "which push", and this file spent three rounds
+		// deciding that; both need a test.
+		if !strings.Contains(entries[0].Details, "· #") {
 			t.Errorf("%s's entry cites no digest: %q", name, entries[0].Details)
 		}
 		// And the push, which is the half a digest cannot supply: a digest is
@@ -124,8 +130,8 @@ func TestPushAuditsTheInputsOfADerivedSecret(t *testing.T) {
 		// provenance: both are functions of the value, so a secret pushed on
 		// every deploy with nothing rotating between them writes rows that are
 		// byte-identical and name no particular delivery.
-		if !strings.Contains(e.Details, "(push #") {
-			t.Errorf("an input's entry does not cite the push it belonged to: %q", e.Details)
+		if !strings.Contains(e.Details, "(carried by #") {
+			t.Errorf("an input's entry does not cite the entry that carried it: %q", e.Details)
 		}
 		return
 	}
@@ -227,8 +233,8 @@ func TestPushRenderAuditsDerivedInputsByPushSequence(t *testing.T) {
 		if !strings.Contains(e.Details, "derives from it") {
 			continue
 		}
-		if !strings.Contains(e.Details, "(push #") {
-			t.Errorf("the input's entry does not cite the push it belonged to: %q", e.Details)
+		if !strings.Contains(e.Details, "(carried by #") {
+			t.Errorf("the input's entry does not cite the entry that carried it: %q", e.Details)
 		}
 		return
 	}
