@@ -111,12 +111,18 @@ sealed push to GitHub. Each egress must leave an entry carrying `SecretID`,
 because the question the ledger has to answer is *"where has this credential
 been"* and it is asked from the credential's side: `signet audit --secret <ref>`.
 
-An entry naming only a `TargetID` leaves that query empty. The same gap has now
-been found on three channels independently — SGNT-18 closed it for `reveal`,
-SGNT-32 for `exec`, and **SGNT-34 is open** for `render` and rendered-target
-sync, both of which still record `TargetID` alone. A rule rediscovered once per
-verb is a rule that belongs in one place, which is why it is stated here rather
-than at each call site.
+An entry naming only a `TargetID` leaves that query empty. The same gap has been
+found on six channels independently — SGNT-18 for `reveal`, SGNT-32 for `exec`,
+and SGNT-34 for `render`, both halves of the sealed push, and signet's own read
+of the GitHub PAT. A rule rediscovered once per verb is a rule that belongs in
+one place, which is why it is stated here rather than at each call site, and why
+`internal/disclose` holds the authoritative list.
+
+Deliberately stated without a live ticket status. An earlier draft said "SGNT-34
+is open … both of which still record `TargetID` alone", which was true when
+written and false the moment that work merged — a file whose subject is that a
+false claim stops the next reader checking should not carry claims with an
+expiry date on them.
 
 **A disclosure of a derived secret is a disclosure of its inputs.** That rule
 lives in `auditDerivedInputs` (`cmd/signet/main.go`), not in any one channel
@@ -200,12 +206,13 @@ empty.)
 Comments here carry reasoning that is not recoverable from the code. That is
 the point of them — and it is exactly why a comment asserting a property the
 code lacks is a real defect, not a style issue: it stops the next reader
-checking. There have been five instances. The most recent is still in the tree:
-`GHState`'s doc comment claims "every view that renders a state renders [the
+checking. There have been five instances. The most instructive is SGNT-35's:
+`GHState`'s doc comment claimed "every view that renders a state renders [the
 reason] alongside it" as the *justification* for returning `drift` rather than
-`error` on a refused push. `LastError` in fact reaches only the mirror's JSON
-and `render`'s trailing note — and that note prints it on `error` alone, which
-is precisely the state a refusal is not (SGNT-35, open).
+`error` on a refused push — while `LastError` in fact reached only the mirror's
+JSON and `render`'s trailing note, and that note printed it on `error` alone,
+which is precisely the state a refusal is not. A false sentence load-bearing for
+a design decision, which is the expensive shape.
 
 Treat "every X goes through Y", "this is the only path", and "this cannot
 happen" as claims to verify.

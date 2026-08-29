@@ -82,11 +82,16 @@ Important finding under twelve nits has failed at its job.
 ## Always check
 
 **Plaintext never leaves except where it is meant to.** Values leave the vault
-in three audited ways — `signet reveal` to stdout, `signet exec` into a child
-process's environment, and rendered file targets — plus the sealed push to
-GitHub Actions. (`exec` was the count's third channel and arrived in 63b8a91,
-SGNT-32; "exactly two" survived it and is corrected here so this file and
-`CLAUDE.md` agree on the size of the egress set.)
+in five audited ways: `signet reveal` to stdout, `signet exec` into a child
+process's environment, rendered file targets, the sealed push to GitHub Actions,
+and signet's own read of the GitHub PAT.
+
+`internal/disclose` holds the authoritative list — it splits the push into its
+two halves, so it says six — and a channel missing from that list is a bug in
+the list. This count has gone stale four times: "exactly two" survived `exec`
+arriving, then "four" survived the PAT read, then "five" survived `PushSecret`,
+then this file survived the README being corrected. Update all three places, or
+none of them will be right.
 
 - Does a new code path put a decrypted value into an error message, a log line,
   a ledger `Details` field, or an HTTP response? The API returns metadata only.
