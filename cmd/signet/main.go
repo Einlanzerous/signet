@@ -2825,8 +2825,8 @@ func (n *stateNotes) print() {
 // A refusal and a failure need different verbs, and the difference is the whole
 // point: "declined" means nothing was sent and the destination still holds what
 // the last good push left, while "failed" means a delivery was attempted and
-// did not land. An operator reading "push declined" knows the environment is
-// intact and stale; reading "push failed" they do not.
+// did not land. An operator reading "the last push attempt was declined" knows
+// the environment is intact and stale; reading "failed" they do not.
 // Both are past tense on purpose. A refusal's text frequently ends in an
 // imperative — "set them, or drop them from the target", "re-add them, or pass
 // --allow-shrink" — and the reason is not re-derived, so that tail can outlive

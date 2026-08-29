@@ -436,14 +436,14 @@ $ signet target list --project construct-server
 SECRET                    KIND       DESTINATION                        STATE   LAST SYNCED
 construct-server (95 keys)  gh-render  o/r · home-server · PROD_ENV_FILE  drift*  2026-08-20T00:00:00Z
 
-  * o/r · home-server · PROD_ENV_FILE — push declined: this render drops 1 key(s) …
+  * o/r · home-server · PROD_ENV_FILE — the last push attempt was declined: this render …
 ```
 
 `signet status`, `signet target list` and `signet render --check` all do this,
 through one function. The note at the end of a `render` is prose and prints no
 state word, so it carries the same reason inline rather than marking anything —
 but it comes from that same function, so the four cannot word one fact four
-ways. A **refusal** reads as `push declined` and a **failure**
+ways. A **refusal** reads as `the last push attempt was declined` and a **failure**
 as `last push failed`, because the two are different facts: after a refusal the
 deployed environment is intact and stale, and after a failure that is not known.
 
@@ -458,7 +458,7 @@ still holds, so a `drift*` note can name a condition already fixed — set the k
 a refusal asked for and the render resolves, differs from what was delivered,
 and reports `drift` with that refusal still quoted. The mark is earned (the
 target *is* stale, and `sync` *is* the next step) but the text may be out of
-date, which is why it reads "the last push was declined: …" rather than an
+date, which is why it reads "the last push attempt was declined: …" rather than an
 imperative. Recomputing currency would mean re-deriving every refusal kind in
 the view, and the transport failures behind `error` cannot be re-derived at all.
 
