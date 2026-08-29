@@ -198,7 +198,16 @@ func TestARefusalAndAFailureAreWordedDifferently(t *testing.T) {
 	// decides the mark — the `unresolved` case. Overwriting the state threw the
 	// answer away, so an errored target on an unresolvable secret printed a
 	// bare word and collected no note.
-	if got := markState(refused, answered("drift").substituting("unresolved")); got != "unresolved*" {
+	//
+	// `error`, not `drift`, because that is the pairing production can reach:
+	// the substitution exists only on the gh-actions branches of `target list`
+	// and `status`, and TargetRefused is written from one place — `refuse` in
+	// internal/sync/render.go — on the rendered-target push path. A target that
+	// can be refused never takes the substitution. An earlier version of this
+	// case paired `refused` with `drift`, which is the third unreachable state
+	// pinned in this PR; the reachable one is what the comment above already
+	// described.
+	if got := markState(failed, answered("error").substituting("unresolved")); got != "unresolved*" {
 		t.Errorf("a substituted state lost the layer's answer: %q", got)
 	}
 	if got := markState(&store.Target{}, answered("in sync").substituting("unresolved")); got != "unresolved" {

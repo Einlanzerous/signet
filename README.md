@@ -433,7 +433,7 @@ is marked with a trailing `*`, and the reason is printed alongside:
 
 ```
 $ signet target list --project construct-server
-SECRET                    KIND       DESTINATION                        STATE   LAST SYNCED
+SECRET                      KIND       DESTINATION                        STATE   LAST SYNCED
 construct-server (95 keys)  gh-render  o/r · home-server · PROD_ENV_FILE  drift*  2026-08-20T00:00:00Z
 
   * o/r · home-server · PROD_ENV_FILE — the last push attempt was declined: this render …
