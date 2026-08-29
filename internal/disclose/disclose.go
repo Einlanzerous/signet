@@ -42,9 +42,15 @@
 // treat a correctly-audited PushSecret as broken.
 //
 // Stated once per channel it gets restated or forgotten. The traversal lives
-// here so a fifth channel inherits it rather than reimplementing it — and so
-// the answer to "does this new egress path record what it disclosed" is a
-// question about one import rather than about four copies staying in step.
+// here so a new channel inherits it rather than reimplementing it — and so the
+// answer to "does this new egress path record what it disclosed" is a question
+// about one import rather than about copies staying in step.
+//
+// No counts in that sentence, deliberately. It was written when there were
+// four, and was still saying "a fifth" and "four copies" two corrections later
+// — nine lines below a paragraph telling the reader a wrong count is a bug
+// report. The table above is the count; prose that repeats it only goes stale
+// somewhere the reader has been told to trust it.
 //
 // # What stays the caller's
 //

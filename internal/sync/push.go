@@ -178,8 +178,8 @@ func PushSecret(ctx context.Context, st *store.Store, key []byte, gh *GHClient, 
 			// which is the state this citation exists to prevent.
 			auditPushedInputs(st, &res, sec, store.AuditRecord{
 				Actor: actor, Action: "sync.push", TargetID: t.ID,
-				Details: fmt.Sprintf("value delivered to %s via push of %s/%s, which derives from it (push #%d)",
-					cfg.Destination(), sec.Project, sec.Name, seq),
+				Details: fmt.Sprintf("value delivered to %s via push of %s/%s, which derives from it %s",
+					cfg.Destination(), sec.Project, sec.Name, pushCitation(seq)),
 				EventKind: kind, ActorRole: role, Status: status,
 			})
 		}
