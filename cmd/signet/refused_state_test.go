@@ -37,7 +37,7 @@ func refuseTheRenderTarget(t *testing.T, st *store.Store, project string) {
 // declined.
 func seedRefusedRender(t *testing.T, st *store.Store) {
 	t.Helper()
-	path := seedProject(t, st, "demo", map[string]string{"ALPHA": "a", "BETA": "b"})
+	seedProject(t, st, "demo", map[string]string{"ALPHA": "a", "BETA": "b"})
 	captureStdout(t, func() {
 		if err := runTargetAdd([]string{
 			"--project", "demo", "--render-as-secret",
@@ -47,7 +47,6 @@ func seedRefusedRender(t *testing.T, st *store.Store) {
 			t.Fatal(err)
 		}
 	})
-	_ = path
 	refuseTheRenderTarget(t, st, "demo")
 }
 
@@ -213,6 +212,24 @@ func TestARefusalAndAFailureAreWordedDifferently(t *testing.T) {
 	if got := markState(&store.Target{}, answered("in sync").substituting("unresolved")); got != "unresolved" {
 		t.Errorf("a substituted state on a target with no reason was marked: %q", got)
 	}
+	// And the NOTE half, which shownState exists to keep in step with the mark.
+	// Only the mark was pinned, so `add` reading s.shown instead of s.judged
+	// passed the whole suite — printing `unresolved*` with nothing under the
+	// table to explain it, which is the false alarm add's own doc forbids and
+	// puts the transport error back where only `signet audit` reaches it.
+	var n stateNotes
+	n.add(failed, "o/r · TOKEN", answered("error").substituting("unresolved"))
+	if len(n.lines) != 1 {
+		t.Fatalf("a marked substituted state collected %d notes, want 1", len(n.lines))
+	}
+	if !strings.Contains(n.lines[0], "boom") {
+		t.Errorf("the note does not carry the reason: %q", n.lines[0])
+	}
+	var quiet stateNotes
+	quiet.add(&store.Target{}, "o/r · TOKEN", answered("in sync").substituting("unresolved"))
+	if len(quiet.lines) != 0 {
+		t.Errorf("a target with no reason collected a note: %v", quiet.lines)
+	}
 }
 
 // The other direction of the same bug, and the one the mark itself could
@@ -224,7 +241,7 @@ func TestARefusalAndAFailureAreWordedDifferently(t *testing.T) {
 // checks whether it took, must not be shown the refusal they just fixed.
 func TestAResolvedRefusalStopsBeingReported(t *testing.T) {
 	st := newCLIVault(t)
-	path := seedProject(t, st, "demo", map[string]string{"ALPHA": "a", "BETA": "b"})
+	seedProject(t, st, "demo", map[string]string{"ALPHA": "a", "BETA": "b"})
 	captureStdout(t, func() {
 		if err := runTargetAdd([]string{
 			"--project", "demo", "--render-as-secret",
@@ -245,7 +262,6 @@ func TestAResolvedRefusalStopsBeingReported(t *testing.T) {
 		nil, ""); err != nil {
 		t.Fatal(err)
 	}
-	_ = path
 
 	// The operator sets BETA — which the seed already did — so the render now
 	// resolves and the state is `never`, not `drift`. The refusal is over.
