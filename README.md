@@ -419,6 +419,46 @@ keys that would be dropped, managed keys the vault cannot resolve, or a target
 that manages nothing at all. The report is printed in full either way, so the
 command is equally usable by eye and as a gate in a deploy script.
 
+### A state marked `*` has a reason printed with it
+
+A refused push is reported as `drift`, not `error`. That is deliberate: nothing
+was sealed and nothing was sent, so the destination still holds what the last
+successful push put there, and *stale* is the fact an operator acts on. Pinning
+the target to `error` would hide the drift underneath it until some later sync
+succeeded.
+
+But "drift" does not say a push was **declined**, which is what explains the
+drift and usually names the fix. So a state whose word does not carry its reason
+is marked with a trailing `*`, and the reason is printed alongside:
+
+```
+$ signet target list --project construct-server
+SECRET                    KIND       DESTINATION                        STATE   LAST SYNCED
+construct-server (95 keys)  gh-render  o/r · home-server · PROD_ENV_FILE  drift*  2026-08-20T00:00:00Z
+
+  * o/r · home-server · PROD_ENV_FILE — push declined: this render drops 1 key(s) …
+```
+
+`signet status`, `signet target list`, `signet render --check` and the note at
+the end of a `render` all do this, through one function, so they cannot come to
+word one fact four ways. A **refusal** reads as `push declined` and a **failure**
+as `last push failed`, because the two are different facts: after a refusal the
+deployed environment is intact and stale, and after a failure that is not known.
+
+**The table keeps its five columns.** A reason is free text of unbounded length
+— the shrink guard's runs to three lines — and a column for it would make every
+row as wide as the worst refusal, in the two views whose job is scanning many
+targets at once. `status` is worse still: one rendered target annotates every
+secret it carries, so the 95-key render would repeat its refusal 95 times. The
+notes are de-duplicated by destination and printed under the table for that
+reason. A `--verbose` flag was considered and rejected: an operator does not know
+to ask for a reason they have not been told exists, which is the failure this
+replaces.
+
+Until this landed, `LastError` reached only the mirror's JSON, and a refused
+target read as ordinary drift in every CLI view — the reason recoverable only
+from `signet audit`, which requires already suspecting a refusal happened.
+
 `signet sync --check` asks the other half of the question. Reachability is a
 property of the credential; completeness is a property of the vault, and a
 destination the PAT can write is not the same as a blob there is anything to

@@ -1571,18 +1571,28 @@ func renderedTargetNote(t *store.Target, state string) renderNote {
 			hint:      "signet render --project %s --check --against /path/to/the/live/.env    # before the first sync",
 		}
 	case "drift":
+		// A refused push arrives here, not in "error": GHState reports it as
+		// drift on purpose. "now stale" is true of it and says nothing about
+		// the decision that caused it, which is both the explanation and the
+		// fix — the shrink guard's refusal names `--allow-shrink` in its own
+		// text (SGNT-35).
+		if t.LastError != "" {
+			return renderNote{text: fmt.Sprintf("now stale — %s", stateReason(t)), wantsSync: true}
+		}
 		return renderNote{text: "now stale", wantsSync: true}
 	case "unknown":
 		return renderNote{text: "delivered once, before signet recorded fingerprints — currency unknown until the next push", wantsSync: true}
 	case "error":
-		// The reason is carried rather than summarized, because this is the
-		// only place in the CLI that prints it: `status`, `target list` and
-		// `render --check` all show the bare state word, so "error" alone would
-		// leave `signet audit` as the only way to learn why.
+		// The reason is carried rather than summarized. This was once the only
+		// place in the CLI that printed it — `status`, `target list` and
+		// `render --check` all showed the bare state word — which is the
+		// asymmetry that made SGNT-35 visible. They all carry it now, through
+		// the same stateReason, so the four cannot come to word one fact four
+		// ways.
 		//
 		// GHState returns "error" only when LastError is non-empty, so there is
 		// no empty-reason branch to write.
-		return renderNote{text: fmt.Sprintf("last push failed (%s)", t.LastError), wantsSync: true}
+		return renderNote{text: stateReason(t), wantsSync: true}
 	case "in sync":
 		return renderNote{text: "in sync — this render changed nothing it delivers"}
 	default:
@@ -1743,7 +1753,15 @@ func printRenderCheck(t *store.Target, project string, want map[string]string, p
 		// current?", and a second copy of the answer is how they would come to
 		// disagree. The branches above have already excluded the two states it
 		// reports that this one words for itself.
-		fmt.Printf("  state: %s\n", renderState(t, cfg, want, key))
+		state := renderState(t, cfg, want, key)
+		fmt.Printf("  state: %s\n", markState(t, state))
+		// Not a table, so the reason goes directly under the state it explains
+		// rather than into a footnote. `drift` on a refused target is the case
+		// this exists for: true about currency, silent about the decision that
+		// caused it.
+		if t.LastError != "" {
+			fmt.Printf("    %s\n", stateReason(t))
+		}
 	}
 
 	if against == "" {
@@ -2545,12 +2563,19 @@ func runTargetList(args []string) error {
 
 	w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
 	rows := 0
-	emit := func(owner, kind, dest, state, synced string) {
+	// The table shape is fixed at five columns and stays that way — see the
+	// README's note on this. A reason is free text of unbounded length; giving
+	// it a column would make every row as wide as the worst refusal, in the
+	// view whose job is scanning many targets at once. It gets a marker here
+	// and a line below instead.
+	var notes stateNotes
+	emit := func(t *store.Target, owner, kind, dest, state, synced string) {
 		if rows == 0 {
 			fmt.Fprintln(w, "SECRET\tKIND\tDESTINATION\tSTATE\tLAST SYNCED")
 		}
 		rows++
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", owner, kind, dest, state, dashIfEmpty(synced))
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", owner, kind, dest, markState(t, state), dashIfEmpty(synced))
+		notes.add(t, dest)
 	}
 
 	for _, t := range targets {
@@ -2577,7 +2602,7 @@ func runTargetList(args []string) error {
 			if derr != nil {
 				state = "unresolved"
 			}
-			emit(sec.Project+"/"+sec.Name, t.Kind, cfg.Destination(), state, t.LastPushedAt)
+			emit(&t, sec.Project+"/"+sec.Name, t.Kind, cfg.Destination(), state, t.LastPushedAt)
 
 		case "gh-render":
 			// Project-scoped like a file target, so a secret filter keeps it
@@ -2600,7 +2625,7 @@ func runTargetList(args []string) error {
 			if wantSecret != nil {
 				owner = t.Project + "/" + wantSecret.Name
 			}
-			emit(owner, t.Kind, cfg.Destination(), renderState(&t, cfg, want, a.key), t.LastPushedAt)
+			emit(&t, owner, t.Kind, cfg.Destination(), renderState(&t, cfg, want, a.key), t.LastPushedAt)
 
 		case "file":
 			// File targets belong to a project rather than one secret, so a
@@ -2628,7 +2653,7 @@ func runTargetList(args []string) error {
 				key = wantSecret.Name
 				owner = t.Project + "/" + wantSecret.Name
 			}
-			emit(owner, t.Kind, cfg.Path, fileState(drift, key), t.LastPushedAt)
+			emit(&t, owner, t.Kind, cfg.Path, fileState(drift, key), t.LastPushedAt)
 		}
 	}
 	if err := w.Flush(); err != nil {
@@ -2637,6 +2662,9 @@ func runTargetList(args []string) error {
 	if rows == 0 {
 		fmt.Println("no targets matched")
 	}
+	// After the flush: these annotate the table's marked rows, and printing
+	// them through the tabwriter would column-align prose against it.
+	notes.print()
 	return nil
 }
 
@@ -2652,6 +2680,92 @@ func anyUnresolved(d syncpkg.FileDrift, problems map[string]error) bool {
 		}
 	}
 	return false
+}
+
+// ── Saying why, where the state word cannot (SGNT-35) ──────────────────────
+//
+// A target's state is one word, and for two of them the word is not the whole
+// fact. `refused` is the case that matters: GHState reports a declined push as
+// `drift`, deliberately — the destination is stale, and stale is what an
+// operator acts on — but "drift" does not say a push was *declined*, which is
+// what explains the drift and names the fix. `error` has the same shape more
+// mildly: it says a push failed and not why.
+//
+// Both reasons live in Target.LastError, and before SGNT-35 that field reached
+// the mirror's JSON and nothing else a human runs. So a shrink guard declining
+// a push read as ordinary drift in `status`, `target list` and `render --check`
+// alike, and the reason was reachable only from `signet audit` — which requires
+// already suspecting a refusal happened.
+//
+// The marker and the sentence live here, once, because three views print them
+// and REVIEW.md's first defect class is what happens when a rule like that is
+// applied at one call site.
+
+// markState appends a marker to a state whose reason the word does not carry.
+//
+// A bare `*` rather than a word, because the states appear in two tabwriter
+// columns that have no room to grow and are read as a column of one-word
+// values. It means "there is a reason, and it is printed below" — see
+// stateNotes.
+func markState(t *store.Target, state string) string {
+	if t.LastError == "" {
+		return state
+	}
+	return state + "*"
+}
+
+// stateNotes collects the reasons behind marked states, for printing under a
+// table with no column to hold them.
+//
+// It de-duplicates by destination because a rendered target annotates every
+// secret it carries — `status` prints one row per secret, and the 95-key
+// construct-server render would otherwise repeat its refusal 95 times, burying
+// the table it is supposed to annotate.
+type stateNotes struct {
+	seen  map[string]bool
+	lines []string
+}
+
+// add records the reason for one target, if it has one. dest is how the view
+// named the destination, so the note points at a row the reader can find.
+func (n *stateNotes) add(t *store.Target, dest string) {
+	if t.LastError == "" {
+		return
+	}
+	if n.seen == nil {
+		n.seen = map[string]bool{}
+	}
+	if n.seen[dest] {
+		return
+	}
+	n.seen[dest] = true
+	n.lines = append(n.lines, fmt.Sprintf("  * %s — %s", dest, stateReason(t)))
+}
+
+// print writes the collected notes, if any. Callers flush their table first:
+// these annotate it and would otherwise land in the middle of it.
+func (n *stateNotes) print() {
+	if len(n.lines) == 0 {
+		return
+	}
+	fmt.Println()
+	for _, l := range n.lines {
+		fmt.Println(l)
+	}
+}
+
+// stateReason phrases a target's LastError as the event it records.
+//
+// A refusal and a failure need different verbs, and the difference is the whole
+// point: "declined" means nothing was sent and the destination still holds what
+// the last good push left, while "failed" means a delivery was attempted and
+// did not land. An operator reading "push declined" knows the environment is
+// intact and stale; reading "push failed" they do not.
+func stateReason(t *store.Target) string {
+	if t.LastState == store.TargetRefused {
+		return "push declined: " + t.LastError
+	}
+	return "last push failed: " + t.LastError
 }
 
 // renderState reduces a rendered target's drift to one word.
@@ -3252,6 +3366,9 @@ func runStatus(args []string) error {
 	type renderInfo struct {
 		cfg   store.GHRenderConfig
 		state string
+		// Carried so the TARGETS column can mark a state whose reason the word
+		// does not hold, and name it below the table — see markState.
+		target *store.Target
 	}
 	fileByProject := map[string][]fileInfo{}
 	renderByProject := map[string][]renderInfo{}
@@ -3283,12 +3400,16 @@ func runStatus(args []string) error {
 			if err != nil {
 				return err
 			}
-			renderByProject[p] = append(renderByProject[p], renderInfo{cfg, renderState(&rts[i], cfg, want, a.key)})
+			renderByProject[p] = append(renderByProject[p], renderInfo{cfg, renderState(&rts[i], cfg, want, a.key), &rts[i]})
 		}
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
 	fmt.Fprintln(w, "PROJECT\tSECRET\tVHASH\tSTATUS\tEXPIRES\tTARGETS")
+	// A marked state in the TARGETS column has its reason printed under the
+	// table. The column already packs several destinations into one cell; free
+	// text belongs nowhere near it.
+	var notes stateNotes
 	for _, sec := range secrets {
 		cur, digest, derr := a.ghDrift(&sec)
 		// A derived secret shows what it is composed from where a stored one
@@ -3323,7 +3444,9 @@ func runStatus(args []string) error {
 			if derr != nil {
 				ghState = "unresolved"
 			}
-			tgt = append(tgt, fmt.Sprintf("gh:%s→%s [%s]", cfg.Repo+dotted(cfg.Environment), cfg.SecretName, ghState))
+			dest := cfg.Repo + dotted(cfg.Environment) + "→" + cfg.SecretName
+			tgt = append(tgt, fmt.Sprintf("gh:%s [%s]", dest, markState(&t, ghState)))
+			notes.add(&t, dest)
 		}
 		// A rendered target is delivered whole, so it annotates every secret it
 		// carries with the same state — the blob is current or it is not, and no
@@ -3332,7 +3455,9 @@ func runStatus(args []string) error {
 			if !ri.cfg.Manages(sec.Name) {
 				continue
 			}
-			tgt = append(tgt, fmt.Sprintf("gh-render:%s→%s [%s]", ri.cfg.Repo+dotted(ri.cfg.Environment), ri.cfg.SecretName, ri.state))
+			dest := ri.cfg.Repo + dotted(ri.cfg.Environment) + "→" + ri.cfg.SecretName
+			tgt = append(tgt, fmt.Sprintf("gh-render:%s [%s]", dest, markState(ri.target, ri.state)))
+			notes.add(ri.target, dest)
 		}
 		for _, fi := range fileByProject[sec.Project] {
 			if !fi.cfg.Manages(sec.Name) {
@@ -3348,7 +3473,11 @@ func runStatus(args []string) error {
 		}
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", sec.Project, sec.Name, vhash, sec.Status, expires, strings.Join(tgt, ", "))
 	}
-	return w.Flush()
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	notes.print()
+	return nil
 }
 
 // expiresIn renders an RFC3339 expiry as "2026-10-19 (79d)", or "" when there
