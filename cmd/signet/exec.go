@@ -322,9 +322,11 @@ func (a *app) auditExec(inject map[string]injected, command string, redacted boo
 		// A derived secret's value carries its inputs', so injecting it
 		// discloses them too — see auditDerivedInputs for why the traversal
 		// lives there rather than here.
-		if err := a.auditDerivedInputs(&in.secret, "secret.exec",
-			fmt.Sprintf("value disclosed to %q via exec of %s/%s, which derives from it",
-				command, in.secret.Project, in.secret.Name)); err != nil {
+		if err := a.auditDerivedInputs(&in.secret, store.AuditRecord{
+			Action: "secret.exec",
+			Details: fmt.Sprintf("value disclosed to %q via exec of %s/%s, which derives from it",
+				command, in.secret.Project, in.secret.Name),
+		}); err != nil {
 			return err
 		}
 	}

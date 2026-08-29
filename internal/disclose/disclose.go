@@ -9,10 +9,17 @@
 // # Why this is a package and not a helper on a call site
 //
 // The rule belongs to the derivation graph, not to any one channel that reads
-// it, and this repo has now rediscovered that four times: `reveal` (SGNT-18),
-// `exec` (SGNT-32), `render` and the rendered-target push (both SGNT-34). Each
-// time it was found as an unaudited read channel in a vault whose premise is
-// that plaintext leaves only in audited ways.
+// it, and this repo has now rediscovered that five times: `reveal` (SGNT-18),
+// `exec` (SGNT-32), `render`, the rendered-target push, and the GitHub PAT read
+// in internal/ops (all three SGNT-34, the last found by review). Each time it
+// was found as an unaudited read channel in a vault whose premise is that
+// plaintext leaves only in audited ways.
+//
+// The count is load-bearing and was wrong here once already: this comment said
+// "four" while `ops.ResolveGHToken` was a fifth, in the package whose stated
+// purpose is that a new channel inherits the rule. If you add a channel, add it
+// to this list — and if you find one missing from the list, it is a bug in the
+// channel, not in the list.
 //
 // Stated once per channel it gets restated or forgotten. The traversal lives
 // here so a fifth channel inherits it rather than reimplementing it — and so

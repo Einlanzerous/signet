@@ -216,6 +216,32 @@ Details worth knowing:
   `reveal` — including the inputs of a derived secret, whose values it carries.
   `signet audit --secret <input>` shows the disclosure.
 
+## Where plaintext leaves, and what the ledger records
+
+Values leave the vault through `reveal`, `exec`, a rendered file target, the
+sealed push to GitHub, and the read of the GitHub PAT itself. **Every one of
+them writes an entry carrying the `SecretID`**, because the question the ledger
+has to answer is asked from the credential's side — *where has this value been*
+— and `signet audit --secret <ref>` filters on exactly that. An entry naming
+only a target answers it empty.
+
+A **disclosure of a derived secret is a disclosure of its inputs**, so each
+channel also writes against every secret the value was composed from,
+transitively and across projects. That rule lives in `internal/disclose`; a new
+egress path inherits it rather than restating it.
+
+**This makes renders wordy on purpose.** A 95-key render writes 95 per-secret
+entries beside its one per-target entry. That is the trade — an entry that is
+not *on* the credential is not findable *from* it — but it means the default
+`signet audit` (newest 50) can be a page of `secret.render` rows with the
+`render` entry they cite pushed off the end. Reach it with `--limit`, or ask
+from the side you actually care about:
+
+```
+signet audit --secret construct-server/DB_PASSWORD   # where has this been written
+signet audit --limit 200                             # the render entry itself
+```
+
 ### `--redact`
 
 Filters the child's stdout and stderr, replacing any value signet manages with

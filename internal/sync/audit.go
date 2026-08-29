@@ -49,10 +49,10 @@ func noteAuditErr(res *PushResult, err error, what string) {
 // whose plaintext its delivered value carries.
 //
 // The traversal is internal/disclose's; this binds it to the push's actor,
-// role, kind and target. rec is deliberately the *push's* kind rather than
-// KindSecretReveal — a fan-out to a destination is a KindSyncPush wherever it
-// appears, and an input's ledger should show it as the same class of event the
-// derived secret's does.
+// role, kind and target. rec deliberately carries the *push's own* kind rather
+// than KindSecretReveal — KindSyncPush normally, KindDriftReconcile when the
+// destination had changed out of band — because an input's ledger should show
+// the disclosure as the same class of event the derived secret's does.
 func auditPushedInputs(st *store.Store, res *PushResult, sec *store.Secret, rec store.AuditRecord) {
 	if err := disclose.Inputs(st, sec, rec); err != nil {
 		noteAuditErr(res, err, rec.Action+" (derivation inputs)")

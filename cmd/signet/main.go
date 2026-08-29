@@ -730,8 +730,10 @@ func runReveal(args []string) error {
 		return err
 	}
 
-	if err := a.auditDerivedInputs(sec, "secret.reveal",
-		fmt.Sprintf("value disclosed via reveal of %s/%s, which derives from it", *project, *name)); err != nil {
+	if err := a.auditDerivedInputs(sec, store.AuditRecord{
+		Action:  "secret.reveal",
+		Details: fmt.Sprintf("value disclosed via reveal of %s/%s, which derives from it", *project, *name),
+	}); err != nil {
 		return err
 	}
 	// The provenance goes to stderr so `reveal` stays pipeable: the value alone
@@ -749,11 +751,11 @@ func runReveal(args []string) error {
 //
 // The rule — *a disclosure of a derived secret is a disclosure of its inputs* —
 // belongs to the derivation graph rather than to any one channel that reads it,
-// and it now has four of them: `reveal`, `exec`, `render`, and the
-// rendered-target push in internal/sync. It therefore lives in
-// internal/disclose, which the sync package reaches too; this is the CLI's
-// binding of it to the actor, role and kind that every disclosure from a
-// terminal shares.
+// and it now has five of them: `reveal`, `exec`, `render`, the rendered-target
+// push, and the PAT read in internal/ops. It therefore lives in
+// internal/disclose, which those packages reach too; this is the CLI's binding
+// of it to the actor, role and kind that every disclosure from a terminal
+// shares.
 //
 // Without it the entry on the derived secret is the only trace, and
 // `signet audit --secret <input>` shows nothing for a read that crossed
@@ -761,14 +763,18 @@ func runReveal(args []string) error {
 // leaves only in audited ways; "audited" has to mean audited where someone
 // investigating that credential would look.
 //
-// detail is the caller's, because what an investigator needs differs between a
-// reveal to a terminal, an injection into a process and a file on disk.
-func (a *app) auditDerivedInputs(sec *store.Secret, action, detail string) error {
-	return disclose.Inputs(a.st, sec, store.AuditRecord{
-		Actor: cliActor(), Action: action, Details: detail,
-		EventKind: store.KindSecretReveal, ActorRole: cliRole(),
-		Status: &store.AuditStatus{Outcome: store.OutcomeDelivered},
-	})
+// rec carries the caller's Action, Details, and — where the channel has one —
+// TargetID. What an investigator needs differs between a reveal to a terminal,
+// an injection into a process and a file on disk, so those are the caller's; a
+// record rather than positional strings because an input's entry should be as
+// findable as the direct one beside it, and TargetID was silently droppable
+// while this took a fixed argument list.
+func (a *app) auditDerivedInputs(sec *store.Secret, rec store.AuditRecord) error {
+	rec.Actor = cliActor()
+	rec.ActorRole = cliRole()
+	rec.EventKind = store.KindSecretReveal
+	rec.Status = &store.AuditStatus{Outcome: store.OutcomeDelivered}
+	return disclose.Inputs(a.st, sec, rec)
 }
 
 // ---- rotate -----------------------------------------------------------------
@@ -1425,19 +1431,16 @@ func runRender(args []string) error {
 		}
 		return nil
 	}
-	want, err := a.projectValuesStrict(*project)
+	// The secrets come back alongside the values because the ledger entries
+	// below need the SecretID behind each key, and resolving the project has
+	// already listed them — asking a second time was two full ListSecrets
+	// passes for one render.
+	want, secrets, err := a.projectValuesStrict(*project)
 	if err != nil {
 		return err
 	}
 	if len(targets) == 0 {
 		return fmt.Errorf("project %s has only rendered targets, which `signet sync` delivers — there is no file to write", *project)
-	}
-	// Fetched once for the whole render rather than per target: the ledger
-	// entries below need the SecretID behind each key, and two targets in one
-	// project routinely share keys.
-	secrets, err := a.projectSecrets(*project)
-	if err != nil {
-		return err
 	}
 
 	for _, t := range targets {
@@ -1619,6 +1622,15 @@ func (a *app) projectValues(project string) (map[string]string, map[string]error
 	if err != nil {
 		return nil, nil, err
 	}
+	want, problems := a.resolveInto(secrets)
+	return want, problems, nil
+}
+
+// resolveInto reduces a project's secrets to their current values, collecting
+// per-secret failures rather than failing the project. Shared by the lenient
+// and strict readers so the two cannot come to disagree about what "absent"
+// and "broken" mean.
+func (a *app) resolveInto(secrets map[string]store.Secret) (map[string]string, map[string]error) {
 	want := map[string]string{}
 	problems := map[string]error{}
 	for _, sec := range secrets {
@@ -1634,7 +1646,7 @@ func (a *app) projectValues(project string) (map[string]string, map[string]error
 		}
 		want[sec.Name] = r.Value
 	}
-	return want, problems, nil
+	return want, problems
 }
 
 // auditRenderedSecrets records a render against each secret whose plaintext it
@@ -1685,9 +1697,17 @@ func (a *app) auditRenderedSecrets(targetID, path string, seq int64, keys []stri
 		// A derived secret's value carries its inputs', so writing it to disk
 		// writes theirs — see internal/disclose for why the traversal is not
 		// repeated here.
-		if err := a.auditDerivedInputs(&sec, "secret.render",
-			fmt.Sprintf("value written to %s via render of %s/%s, which derives from it",
-				path, sec.Project, sec.Name)); err != nil {
+		//
+		// The TargetID and the render's sequence travel with it. An investigator
+		// who arrives at this secret because it is an INPUT has the same
+		// question as one who arrives at it directly, and an entry that named
+		// the file but not the render it belonged to answered half of it.
+		if err := a.auditDerivedInputs(&sec, store.AuditRecord{
+			Action:   "secret.render",
+			TargetID: targetID,
+			Details: fmt.Sprintf("value written to %s via render of %s/%s, which derives from it (render #%d)",
+				path, sec.Project, sec.Name, seq),
+		}); err != nil {
 			return err
 		}
 	}
@@ -1735,15 +1755,19 @@ func (a *app) ghDrift(sec *store.Secret) (*store.Version, string, error) {
 // projectValuesStrict is projectValues for callers that must not proceed on a
 // partial answer — render, which would otherwise write a file missing a key it
 // is responsible for.
-func (a *app) projectValuesStrict(project string) (map[string]string, error) {
-	want, problems, err := a.projectValues(project)
+// It returns the secrets alongside their values: a caller strict enough to
+// refuse a partial answer is also the caller that has to record what it
+// disclosed, and a value cannot supply a SecretID.
+func (a *app) projectValuesStrict(project string) (map[string]string, map[string]store.Secret, error) {
+	secrets, err := a.projectSecrets(project)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	want, problems := a.resolveInto(secrets)
 	for _, name := range sortedKeys(problems) {
-		return nil, fmt.Errorf("%s/%s cannot be resolved: %w", project, name, problems[name])
+		return nil, nil, fmt.Errorf("%s/%s cannot be resolved: %w", project, name, problems[name])
 	}
-	return want, nil
+	return want, secrets, nil
 }
 
 // sortedKeys returns a map's keys in order, so a failure reports the same

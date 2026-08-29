@@ -557,7 +557,7 @@ func markRenderTargetPushed(t *testing.T, st *store.Store, project string) {
 		t.Fatal(err)
 	}
 	defer a.close()
-	want, err := a.projectValuesStrict(project)
+	want, _, err := a.projectValuesStrict(project)
 	if err != nil {
 		t.Fatal(err)
 	}

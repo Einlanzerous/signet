@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Einlanzerous/signet/internal/disclose"
 	"github.com/Einlanzerous/signet/internal/resolve"
 	"github.com/Einlanzerous/signet/internal/store"
 )
@@ -152,14 +153,35 @@ func ResolveGHTokenFor(st *store.Store, key []byte, envToken, actor string, role
 	if token == "" {
 		return GHToken{}, fmt.Errorf("%s is empty — cannot push to GitHub Actions; store the PAT with %s", ref, ghTokenFix)
 	}
-	if _, err := st.AppendAudit(store.AuditRecord{
+	rec := store.AuditRecord{
 		Actor: actor, Action: ActionSecretRead, SecretID: sec.ID,
 		Details: fmt.Sprintf("read %s %s to %s (%s)",
 			ref, provenanceOf(r), purpose, GHTokenEnvNone),
 		EventKind: store.KindSecretReveal, ActorRole: role,
 		Status: &store.AuditStatus{Outcome: store.OutcomeDelivered},
-	}); err != nil {
+	}
+	if _, err := st.AppendAudit(rec); err != nil {
 		return GHToken{}, fmt.Errorf("%s read but not recorded: %w", ref, err)
+	}
+	// The fifth disclosure channel, found by the review on #43 (SGNT-34).
+	//
+	// The resolve.Current above exists precisely so a DERIVED PAT works, and a
+	// derived PAT's plaintext is its inputs' — decrypted here and put into an
+	// Authorization header. Recording only against the PAT left
+	// `signet audit --secret <input>` empty for a read that sent that
+	// credential off-box, on the one secret in the vault that can rewrite every
+	// other destination.
+	//
+	// Same rule, same traversal, as reveal, exec, render and the pushes; see
+	// internal/disclose for why it is not restated here.
+	if err := disclose.Inputs(st, sec, store.AuditRecord{
+		Actor: actor, Action: ActionSecretRead,
+		Details: fmt.Sprintf("value read to %s via %s, which derives from it (%s)",
+			purpose, ref, GHTokenEnvNone),
+		EventKind: store.KindSecretReveal, ActorRole: role,
+		Status: &store.AuditStatus{Outcome: store.OutcomeDelivered},
+	}); err != nil {
+		return GHToken{}, fmt.Errorf("%s read but its derivation inputs were not recorded: %w", ref, err)
 	}
 	return GHToken{Value: token, Source: TokenFromVault, ExpiresAt: sec.ExpiresAt}, nil
 }

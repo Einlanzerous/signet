@@ -74,9 +74,21 @@ func TestRenderAuditsTheInputsOfADerivedSecret(t *testing.T) {
 	})
 
 	for _, e := range renderEntriesFor(t, st, "csrv", "DB_PASSWORD") {
-		if strings.Contains(e.Details, "derives from it") {
-			return
+		if !strings.Contains(e.Details, "derives from it") {
+			continue
 		}
+		// An investigator who arrives here because this secret is an INPUT has
+		// the same question as one who arrives at it directly, so the entry has
+		// to lead back the same way: to the target, and to the render entry
+		// holding the full account. It named the file and nothing else until
+		// the review on #43 caught the asymmetry with the direct entry beside it.
+		if e.TargetID == "" {
+			t.Error("an input's entry carries no TargetID, so it cannot be tied back to the render")
+		}
+		if !strings.Contains(e.Details, "(render #") {
+			t.Errorf("an input's entry does not cite the render it belonged to: %q", e.Details)
+		}
+		return
 	}
 	t.Fatal("rendering a derived secret to disk left no trace on the input whose value it carries")
 }
