@@ -172,9 +172,31 @@ func (t *Target) GHState(cur *Version, digest string) string {
 	// successful push put there. Treating it as an error state would pin the
 	// target to "error" until some later sync succeeded, hiding the drift
 	// underneath it — and drift is the fact an operator needs, because it is
-	// the one that says the deployed environment is stale. The refusal itself
-	// is not lost: LastError carries its reason, and every view that renders a
-	// state renders that alongside it.
+	// the one that says the deployed environment is stale.
+	//
+	// That argument stands on its own, and until SGNT-35 it was propped up by a
+	// claim that did not: "every view that renders a state renders [LastError]
+	// alongside it". None of the CLI views did. A refused push read as ordinary
+	// drift in `status`, `target list` and `render --check`, all three true
+	// about currency and none of them saying a push had been DECLINED — the
+	// fact that explains the drift and the one an operator acts on. The reason
+	// was reachable only from `signet audit`, which requires already suspecting
+	// a refusal happened.
+	//
+	// It is true now, for the two states that hide a reason — this one, when
+	// LastState is `refused`, and `error`. Three CLI views mark them with a
+	// trailing `*` and print the reason: under the table for `signet status`
+	// and `signet target list`, beneath the state for `signet render --check`.
+	// The fourth, the note at the end of a `render`, prints no state word at
+	// all — it is prose — so it carries the reason inline instead. The mirror's
+	// TargetView carries LastError as its own field, as it always did.
+	//
+	// The qualifier is load-bearing and is the whole sentence's honesty: no
+	// other state is marked, because LastError outlives the refusal it records
+	// — nothing clears it short of a later successful push — so an operator who
+	// fixes a refusal would otherwise see `never*` or `in sync*` still quoting
+	// it. Whoever changes those views owns keeping this true; it is the
+	// justification for the branch below, not decoration on it.
 	if t.LastError != "" && t.LastState != TargetRefused {
 		return "error"
 	}

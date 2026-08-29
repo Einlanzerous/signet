@@ -455,6 +455,75 @@ keys that would be dropped, managed keys the vault cannot resolve, or a target
 that manages nothing at all. The report is printed in full either way, so the
 command is equally usable by eye and as a gate in a deploy script.
 
+### A state marked `*` has a reason printed with it
+
+A refused push is reported as `drift`, not `error`. That is deliberate: nothing
+was sealed and nothing was sent, so the destination still holds what the last
+successful push put there, and *stale* is the fact an operator acts on. Pinning
+the target to `error` would hide the drift underneath it until some later sync
+succeeded.
+
+But "drift" does not say a push was **declined**, which is what explains the
+drift and usually names the fix. So a state whose word does not carry its reason
+is marked with a trailing `*`, and the reason is printed alongside:
+
+```
+$ signet target list --project construct-server
+SECRET                      KIND       DESTINATION                        STATE   LAST SYNCED
+construct-server (95 keys)  gh-render  o/r · home-server · PROD_ENV_FILE  drift*  2026-08-20T00:00:00Z
+
+  * o/r · home-server · PROD_ENV_FILE — the last push attempt was declined: this render …
+```
+
+`signet status`, `signet target list` and `signet render --check` all do this,
+through one function. The note at the end of a `render` is prose and prints no
+state word, so it carries the same reason inline rather than marking anything —
+but it comes from that same function, so the four cannot word one fact four
+ways. A **refusal** reads as `the last push attempt was declined` and a **failure**
+as `last push failed`, because the two are different facts: after a refusal the
+deployed environment is intact and stale, and after a failure that is not known.
+
+**Only two states are marked** — `error`, and `drift` on a target whose last
+push was refused. The recorded reason outlives the refusal (nothing clears it
+short of a later successful push), so marking on its presence alone would show
+an operator who *fixed* a refusal a `never*` or `in sync*` still quoting the
+refusal they just fixed, at the moment they were checking whether the fix took.
+
+**A reason is history, and is worded as history.** Nothing recomputes whether it
+still holds, so a `drift*` note can name a condition already fixed — set the key
+a refusal asked for and the render resolves, differs from what was delivered,
+and reports `drift` with that refusal still quoted. The mark is earned (the
+target *is* stale, and `sync` *is* the next step) but the text may be out of
+date, which is why it reads "the last push attempt was declined: …" rather than an
+imperative. Recomputing currency would mean re-deriving every refusal kind in
+the view, and the transport failures behind `error` cannot be re-derived at all.
+
+`unresolved` is not a state signet derives — it is a word `target list` and
+`status` substitute when a secret's value cannot be resolved at all. It still
+carries the mark and the note, because the underlying state is what decides
+them: a target whose last push failed, on a secret that has *also* stopped
+resolving, would otherwise print a bare word and put the push failure back
+where only `signet audit` could reach it.
+
+`empty` and `incomplete` are unmarked because they are conditions rather than
+history. Note that only `render --check` currently spells them out; `target
+list` and `status` print the bare word, which is this section's own complaint
+one state over and is not addressed here.
+
+**The table keeps its five columns.** A reason is free text of unbounded length
+— the shrink guard's runs to three lines — and a column for it would make every
+row as wide as the worst refusal, in the two views whose job is scanning many
+targets at once. `status` is worse still: one rendered target annotates every
+secret it carries, so the 95-key render would repeat its refusal 95 times. The
+notes are de-duplicated by destination and printed under the table for that
+reason. A `--verbose` flag was considered and rejected: an operator does not know
+to ask for a reason they have not been told exists, which is the failure this
+replaces.
+
+Until this landed, `LastError` reached only the mirror's JSON, and a refused
+target read as ordinary drift in every CLI view — the reason recoverable only
+from `signet audit`, which requires already suspecting a refusal happened.
+
 `signet sync --check` asks the other half of the question. Reachability is a
 property of the credential; completeness is a property of the vault, and a
 destination the PAT can write is not the same as a blob there is anything to
