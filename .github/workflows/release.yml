@@ -88,6 +88,13 @@ jobs:
             echo "If the failure was a flake rather than a real defect, re-running this"
             echo "workflow is enough; prefer fixing the flake (see SGNT-26, which is how"
             echo "this gap was found)."
+            echo
+            echo "> One exception, if the commit blocked here was a **release-PR merge**."
+            echo "> release-please tags that merge commit, not your fix, so a later run"
+            echo "> will cut the release at this same red commit. \`verify-tag\` re-runs"
+            echo "> the suite against the tag and will withhold the binary if it is still"
+            echo "> failing — see that job's summary for what to do then. Re-running this"
+            echo "> workflow, rather than pushing past it, is the cleaner recovery."
           } >> "$GITHUB_STEP_SUMMARY"
           echo "::error title=Release blocked::ci failed on ${GITHUB_SHA} — no tag, no release, no deploy dispatch. See the run summary."
           exit 1
@@ -128,32 +135,108 @@ jobs:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
+  # ── Gating the commit that is actually published (SGNT-27, round 2) ───────
+  #
+  # The `ci` job above gates release-please: it runs on `github.sha`, the pushed
+  # commit, and stops a release being cut while main is red. That is not the
+  # same as gating what gets SHIPPED, because the tag release-please creates
+  # does not have to be the pushed commit.
+  #
+  # release-please ties a release to the release PR, and tags that PR's MERGE
+  # COMMIT. Every tag in this repo points at one (`v1.9.1`→`e0e6bd4`,
+  # `v1.9.0`→`4fc5f14`, …), and until this workflow gained a `concurrency` block
+  # that always coincided with the run's HEAD, because every push to main got
+  # its own run. It no longer has to:
+  #
+  #   1. release PR merges as M; M's run fails `ci`; `blocked` fires, no tag.
+  #   2. the operator does what `blocked` says and pushes the fix, F.
+  #   3. F's run passes `ci` — on F — and release-please cuts the release at M.
+  #   4. `build` checks out the tag, which is M. Whose suite was red.
+  #
+  # The gate ran on F and the binary came from M. That is this ticket's own
+  # title, re-created one job along, and it was introduced by round 2's fix for
+  # a different problem: before it, `build` compiled `github.sha` and uploaded
+  # to the tag, so the artifact was gated but possibly MISLABELLED. Trading that
+  # for possibly UNGATED is the worse half, because a mislabelled binary is
+  # visible in /healthz and an ungated one is visible nowhere.
+  #
+  # So the suite runs again, against the tag. This is deliberately not an
+  # argument about what release-please targets: if the tag is always the pushed
+  # commit then this job is a cheap no-op, and if it is not then this job is the
+  # only thing standing between a red commit and construct-server. It is correct
+  # under both readings, which is why it is here rather than a comment claiming
+  # the question is settled.
+  verify-tag:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created }}
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.release-please.outputs.tag_name }}
+
+  # The same refusal as `blocked`, for the case where the tag exists. It is a
+  # different fact and a different recovery — there is a tag and a GitHub
+  # Release out there — so it says so rather than reusing the other wording.
+  tag-unverified:
+    needs: [release-please, verify-tag]
+    # Narrower than `failure()`, which is true when ANY ancestor failed — that
+    # includes the `ci` job, whose failure `blocked` already reports and which
+    # leaves no tag for this summary to be about. Naming the result keeps the
+    # two refusals describing the state they actually happened in.
+    if: ${{ always() && needs.verify-tag.result == 'failure' }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Report the withheld artifact
+        env:
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          {
+            echo "## Release \`${TAG}\` was tagged, and its binary is withheld"
+            echo
+            echo "The suite failed when run against \`${TAG}\` itself, which is not"
+            echo "necessarily the commit this run was triggered by — release-please tags"
+            echo "the release PR's merge commit."
+            echo
+            echo "**No binary was attached and no \`signet-released\` dispatch was sent**,"
+            echo "so construct-server was never offered this release and the"
+            echo "\`signet-prod\` approver will see nothing."
+            echo
+            echo "### Recovering"
+            echo
+            echo "The tag and the GitHub Release exist and are empty. This is the one"
+            echo "case that needs a decision rather than a retry:"
+            echo
+            echo "- **A flake** — re-run this workflow. The suite runs against the tag"
+            echo "  again and the binary attaches to the existing release."
+            echo "- **A real failure** — the tagged commit should not ship. Fix forward"
+            echo "  and cut a new release; delete this tag and its release if you do not"
+            echo "  want an empty one in the history. Pushing a fix alone does NOT move"
+            echo "  this tag."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error title=Binary withheld::the suite failed against ${TAG} — tag exists, no binary, no deploy dispatch. See the run summary."
+          exit 1
+
   # When release-please cuts a release, build the static binary and attach it to
   # the GitHub Release as linux/amd64 + a sha256 checksum. (Switchyard pushes a
   # ghcr image here; Signet ships a host binary, so the artifact is the binary.)
   build:
-    needs: release-please
+    needs: [release-please, verify-tag]
     if: ${{ needs.release-please.outputs.release_created }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: write
     steps:
-      # The tag release-please just created, NOT the run's HEAD.
+      # The tag release-please just created, NOT the run's HEAD — so this job
+      # builds what it uploads, by construction, rather than compiling one
+      # commit and attaching the result to a tag pointing at another.
       #
-      # Those are the same commit in the ordinary case, and were always the same
-      # commit before the workflow-level `concurrency` above existed, because
-      # every push to main got its own release run. They can now differ: of two
-      # pushes arriving while a release is in flight, the first is dropped
-      # before it starts, so the release-PR merge can be cut by a later run
-      # whose HEAD is a different commit. Nothing in this job would notice —
-      # it would compile one commit, stamp its sha, and upload the result to a
-      # tag pointing at another.
-      #
-      # Naming the tag makes the mismatch unrepresentable rather than unlikely:
-      # this job builds what it uploads, by construction. Flagged as
-      # pre-existing in the review on #42; fixed here because the concurrency
-      # change above is what makes it reachable.
+      # This is only safe because `verify-tag` ran the suite against the same
+      # ref. Pinning the artifact to the tag WITHOUT that gate is strictly worse
+      # than not pinning it: see the comment on verify-tag for how it moved this
+      # job from "gated but possibly mislabelled" to "correctly labelled but
+      # possibly ungated". The two changes belong together and neither should be
+      # reverted alone.
       - name: Checkout
         uses: actions/checkout@v4
         with:

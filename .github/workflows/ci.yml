@@ -22,6 +22,16 @@ name: ci
 on:
   pull_request:
   workflow_call:
+    inputs:
+      ref:
+        description: >-
+          Commit-ish to check out. Empty (the default) means the ref that
+          triggered the caller, which is what the PR path and the release
+          gate both want. release.yml passes a tag so the suite can be run
+          against the commit that is actually published — see verify-tag.
+        type: string
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -31,7 +41,13 @@ concurrency:
   # `ci-ci-…` for a pull request and `ci-Release Please-…` for the release gate.
   # Naming the workflow keeps those apart; without it a future caller sharing a
   # ref would land in one group with the cancellation below.
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  #
+  # `inputs.ref` is in the key because release.yml calls this workflow TWICE in
+  # one run — once on the pushed commit, once on the tag — and those two must
+  # not share a group. They are sequenced by `needs:` today, so nothing would
+  # deadlock, but a group two jobs of one run can both want is a trap to leave
+  # lying around. Empty on the pull-request path, where `inputs` is unset.
+  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ inputs.ref }}
   # Superseded PR runs are worth cancelling. A run the release gate is waiting
   # on is not: cancelling it either blocks a release that should have been cut
   # or, if the cancellation reaches the caller once `build` has started, leaves
@@ -44,6 +60,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Empty resolves to the triggering ref, so the PR path is unchanged.
+          ref: ${{ inputs.ref }}
 
       - uses: actions/setup-go@v5
         with:

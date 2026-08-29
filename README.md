@@ -700,17 +700,41 @@ separate `ci` *workflow* run on a `main` commit — the same signal appears as t
 unchanged, and `main` carries no branch protection or ruleset that named the old
 check.
 
-**When a release is blocked**, the `Release Please` run goes red and its
-`blocked` job writes a summary saying so — that a release was withheld, and
-that nothing was tagged or dispatched. A release that simply never appears is
-its own kind of invisible, which is why the refusal is announced rather than
-implied by an absent tag.
+**The suite runs twice on a release**, and the second run is the load-bearing
+one. `ci` gates release-please, so no tag is cut while `main` is red.
+`verify-tag` then re-runs the suite **against the tag itself** and gates the
+binary and the deploy dispatch on that.
 
-**Recovering needs nothing manual.** Push the fix to `main`; that push runs the
-workflow again and release-please picks up every commit since the last release,
-including the blocked one. The release is delayed, not lost — no re-tagging, no
-cleanup. If the failure was a genuine flake, re-running the workflow is enough,
-though fixing the flake is the better answer.
+The second gate exists because the tag is not necessarily the commit that was
+pushed: release-please ties a release to the release PR and tags that PR's
+*merge commit*. Gate the pushed commit only, and this is reachable — the
+release-PR merge fails `ci`, the operator pushes a fix, the fix's run passes
+`ci` **on the fix** and cuts the release **at the still-red merge commit**.
+`verify-tag` is correct whether or not those two commits can actually diverge,
+which is why it is a job rather than a comment asserting that they cannot.
+
+**When something is blocked, the run says which of the two it was**, because
+the states differ and so does the recovery:
+
+| job | what happened | what exists |
+|---|---|---|
+| `blocked` | `ci` failed on the pushed commit | nothing — no tag, no release, no dispatch |
+| `tag-unverified` | the suite failed against the tag | a tag and an empty GitHub Release; no binary, no dispatch |
+
+A release that simply never appears is its own kind of invisible, which is why
+both are announced rather than implied by an absent tag.
+
+**Recovering from `blocked` needs nothing manual.** Push the fix to `main`; that
+push runs the workflow again and release-please picks up every commit since the
+last release. The release is delayed, not lost.
+
+**Recovering from `tag-unverified` needs a decision**, and it is the one case
+where "push the fix" is not the answer. The tag already exists and pushing a fix
+does not move it — release-please releases the merged release PR at its own
+merge commit. So: if the failure was a flake, **re-run the workflow** and the
+binary attaches to the existing release. If it was real, that commit should not
+ship — fix forward and cut a new release, deleting the empty tag and release if
+you would rather not keep one in the history.
 
 One consequence worth knowing: while `main` is red, release-please does not run
 at all, so **the release PR stops updating too**. That is intended — the release
