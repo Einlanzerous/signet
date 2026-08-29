@@ -721,18 +721,23 @@ func runReveal(args []string) error {
 	} else {
 		details = fmt.Sprintf("revealed %s/%s version %d #%s to stdout", *project, *name, r.Version.VersionNo, r.Version.VHash)
 	}
-	if _, err := a.st.AppendAudit(store.AuditRecord{
+	revealed, err := a.st.AppendAudit(store.AuditRecord{
 		Actor: cliActor(), Action: "secret.reveal", SecretID: sec.ID,
 		Details:   details,
 		EventKind: store.KindSecretReveal, ActorRole: cliRole(),
 		Status: &store.AuditStatus{Outcome: store.OutcomeDelivered},
-	}); err != nil {
+	})
+	if err != nil {
 		return err
 	}
 
+	// Cited by sequence, as every other channel's input entries are: the direct
+	// entry above names the derivation, and without a back-reference an input's
+	// ledger reads the same after three reveals as after one.
 	if err := a.auditDerivedInputs(sec, store.AuditRecord{
-		Action:  "secret.reveal",
-		Details: fmt.Sprintf("value disclosed via reveal of %s/%s, which derives from it", *project, *name),
+		Action: "secret.reveal",
+		Details: fmt.Sprintf("value disclosed via reveal of %s/%s, which derives from it (reveal #%d)",
+			*project, *name, revealed.Seq),
 	}); err != nil {
 		return err
 	}

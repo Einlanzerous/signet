@@ -48,17 +48,26 @@ type PushResult struct {
 // compares against to decide whether a destination has drifted, so a silent
 // failure here leaves the target reading "in sync" against a version it no
 // longer holds, and nothing later corrects it.
-func recordPush(st *store.Store, res *PushResult, rec store.AuditRecord, state, lastErr string, prov *store.PushProvenance, pushedAt string) {
+// It returns the sequence of the entry it wrote, or 0 if the write failed. That
+// number is the only thing that distinguishes one delivery from the next: a
+// digest is a function of the VALUE, so two pushes of an unchanged blob produce
+// the same one, and an input's entry citing only a digest is byte-identical on
+// every deploy. Callers thread it into the derivation-input entries so those
+// answer "which push was this" the same way `render`'s do.
+func recordPush(st *store.Store, res *PushResult, rec store.AuditRecord, state, lastErr string, prov *store.PushProvenance, pushedAt string) int64 {
 	if err := st.UpdateTargetPush(res.TargetID, state, lastErr, prov, pushedAt); err != nil {
 		res.StateErr = err.Error()
 		log.Printf("target state write failed for %s: %v — the push happened but %s still reads as its previous state",
 			res.Repo, err, res.TargetID)
 	}
-	if _, err := st.AppendAudit(rec); err != nil {
+	entry, err := st.AppendAudit(rec)
+	if err != nil {
 		res.AuditErr = err.Error()
 		log.Printf("audit append failed for %s %s: %v — destination changed but the ledger has no entry",
 			rec.Action, res.Repo, err)
+		return 0
 	}
+	return entry.Seq
 }
 
 // PushSecret seals the secret's current version and pushes it to every
@@ -154,7 +163,7 @@ func PushSecret(ctx context.Context, st *store.Store, key []byte, gh *GHClient, 
 			if res.Note != "" {
 				detail += " (" + res.Note + ")"
 			}
-			recordPush(st, &res, store.AuditRecord{
+			seq := recordPush(st, &res, store.AuditRecord{
 				Actor: actor, Action: "sync.push", SecretID: sec.ID, TargetID: t.ID,
 				Details: detail, EventKind: kind, ActorRole: role, Status: status,
 			}, "in sync", "", &prov, nowRFC3339())
@@ -162,15 +171,15 @@ func PushSecret(ctx context.Context, st *store.Store, key []byte, gh *GHClient, 
 			// GitHub sends theirs — off-box, to a destination nothing can read
 			// back. Found while checking whether `sync` shared `render`'s gap
 			// (SGNT-34); it is the same one SGNT-18 closed for `reveal`.
-			// `provenance` for the same reason the direct entry above carries
-			// it: without it, every push of this derived secret writes an
-			// identical row on each input and an investigator cannot tell one
-			// delivery from the next. For a derived secret it is the resolved
-			// value's digest, which is the only currency it has.
+			//
+			// The entry above is cited by SEQUENCE, not by digest. A digest is
+			// a function of the value, so an unrotated secret pushed on every
+			// deploy would write byte-identical rows on its inputs for ever —
+			// which is the state this citation exists to prevent.
 			auditPushedInputs(st, &res, sec, store.AuditRecord{
 				Actor: actor, Action: "sync.push", TargetID: t.ID,
-				Details: fmt.Sprintf("value delivered to %s via push of %s/%s, which derives from it · %s",
-					cfg.Destination(), sec.Project, sec.Name, provenance),
+				Details: fmt.Sprintf("value delivered to %s via push of %s/%s, which derives from it (push #%d)",
+					cfg.Destination(), sec.Project, sec.Name, seq),
 				EventKind: kind, ActorRole: role, Status: status,
 			})
 		}

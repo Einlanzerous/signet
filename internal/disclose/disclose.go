@@ -26,6 +26,13 @@
 // Each was an unaudited read channel in a vault whose premise is that plaintext
 // leaves only in audited ways.
 //
+// All six cite their own direct entry by ledger SEQUENCE — `(reveal #N)`,
+// `(exec #N)`, `(render #N)`, `(push #N)`, `(read #N)`. A digest or a
+// provenance was tried first and is not a join key: both are functions of the
+// VALUE, so a secret pushed on every deploy with nothing rotating between them
+// wrote byte-identical rows against its inputs for ever. The sequence is the
+// only thing that names a delivery rather than a value.
+//
 // The count is load-bearing and has now been wrong here twice — "four" while
 // ops.ResolveGHToken was a fifth, then "five" while PushSecret was a sixth, in
 // the package whose stated purpose is that a new channel inherits the rule. So

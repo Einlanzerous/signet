@@ -65,15 +65,21 @@ func auditPushedInputs(st *store.Store, res *PushResult, sec *store.Secret, rec 
 // One entry per key, as `render` and `exec` do, and for the same reason: the
 // query these serve filters on secret_id, so an entry naming only the project
 // answers it empty for every secret in that project. Each is kept short and
-// cites the blob's digest, which is what ties it back to the target entry that
-// holds the full account — the key count, the scope, and any keys the push
+// cites the push's own ledger sequence, which ties it to the target entry
+// holding the full account — the key count, the scope, and any keys the push
 // added.
+//
+// The sequence rather than the digest, which these used to carry: a digest is a
+// function of the VALUE, so a target pushed on every deploy with nothing
+// rotating between them produced byte-identical rows against every key, which
+// is the state the citation exists to prevent. The digest stays on the direct
+// entry, where the question it answers — did the blob change — is the right one.
 //
 // Failures here do not fail the push. It has already happened, the blob is at
 // the destination, and a caller that treated an incomplete ledger as a failed
 // delivery would report the opposite of the truth.
 func auditRenderedKeys(st *store.Store, res *PushResult, t *store.Target, cfg store.GHRenderConfig,
-	kind store.EventKind, actor string, role store.ActorRole, digest string) {
+	kind store.EventKind, actor string, role store.ActorRole, digest string, seq int64) {
 
 	for _, k := range cfg.Keys {
 		sec, err := st.GetSecret(t.Project, k)
@@ -97,19 +103,17 @@ func auditRenderedKeys(st *store.Store, res *PushResult, t *store.Target, cfg st
 			EventKind: kind, ActorRole: role,
 			Status: &store.AuditStatus{Outcome: store.OutcomeDelivered},
 		}
-		if _, err := st.AppendAudit(rec); err != nil {
+		keyed, err := st.AppendAudit(rec)
+		if err != nil {
 			noteAuditErr(res, err, "sync.push (key "+k+")")
 			continue
 		}
-		// The digest travels with it. Without it every push of this blob writes
-		// an input entry identical to the last, so `audit --secret <input>`
-		// returns N rows that cannot be told apart — while the direct entry
-		// three lines up cites the digest for exactly this reason. Round 1 of
-		// the review on #43 found this asymmetry on the CLI render path; it was
-		// fixed there and left here, which is the fix-at-the-instance shape
-		// REVIEW.md names first.
-		rec.Details = fmt.Sprintf("value delivered to %s in the %s render of %s/%s, which derives from it · #%s",
-			cfg.Destination(), t.Project, sec.Project, sec.Name, digest)
+		// This key's own entry is what an input's entry points back to, by
+		// sequence — so an investigator who arrives at the input can reach the
+		// key that carried it, and from there the push. See the note above on
+		// why this is not the digest.
+		rec.Details = fmt.Sprintf("value delivered to %s in the %s render of %s/%s, which derives from it (push #%d)",
+			cfg.Destination(), t.Project, sec.Project, sec.Name, keyed.Seq)
 		auditPushedInputs(st, res, sec, rec)
 	}
 }

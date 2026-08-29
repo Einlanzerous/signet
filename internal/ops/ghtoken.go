@@ -160,7 +160,8 @@ func ResolveGHTokenFor(st *store.Store, key []byte, envToken, actor string, role
 		EventKind: store.KindSecretReveal, ActorRole: role,
 		Status: &store.AuditStatus{Outcome: store.OutcomeDelivered},
 	}
-	if _, err := st.AppendAudit(rec); err != nil {
+	entry, err := st.AppendAudit(rec)
+	if err != nil {
 		return GHToken{}, fmt.Errorf("%s read but not recorded: %w", ref, err)
 	}
 	// The fifth disclosure channel, found by the review on #43 (SGNT-34).
@@ -176,13 +177,13 @@ func ResolveGHTokenFor(st *store.Store, key []byte, envToken, actor string, role
 	// internal/disclose for why it is not restated here.
 	if err := disclose.Inputs(st, sec, store.AuditRecord{
 		Actor: actor, Action: ActionSecretRead,
-		// provenanceOf, as the direct entry above carries: `sync` reads the PAT
-		// on every run, so without it an input's ledger is a wall of identical
-		// rows and no delivery can be told from the next. Found by
-		// self-checking the round-2 finding on #43 across all six input-entry
-		// sites rather than only the two it named.
-		Details: fmt.Sprintf("value read to %s via %s %s, which derives from it (%s)",
-			purpose, ref, provenanceOf(r), GHTokenEnvNone),
+		// The direct entry above is cited by SEQUENCE, not by its provenance.
+		// `sync` reads the PAT on every run and provenanceOf is a function of
+		// the value, so an unrotated PAT produced byte-identical rows on its
+		// inputs for ever — a wall of rows that named the credential and not
+		// which read they belonged to.
+		Details: fmt.Sprintf("value read to %s via %s, which derives from it (read #%d)",
+			purpose, ref, entry.Seq),
 		EventKind: store.KindSecretReveal, ActorRole: role,
 		Status: &store.AuditStatus{Outcome: store.OutcomeDelivered},
 	}); err != nil {

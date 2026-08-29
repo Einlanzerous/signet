@@ -466,10 +466,11 @@ func TestResolveGHTokenAuditsTheInputsOfADerivedPAT(t *testing.T) {
 			continue
 		}
 		// `sync` reads the PAT on every run, so an input entry with nothing to
-		// distinguish it from the last leaves a wall of identical rows. The
-		// direct entry cites its provenance; so does this one.
-		if !strings.Contains(e.Details, "#") {
-			t.Errorf("the input's entry cites no provenance, so two reads are indistinguishable: %q", e.Details)
+		// distinguish it from the last leaves a wall of identical rows. A
+		// provenance would not fix that — it is a function of the value — so
+		// this cites the direct entry by ledger sequence.
+		if !strings.Contains(e.Details, "(read #") {
+			t.Errorf("the input's entry does not cite the read it belonged to: %q", e.Details)
 		}
 		return
 	}

@@ -49,7 +49,7 @@ func TestPushRenderIsAuditedPerSecret(t *testing.T) {
 			t.Errorf("%s's entry does not name the destination: %q", name, entries[0].Details)
 		}
 		if !strings.Contains(entries[0].Details, "#") {
-			t.Errorf("%s's entry cites no digest, so two pushes are indistinguishable: %q", name, entries[0].Details)
+			t.Errorf("%s's entry cites no digest: %q", name, entries[0].Details)
 		}
 	}
 
@@ -111,11 +111,12 @@ func TestPushAuditsTheInputsOfADerivedSecret(t *testing.T) {
 		if !strings.Contains(e.Details, "derives from it") {
 			continue
 		}
-		// An input's entry has to distinguish one delivery from the next, or a
-		// secret pushed on every deploy returns N identical rows. The direct
-		// entry cites its provenance; so does this one.
-		if !strings.Contains(e.Details, "#") {
-			t.Errorf("an input's entry cites no provenance, so two pushes are indistinguishable: %q", e.Details)
+		// A back-reference to the direct entry by SEQUENCE. Not a digest or a
+		// provenance: both are functions of the value, so a secret pushed on
+		// every deploy with nothing rotating between them writes rows that are
+		// byte-identical and name no particular delivery.
+		if !strings.Contains(e.Details, "(push #") {
+			t.Errorf("an input's entry does not cite the push it belonged to: %q", e.Details)
 		}
 		return
 	}
@@ -212,8 +213,8 @@ func TestPushRenderAuditsDerivedInputsWithTheDigest(t *testing.T) {
 		if !strings.Contains(e.Details, "derives from it") {
 			continue
 		}
-		if !strings.Contains(e.Details, "#") {
-			t.Errorf("the input's entry cites no digest, so two pushes are indistinguishable: %q", e.Details)
+		if !strings.Contains(e.Details, "(push #") {
+			t.Errorf("the input's entry does not cite the push it belonged to: %q", e.Details)
 		}
 		return
 	}
