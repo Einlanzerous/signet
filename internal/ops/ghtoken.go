@@ -176,8 +176,13 @@ func ResolveGHTokenFor(st *store.Store, key []byte, envToken, actor string, role
 	// internal/disclose for why it is not restated here.
 	if err := disclose.Inputs(st, sec, store.AuditRecord{
 		Actor: actor, Action: ActionSecretRead,
-		Details: fmt.Sprintf("value read to %s via %s, which derives from it (%s)",
-			purpose, ref, GHTokenEnvNone),
+		// provenanceOf, as the direct entry above carries: `sync` reads the PAT
+		// on every run, so without it an input's ledger is a wall of identical
+		// rows and no delivery can be told from the next. Found by
+		// self-checking the round-2 finding on #43 across all six input-entry
+		// sites rather than only the two it named.
+		Details: fmt.Sprintf("value read to %s via %s %s, which derives from it (%s)",
+			purpose, ref, provenanceOf(r), GHTokenEnvNone),
 		EventKind: store.KindSecretReveal, ActorRole: role,
 		Status: &store.AuditStatus{Outcome: store.OutcomeDelivered},
 	}); err != nil {

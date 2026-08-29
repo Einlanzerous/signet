@@ -462,9 +462,16 @@ func TestResolveGHTokenAuditsTheInputsOfADerivedPAT(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, e := range entries {
-		if e.Action == ActionSecretRead && strings.Contains(e.Details, "derives from it") {
-			return
+		if e.Action != ActionSecretRead || !strings.Contains(e.Details, "derives from it") {
+			continue
 		}
+		// `sync` reads the PAT on every run, so an input entry with nothing to
+		// distinguish it from the last leaves a wall of identical rows. The
+		// direct entry cites its provenance; so does this one.
+		if !strings.Contains(e.Details, "#") {
+			t.Errorf("the input's entry cites no provenance, so two reads are indistinguishable: %q", e.Details)
+		}
+		return
 	}
 	t.Fatal("reading a derived PAT left no trace on the input whose value it carries")
 }
