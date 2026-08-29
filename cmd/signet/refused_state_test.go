@@ -195,3 +195,91 @@ func TestARefusalAndAFailureAreWordedDifferently(t *testing.T) {
 		t.Error("a target carrying a reason was not marked")
 	}
 }
+
+// The other direction of the same bug, and the one the mark itself could
+// introduce (found by the review on #44).
+//
+// LastError is a historical record — nothing clears it short of a later
+// successful push — so a target keeps its reason after the reason stops being
+// true. An operator who does exactly what the refusal told them to, and then
+// checks whether it took, must not be shown the refusal they just fixed.
+func TestAResolvedRefusalStopsBeingReported(t *testing.T) {
+	st := newCLIVault(t)
+	path := seedProject(t, st, "demo", map[string]string{"ALPHA": "a", "BETA": "b"})
+	captureStdout(t, func() {
+		if err := runTargetAdd([]string{
+			"--project", "demo", "--render-as-secret",
+			"--gh-repo", "o/r", "--gh-environment", "home-server",
+			"--gh-secret", "PROD_ENV_FILE", "--no-preflight",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	// A MissingKeysError refusal: never pushed, so `refuse` records the reason
+	// and leaves last_pushed_at empty.
+	targets, err := st.RenderTargetsForProject("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateTargetPush(targets[0].ID, store.TargetRefused,
+		"1 key(s) the target manages have no value in project demo: BETA — set them, or drop them from the target",
+		nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	_ = path
+
+	// The operator sets BETA — which the seed already did — so the render now
+	// resolves and the state is `never`, not `drift`. The refusal is over.
+	for _, tc := range []struct {
+		name string
+		run  func() error
+	}{
+		{"target list", func() error { return runTargetList([]string{"--project", "demo"}) }},
+		{"status", func() error { return runStatus(nil) }},
+		{"render --check", func() error { return runRender([]string{"--project", "demo", "--check"}) }},
+	} {
+		out := captureStdout(t, func() {
+			if err := tc.run(); err != nil {
+				t.Fatal(err)
+			}
+		})
+		if strings.Contains(out, "never*") {
+			t.Errorf("%s marked a state whose refusal is resolved:\n%s", tc.name, out)
+		}
+		if strings.Contains(out, "push declined") {
+			t.Errorf("%s quoted a refusal the operator had already fixed:\n%s", tc.name, out)
+		}
+	}
+}
+
+// And the predicate itself, at both boundaries: `error` always hides its
+// reason, `drift` only when a refusal is what put it there, and nothing else
+// ever does.
+func TestOnlyErrorAndARefusedDriftHideTheirReason(t *testing.T) {
+	refused := &store.Target{LastState: store.TargetRefused, LastError: "boom"}
+	errored := &store.Target{LastState: "error", LastError: "boom"}
+	clean := &store.Target{LastState: "in sync"}
+
+	for _, tc := range []struct {
+		target *store.Target
+		state  string
+		want   bool
+	}{
+		{errored, "error", true},
+		{refused, "drift", true},
+		// The states a resolved refusal lands in. These are the regression.
+		{refused, "never", false},
+		{refused, "in sync", false},
+		{refused, "unknown", false},
+		// These say their own reason, so a marker would add nothing.
+		{refused, "empty", false},
+		{refused, "incomplete", false},
+		// A target that drifted for ordinary reasons after its refusal cleared.
+		{clean, "drift", false},
+	} {
+		if got := stateHidesItsReason(tc.target, tc.state); got != tc.want {
+			t.Errorf("stateHidesItsReason(last_state=%q, state=%q) = %v, want %v",
+				tc.target.LastState, tc.state, got, tc.want)
+		}
+	}
+}

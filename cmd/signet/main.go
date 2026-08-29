@@ -1576,7 +1576,7 @@ func renderedTargetNote(t *store.Target, state string) renderNote {
 		// the decision that caused it, which is both the explanation and the
 		// fix — the shrink guard's refusal names `--allow-shrink` in its own
 		// text (SGNT-35).
-		if t.LastError != "" {
+		if stateHidesItsReason(t, state) {
 			return renderNote{text: fmt.Sprintf("now stale — %s", stateReason(t)), wantsSync: true}
 		}
 		return renderNote{text: "now stale", wantsSync: true}
@@ -1759,7 +1759,7 @@ func printRenderCheck(t *store.Target, project string, want map[string]string, p
 		// rather than into a footnote. `drift` on a refused target is the case
 		// this exists for: true about currency, silent about the decision that
 		// caused it.
-		if t.LastError != "" {
+		if stateHidesItsReason(t, state) {
 			fmt.Printf("    %s\n", stateReason(t))
 		}
 	}
@@ -2575,7 +2575,7 @@ func runTargetList(args []string) error {
 		}
 		rows++
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", owner, kind, dest, markState(t, state), dashIfEmpty(synced))
-		notes.add(t, dest)
+		notes.add(t, dest, state)
 	}
 
 	for _, t := range targets {
@@ -2701,6 +2701,44 @@ func anyUnresolved(d syncpkg.FileDrift, problems map[string]error) bool {
 // and REVIEW.md's first defect class is what happens when a rule like that is
 // applied at one call site.
 
+// stateHidesItsReason reports whether the state word withholds a reason the
+// target is still carrying — the one predicate the mark and the note both key
+// off, so they cannot disagree about when to fire.
+//
+// It turns on the STATE, not on LastError. That field is a historical record:
+// `UpdateTargetPush`'s prov == nil branch writes it and nothing clears it short
+// of a later successful push, so a target keeps its reason after the reason
+// stops being true. Marking on the field alone meant an operator who did what
+// the refusal told them to — set the missing key, re-add the dropped one — saw
+// `never*` or `in sync*` still quoting the refusal they had just fixed, at the
+// exact moment they were checking whether the fix took. Found by the review on
+// #44, and it is the failure this whole change is supposed to avoid rather than
+// commit.
+//
+// Only two states hide a reason:
+//
+//	error   GHState returns it only when LastError is non-empty, so the reason
+//	        is guaranteed present and the word never says what it was.
+//	drift   the refusal case. GHState routes a declined push here deliberately,
+//	        so the word is true about currency and silent about the decision.
+//	        Guarded on LastState so a target that has drifted for ordinary
+//	        reasons since its refusal was resolved is not still quoting it.
+//
+// Every other state either says its own reason (`empty`, `incomplete`) or means
+// the refusal is over (`never`, `in sync`, `unknown`).
+func stateHidesItsReason(t *store.Target, state string) bool {
+	if t.LastError == "" {
+		return false
+	}
+	switch state {
+	case "error":
+		return true
+	case "drift":
+		return t.LastState == store.TargetRefused
+	}
+	return false
+}
+
 // markState appends a marker to a state whose reason the word does not carry.
 //
 // A bare `*` rather than a word, because the states appear in two tabwriter
@@ -2708,7 +2746,7 @@ func anyUnresolved(d syncpkg.FileDrift, problems map[string]error) bool {
 // values. It means "there is a reason, and it is printed below" — see
 // stateNotes.
 func markState(t *store.Target, state string) string {
-	if t.LastError == "" {
+	if !stateHidesItsReason(t, state) {
 		return state
 	}
 	return state + "*"
@@ -2726,10 +2764,13 @@ type stateNotes struct {
 	lines []string
 }
 
-// add records the reason for one target, if it has one. dest is how the view
-// named the destination, so the note points at a row the reader can find.
-func (n *stateNotes) add(t *store.Target, dest string) {
-	if t.LastError == "" {
+// add records the reason for one target, if the state it was shown under
+// withholds one. dest is how the view named the destination, so the note points
+// at a row the reader can find; state is required rather than inferred, because
+// a note without a marked row to explain is the same false alarm as a marked
+// row without a note.
+func (n *stateNotes) add(t *store.Target, dest, state string) {
+	if !stateHidesItsReason(t, state) {
 		return
 	}
 	if n.seen == nil {
@@ -3446,7 +3487,7 @@ func runStatus(args []string) error {
 			}
 			dest := cfg.Repo + dotted(cfg.Environment) + "→" + cfg.SecretName
 			tgt = append(tgt, fmt.Sprintf("gh:%s [%s]", dest, markState(&t, ghState)))
-			notes.add(&t, dest)
+			notes.add(&t, dest, ghState)
 		}
 		// A rendered target is delivered whole, so it annotates every secret it
 		// carries with the same state — the blob is current or it is not, and no
@@ -3457,7 +3498,7 @@ func runStatus(args []string) error {
 			}
 			dest := ri.cfg.Repo + dotted(ri.cfg.Environment) + "→" + ri.cfg.SecretName
 			tgt = append(tgt, fmt.Sprintf("gh-render:%s [%s]", dest, markState(ri.target, ri.state)))
-			notes.add(ri.target, dest)
+			notes.add(ri.target, dest, ri.state)
 		}
 		for _, fi := range fileByProject[sec.Project] {
 			if !fi.cfg.Manages(sec.Name) {

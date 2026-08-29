@@ -445,6 +445,14 @@ word one fact four ways. A **refusal** reads as `push declined` and a **failure*
 as `last push failed`, because the two are different facts: after a refusal the
 deployed environment is intact and stale, and after a failure that is not known.
 
+**Only two states are marked** — `error`, and `drift` on a target whose last
+push was refused. The recorded reason outlives the refusal (nothing clears it
+short of a later successful push), so marking on its presence alone would show
+an operator who *fixed* a refusal a `never*` or `in sync*` still quoting the
+refusal they just fixed, at the moment they were checking whether the fix took.
+Every other state either says its own reason (`empty`, `incomplete`) or means
+the refusal is over.
+
 **The table keeps its five columns.** A reason is free text of unbounded length
 — the shrink guard's runs to three lines — and a column for it would make every
 row as wide as the worst refusal, in the two views whose job is scanning many
