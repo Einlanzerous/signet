@@ -9,6 +9,13 @@ citations are the commits that established or restored it — they are the
 evidence that the rule is load-bearing rather than a preference, and they are
 worth reading when a change looks like it needs an exception.
 
+They cite the **squash commit on `main`**, with its PR number, and not the
+branch commit whose subject the text quotes. PRs here are squash-merged, so a
+branch commit is reachable only from a merged branch that may be deleted at any
+time — `git show` on one fails from a fresh checkout, which is the opposite of
+durable evidence. One squash commit therefore sometimes stands for two branch
+commits, and the text says which.
+
 ## What signet is
 
 A single-host credential vault and sync daemon. Secrets live encrypted in
@@ -34,6 +41,7 @@ internal/redact/ output redaction for exec --redact
 internal/ops/    GitHub token handling, rotation, import
 internal/config/ env-var configuration
 internal/version/ build identity, stamped at link time
+internal/logtest/ test-only: capture what a command logged
 ```
 
 ## The invariants
@@ -54,8 +62,10 @@ while the API kept its own copy.
 > layer owns that invariant and whether every path through it is covered.
 > `grep` for the other callers. "The caller must remember" is not a design.
 
-Cited: `985b2b2` (put the provenance and mint guards at the layer that owns
-them), `5f8db42` (route every reader through resolve), `6ccc798`.
+Cited: `16a9a59` (#25) — which carries both `put the provenance and mint guards
+at the layer that owns them` and `close the rotation and provenance gaps review
+found`; `70afeae` (#23) — `route every reader through resolve, and make derived
+drift visible`.
 
 ### 2. Reads of a secret's value go through `internal/resolve`
 
@@ -71,8 +81,8 @@ legitimate exception in the tree — `clearDerivation`, which asks what is
 `resolve.ErrNoVersion` is a sentinel because callers divide on it: `render` and
 `status` skip such a secret, `reveal` and push must fail.
 
-Cited: `5f8db42`, `a89d89a` (keep the mirror from calling an unresolvable
-secret in sync).
+Cited: `70afeae` (#23), which carries both `route every reader through resolve`
+and `keep the mirror from calling an unresolvable secret in sync`.
 
 ### 3. A mutation and its ledger entry are one transaction
 
@@ -179,8 +189,10 @@ ledger indistinguishable from a real deploy.
 
 The two injectors are `.github/workflows/release.yml` and the `Makefile`. They
 must agree, and the `Makefile` needs `sed 's/^v//'` because `git describe`
-returns the tag as written. (See `ff801a9` for how a shell fallback outside a
-subshell silently stopped running.)
+returns the tag as written. (See `df2b21d` (#39) for how a `|| echo dev`
+fallback outside a subshell silently stopped running: `||` binds to the
+pipeline, whose exit status is `sed`'s, so it never fired and VERSION was
+empty.)
 
 ### 10. Doc comments are load-bearing, so a false one is expensive
 
