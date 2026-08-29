@@ -206,14 +206,97 @@ jobs:
             echo "The tag and the GitHub Release exist and are empty. This is the one"
             echo "case that needs a decision rather than a retry:"
             echo
-            echo "- **A flake** — re-run this workflow. The suite runs against the tag"
-            echo "  again and the binary attaches to the existing release."
+            echo "- **A flake** — use **Re-run failed jobs** on THIS run. Not \"Re-run all"
+            echo "  jobs\": that re-runs release-please, which will not release the same PR"
+            echo "  twice (it is already \`autorelease: tagged\`), so \`release_created\`"
+            echo "  comes back empty, every job below it skips, and the run goes green"
+            echo "  having attached nothing. Re-running only the failed jobs preserves"
+            echo "  release-please's outputs, so \`verify-tag\` and \`build\` see a real tag."
             echo "- **A real failure** — the tagged commit should not ship. Fix forward"
             echo "  and cut a new release; delete this tag and its release if you do not"
             echo "  want an empty one in the history. Pushing a fix alone does NOT move"
             echo "  this tag."
+            echo
+            echo "Until one of those happens, the \`orphan-release\` job fails on every"
+            echo "later run of this workflow, so the empty release cannot go quiet."
           } >> "$GITHUB_STEP_SUMMARY"
           echo "::error title=Binary withheld::the suite failed against ${TAG} — tag exists, no binary, no deploy dispatch. See the run summary."
+          exit 1
+
+  # ── The orphan check (SGNT-27, round 3) ──────────────────────────────────
+  #
+  # `tag-unverified` refuses loudly, but only in the run that created the tag.
+  # The state it leaves behind — a published Release with no binary — is
+  # invisible afterwards, and the recovery this workflow used to document made
+  # that worse: "re-run the workflow" means Re-run ALL jobs, which re-runs
+  # release-please, which will not release the same PR twice.
+  #
+  # release-please only considers merged PRs still carrying `autorelease:
+  # pending`, and swaps that for `autorelease: tagged` the moment it creates the
+  # release — which already happened. So `release_created` and `tag_name` are
+  # never set on the retry, `verify-tag` and `build` skip on an empty `if:`,
+  # `tag-unverified` sees `skipped` rather than `failure`, and the run the docs
+  # sent the operator to goes GREEN having done nothing. A path that returns
+  # success because nothing explicitly failed, on the recovery path for the
+  # state this workflow added.
+  #
+  # This closes it from the other side: while the version in the manifest has a
+  # published Release with no assets, every subsequent run of this workflow
+  # fails. It cannot cry wolf — it is skipped entirely on the run that cuts a
+  # release, and a healthy release has its binary — and it keeps failing until
+  # someone attaches the binary or removes the Release, rather than reporting
+  # once and going quiet.
+  orphan-release:
+    needs: [ci, release-please]
+    if: ${{ always() && needs.release-please.result == 'success' && !needs.release-please.outputs.release_created }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Refuse while a published release has no binary
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="$(jq -r '.["."]' .release-please-manifest.json)"
+          if [ -z "${version}" ] || [ "${version}" = "null" ]; then
+            echo "::error title=Unreadable manifest::.release-please-manifest.json has no "." version"
+            exit 1
+          fi
+          tag="v${version}"
+          # A missing release is the ordinary case before the first one, and on
+          # any repo state where the tag was deliberately removed. Not an error.
+          if ! assets="$(gh release view "${tag}" --json assets --jq '.assets | length' 2>/dev/null)"; then
+            echo "no published release for ${tag} — nothing to check"
+            exit 0
+          fi
+          if [ "${assets}" -gt 0 ]; then
+            echo "${tag} has ${assets} asset(s)"
+            exit 0
+          fi
+          {
+            echo "## \`${tag}\` is published with no binary"
+            echo
+            echo "A previous run tagged this version and withheld its artifact — see that"
+            echo "run's \`tag-unverified\` job. Nothing has attached one since, so"
+            echo "construct-server has never been offered this release and anyone"
+            echo "installing by tag gets a release with nothing in it."
+            echo
+            echo "This job will keep failing until that is resolved. It is reporting an"
+            echo "existing condition, not a fault in this run's commit."
+            echo
+            echo "### Resolving"
+            echo
+            echo "- **The tagged commit is good** (the earlier failure was a flake) — go to"
+            echo "  the run that cut \`${tag}\` and use **Re-run failed jobs**, not Re-run all"
+            echo "  jobs. That preserves release-please's outputs so \`verify-tag\` and"
+            echo "  \`build\` see a real tag; a full re-run releases nothing, because the"
+            echo "  release PR is already \`autorelease: tagged\`."
+            echo "- **The tagged commit is bad** — delete \`${tag}\` and its Release, and cut"
+            echo "  a new version. That commit should not ship."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error title=Release with no binary::${tag} is published with no assets — see the run summary."
           exit 1
 
   # When release-please cuts a release, build the static binary and attach it to

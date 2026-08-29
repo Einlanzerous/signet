@@ -724,17 +724,37 @@ the states differ and so does the recovery:
 A release that simply never appears is its own kind of invisible, which is why
 both are announced rather than implied by an absent tag.
 
-**Recovering from `blocked` needs nothing manual.** Push the fix to `main`; that
-push runs the workflow again and release-please picks up every commit since the
-last release. The release is delayed, not lost.
+**Recovering from `blocked` usually needs nothing manual.** Push the fix to
+`main`; that push runs the workflow again and release-please picks up every
+commit since the last release. The release is delayed, not lost.
+
+The exception is when the blocked commit was itself a **release-PR merge**.
+Pushing a fix does not move the release: release-please tags that merge commit,
+so the next green run cuts at the still-red commit and lands you in
+`tag-unverified` below. Re-running the blocked run is the cleaner recovery
+there.
 
 **Recovering from `tag-unverified` needs a decision**, and it is the one case
 where "push the fix" is not the answer. The tag already exists and pushing a fix
 does not move it — release-please releases the merged release PR at its own
-merge commit. So: if the failure was a flake, **re-run the workflow** and the
-binary attaches to the existing release. If it was real, that commit should not
-ship — fix forward and cut a new release, deleting the empty tag and release if
-you would rather not keep one in the history.
+merge commit.
+
+- **A flake** — use **Re-run failed jobs** on that run. Not *Re-run all jobs*:
+  that re-runs release-please, which will not release the same PR twice (it
+  already carries `autorelease: tagged`), so `release_created` comes back empty,
+  every job below it skips, and **the run goes green having attached nothing**.
+  Re-running only the failed jobs preserves release-please's outputs, so
+  `verify-tag` and `build` see a real tag.
+- **A real failure** — that commit should not ship. Fix forward and cut a new
+  version, deleting the empty tag and Release if you would rather not keep one
+  in the history.
+
+**An empty release cannot go quiet.** While the version in
+`.release-please-manifest.json` has a published Release with no assets, the
+`orphan-release` job fails on every later run of this workflow. It is skipped on
+the run that cuts a release and passes when the binary is attached, so it only
+speaks when there is something to say — and it keeps saying it until someone
+acts, rather than reporting once in a run nobody revisits.
 
 One consequence worth knowing: while `main` is red, release-please does not run
 at all, so **the release PR stops updating too**. That is intended — the release
