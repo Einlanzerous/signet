@@ -462,6 +462,13 @@ date, which is why it reads "the last push attempt was declined: …" rather tha
 imperative. Recomputing currency would mean re-deriving every refusal kind in
 the view, and the transport failures behind `error` cannot be re-derived at all.
 
+`unresolved` is not a state signet derives — it is a word `target list` and
+`status` substitute when a secret's value cannot be resolved at all. It still
+carries the mark and the note, because the underlying state is what decides
+them: a target whose last push failed, on a secret that has *also* stopped
+resolving, would otherwise print a bare word and put the push failure back
+where only `signet audit` could reach it.
+
 `empty` and `incomplete` are unmarked because they are conditions rather than
 history. Note that only `render --check` currently spells them out; `target
 list` and `status` print the bare word, which is this section's own complaint

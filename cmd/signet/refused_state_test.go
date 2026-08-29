@@ -188,11 +188,21 @@ func TestARefusalAndAFailureAreWordedDifferently(t *testing.T) {
 	if got := stateReason(failed); !strings.HasPrefix(got, "the last push failed") {
 		t.Errorf("a failure reads as %q", got)
 	}
-	if markState(&store.Target{}, "drift") != "drift" {
+	if markState(&store.Target{}, answered("drift")) != "drift" {
 		t.Error("a target with no reason was marked anyway")
 	}
-	if markState(refused, "drift") != "drift*" {
+	if markState(refused, answered("drift")) != "drift*" {
 		t.Error("a target carrying a reason was not marked")
+	}
+	// A call site's substituted word is printed, and the layer's answer still
+	// decides the mark — the `unresolved` case. Overwriting the state threw the
+	// answer away, so an errored target on an unresolvable secret printed a
+	// bare word and collected no note.
+	if got := markState(refused, answered("drift").substituting("unresolved")); got != "unresolved*" {
+		t.Errorf("a substituted state lost the layer's answer: %q", got)
+	}
+	if got := markState(&store.Target{}, answered("in sync").substituting("unresolved")); got != "unresolved" {
+		t.Errorf("a substituted state on a target with no reason was marked: %q", got)
 	}
 }
 
@@ -270,6 +280,12 @@ func TestOnlyErrorAndARefusedDriftHideTheirReason(t *testing.T) {
 		// The states a resolved refusal lands in. These are the regression.
 		{refused, "never", false},
 		{refused, "in sync", false},
+		// `unknown` is currently UNREACHABLE from GHState — its two tests are
+		// in the wrong order, so the branch is dead (SGNT-43). Pinned anyway,
+		// and flagged: when that is fixed, a target refused after a
+		// pre-fingerprint push lands here with a live refusal and this
+		// expectation becomes wrong. It is a decision to revisit with that
+		// fix, not a property to rely on.
 		{refused, "unknown", false},
 		// Conditions rather than history, so a stale reason would mislead.
 		{refused, "empty", false},

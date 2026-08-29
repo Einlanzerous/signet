@@ -1754,7 +1754,7 @@ func printRenderCheck(t *store.Target, project string, want map[string]string, p
 		// disagree. The branches above have already excluded the two states it
 		// reports that this one words for itself.
 		state := renderState(t, cfg, want, key)
-		fmt.Printf("  state: %s\n", markState(t, state))
+		fmt.Printf("  state: %s\n", markState(t, answered(state)))
 		// Not a table, so the reason goes directly under the state it explains
 		// rather than into a footnote. `drift` on a refused target is the case
 		// this exists for: true about currency, silent about the decision that
@@ -2569,7 +2569,7 @@ func runTargetList(args []string) error {
 	// view whose job is scanning many targets at once. It gets a marker here
 	// and a line below instead.
 	var notes stateNotes
-	emit := func(t *store.Target, owner, kind, dest, state, synced string) {
+	emit := func(t *store.Target, owner, kind, dest string, state shownState, synced string) {
 		if rows == 0 {
 			fmt.Fprintln(w, "SECRET\tKIND\tDESTINATION\tSTATE\tLAST SYNCED")
 		}
@@ -2598,9 +2598,9 @@ func runTargetList(args []string) error {
 			// Needs the secret's current value fingerprint: "in sync" from the
 			// last push is not the same as "still current".
 			cur, digest, derr := a.ghDrift(sec)
-			state := t.GHState(cur, digest)
+			state := answered(t.GHState(cur, digest))
 			if derr != nil {
-				state = "unresolved"
+				state = state.substituting("unresolved")
 			}
 			emit(&t, sec.Project+"/"+sec.Name, t.Kind, cfg.Destination(), state, t.LastPushedAt)
 
@@ -2625,7 +2625,7 @@ func runTargetList(args []string) error {
 			if wantSecret != nil {
 				owner = t.Project + "/" + wantSecret.Name
 			}
-			emit(&t, owner, t.Kind, cfg.Destination(), renderState(&t, cfg, want, a.key), t.LastPushedAt)
+			emit(&t, owner, t.Kind, cfg.Destination(), answered(renderState(&t, cfg, want, a.key)), t.LastPushedAt)
 
 		case "file":
 			// File targets belong to a project rather than one secret, so a
@@ -2653,7 +2653,7 @@ func runTargetList(args []string) error {
 				key = wantSecret.Name
 				owner = t.Project + "/" + wantSecret.Name
 			}
-			emit(&t, owner, t.Kind, cfg.Path, fileState(drift, key), t.LastPushedAt)
+			emit(&t, owner, t.Kind, cfg.Path, answered(fileState(drift, key)), t.LastPushedAt)
 		}
 	}
 	if err := w.Flush(); err != nil {
@@ -2745,12 +2745,28 @@ func anyUnresolved(d syncpkg.FileDrift, problems map[string]error) bool {
 // now. Recomputing currency would mean re-deriving each refusal kind here, and
 // the transport failures behind `error` cannot be re-derived at all.
 //
-// The states below are excluded because in them the refusal is genuinely over:
-// `never` and `in sync` and `unknown` all mean the vault and the destination
-// agree or have never disagreed. `empty` and `incomplete` are excluded because
-// they are conditions, not history — though only `render --check` currently
-// spells them out, and `target list` and `status` print them bare, which is
-// this ticket's own complaint one state over and is not fixed here.
+// The other states are excluded for two different reasons, and conflating them
+// is how the last version of this comment got `unknown` backwards.
+//
+//	never, in sync    the refusal is genuinely over — the vault and the
+//	                  destination agree, or have never disagreed.
+//	unknown           NOT that. `targets.go` introduces it as "delivered once,
+//	                  before signet recorded fingerprints — currency unknown
+//	                  until the next push", and renderedTargetNote's branch for
+//	                  it returns wantsSync. It is excluded because currency is
+//	                  UNRECORDED, not because anything is settled. It is also
+//	                  currently unreachable (see SGNT-43) — the moment it is
+//	                  not, a target refused after a pre-fingerprint push would
+//	                  land here carrying a LIVE refusal, and this exclusion
+//	                  would be wrong. Revisit it with that fix, not after.
+//	empty, incomplete conditions rather than history, so a stale reason would
+//	                  mislead. Only `render --check` spells them out; `target
+//	                  list` and `status` print the bare word, which is this
+//	                  ticket's own complaint one state over and is not fixed
+//	                  here.
+//
+// `unresolved` is not in this list because it is not a state GHState produces —
+// see shownState, which keeps the layer's answer under the substitution.
 func stateHidesItsReason(t *store.Target, state string) bool {
 	if t.LastError == "" {
 		return false
@@ -2764,17 +2780,46 @@ func stateHidesItsReason(t *store.Target, state string) bool {
 	return false
 }
 
+// shownState pairs the word a view prints with the state GHState actually
+// answered.
+//
+// They are the same everywhere but one place: `target list` and `status`
+// substitute `unresolved` when a secret's value cannot be resolved, which is a
+// call-site word for a condition GHState was never asked about. Overwriting the
+// answer with it threw the answer away — a target whose last push FAILED, on a
+// secret that also stopped resolving, printed `unresolved` bare in both tables
+// and collected no note, putting the 403 back where only `signet audit` could
+// reach it. That is the state this ticket exists to end, so the substitution
+// carries the original: the column shows `unresolved`, and the mark and the
+// note still come from what the layer said.
+//
+// Making it a pair rather than a convention is the point — a call site cannot
+// substitute a word without saying what it is substituting for.
+type shownState struct {
+	shown  string
+	judged string
+}
+
+// answered wraps a state the layer produced, with nothing substituted.
+func answered(state string) shownState { return shownState{shown: state, judged: state} }
+
+// substituting puts a call site's own word in the column while keeping the
+// layer's answer for the mark and the note.
+func (s shownState) substituting(word string) shownState {
+	return shownState{shown: word, judged: s.judged}
+}
+
 // markState appends a marker to a state whose reason the word does not carry.
 //
 // A bare `*` rather than a word, because the states appear in two tabwriter
 // columns that have no room to grow and are read as a column of one-word
 // values. It means "there is a reason, and it is printed below" — see
 // stateNotes.
-func markState(t *store.Target, state string) string {
-	if !stateHidesItsReason(t, state) {
-		return state
+func markState(t *store.Target, s shownState) string {
+	if !stateHidesItsReason(t, s.judged) {
+		return s.shown
 	}
-	return state + "*"
+	return s.shown + "*"
 }
 
 // stateNotes collects the reasons behind marked states, for printing under a
@@ -2794,8 +2839,8 @@ type stateNotes struct {
 // at a row the reader can find; state is required rather than inferred, because
 // a note without a marked row to explain is the same false alarm as a marked
 // row without a note.
-func (n *stateNotes) add(t *store.Target, dest, state string) {
-	if !stateHidesItsReason(t, state) {
+func (n *stateNotes) add(t *store.Target, dest string, s shownState) {
+	if !stateHidesItsReason(t, s.judged) {
 		return
 	}
 	if n.seen == nil {
@@ -3522,9 +3567,9 @@ func runStatus(args []string) error {
 			if err != nil {
 				return err
 			}
-			ghState := t.GHState(cur, digest)
+			ghState := answered(t.GHState(cur, digest))
 			if derr != nil {
-				ghState = "unresolved"
+				ghState = ghState.substituting("unresolved")
 			}
 			dest := cfg.Repo + dotted(cfg.Environment) + "→" + cfg.SecretName
 			tgt = append(tgt, fmt.Sprintf("gh:%s [%s]", dest, markState(&t, ghState)))
@@ -3538,8 +3583,8 @@ func runStatus(args []string) error {
 				continue
 			}
 			dest := ri.cfg.Repo + dotted(ri.cfg.Environment) + "→" + ri.cfg.SecretName
-			tgt = append(tgt, fmt.Sprintf("gh-render:%s [%s]", dest, markState(ri.target, ri.state)))
-			notes.add(ri.target, dest, ri.state)
+			tgt = append(tgt, fmt.Sprintf("gh-render:%s [%s]", dest, markState(ri.target, answered(ri.state))))
+			notes.add(ri.target, dest, answered(ri.state))
 		}
 		for _, fi := range fileByProject[sec.Project] {
 			if !fi.cfg.Manages(sec.Name) {
