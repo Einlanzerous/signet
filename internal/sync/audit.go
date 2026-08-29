@@ -59,6 +59,24 @@ func auditPushedInputs(st *store.Store, res *PushResult, sec *store.Secret, rec 
 	}
 }
 
+// pushCitation renders the back-reference to a push's own ledger entry.
+//
+// recordPush returns 0 when its append failed, and Seq comes from LastInsertId
+// so a real entry is never 0. Citing it regardless would send an investigator
+// to entry 0, find nothing, and leave them unable to tell a placeholder from a
+// ledger worth worrying about — while the AuditErr that explains it lived and
+// died in one terminal. On a 95-key render that is 95 credentials each carrying
+// a dangling reference.
+//
+// So the citation format means exactly one thing: a number is an entry that
+// exists, and its absence is stated rather than faked.
+func pushCitation(seq int64) string {
+	if seq == 0 {
+		return "(push entry not recorded)"
+	}
+	return fmt.Sprintf("(push #%d)", seq)
+}
+
 // auditRenderedKeys records a rendered-target push against every secret whose
 // plaintext the delivered blob carried.
 //
@@ -83,24 +101,6 @@ func auditPushedInputs(st *store.Store, res *PushResult, sec *store.Secret, rec 
 // Failures here do not fail the push. It has already happened, the blob is at
 // the destination, and a caller that treated an incomplete ledger as a failed
 // delivery would report the opposite of the truth.
-// pushCitation renders the back-reference to a push's own ledger entry.
-//
-// recordPush returns 0 when its append failed, and Seq comes from LastInsertId
-// so a real entry is never 0. Citing it regardless would send an investigator
-// to entry 0, find nothing, and leave them unable to tell a placeholder from a
-// ledger worth worrying about — while the AuditErr that explains it lived and
-// died in one terminal. On a 95-key render that is 95 credentials each carrying
-// a dangling reference.
-//
-// So the citation format means exactly one thing: a number is an entry that
-// exists, and its absence is stated rather than faked.
-func pushCitation(seq int64) string {
-	if seq == 0 {
-		return "(push entry not recorded)"
-	}
-	return fmt.Sprintf("(push #%d)", seq)
-}
-
 func auditRenderedKeys(st *store.Store, res *PushResult, t *store.Target, cfg store.GHRenderConfig,
 	kind store.EventKind, actor string, role store.ActorRole, digest string, seq int64) {
 

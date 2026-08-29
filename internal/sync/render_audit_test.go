@@ -180,11 +180,16 @@ func pushEntriesFor(t *testing.T, st *store.Store, project, name string) []store
 }
 
 // The rendered blob can carry a DERIVED key, in which case the push discloses
-// that key's inputs too — and their entries need the same digest the direct
-// ones carry, or a target pushed on every deploy writes rows against its inputs
-// that cannot be told apart. Round 1 of the review on #43 found this asymmetry
-// on the CLI render path; it was fixed there and left here.
-func TestPushRenderAuditsDerivedInputsWithTheDigest(t *testing.T) {
+// that key's inputs too — and their entries have to name WHICH delivery, or a
+// target pushed on every deploy writes rows against its inputs that cannot be
+// told apart.
+//
+// By sequence, not by digest. A digest is a function of the value, so an
+// unrotated secret produces the same one on every push; that was the round-2
+// answer here and round 3 refuted it. The input entry carries no digest at all
+// now — auditRenderedKeys reassigns Details to a string holding only the
+// citation.
+func TestPushRenderAuditsDerivedInputsByPushSequence(t *testing.T) {
 	gh, _, _, _ := renderServer(t)
 	st, key, _ := renderFixture(t, gh.BaseURL, []string{"ALPHA", "DSN"}, map[string]string{"ALPHA": "a"})
 
