@@ -371,3 +371,85 @@ func TestADriftedTargetStillQuotesAResolvedRefusalAsHistory(t *testing.T) {
 		t.Errorf("present-tense wording survived:\n%s", out)
 	}
 }
+
+// The fourth view: the note at the end of a plain `render`, which is the only
+// one of the four that prints no state word and carries the reason inline.
+//
+// Nothing pinned it until round 8 of the review on #44 ran a mutation battery
+// and found that deleting the reason from renderedTargetNote's `drift` branch
+// left the whole suite green. `status`, `target list` and `render --check` were
+// all covered; the view whose wording this ticket changed twice was not.
+func TestRenderWriteNoteCarriesTheRefusalReason(t *testing.T) {
+	st := newCLIVault(t)
+	seedRefusedRender(t, st)
+
+	// No --check: this is the write path, whose trailing note reports the
+	// rendered targets it did not touch.
+	out := captureStdout(t, func() {
+		if err := runRender([]string{"--project", "demo"}); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	if !strings.Contains(out, "now stale") {
+		t.Fatalf("the note does not report the target as stale:\n%s", out)
+	}
+	if !strings.Contains(out, "the last push attempt was declined:") {
+		t.Errorf("the note does not carry the refusal, so the reason is back to being `signet audit`-only:\n%s", out)
+	}
+	if !strings.Contains(out, "--allow-shrink") {
+		t.Errorf("the refusal's own text — which names the fix — is not in the note:\n%s", out)
+	}
+	// Inline, not marked: this view prints prose, so there is no state word for
+	// a `*` to attach to. GHState's doc says exactly that, and it is the half
+	// of the claim a test can hold.
+	if strings.Contains(out, "drift*") {
+		t.Errorf("the prose note grew a state marker:\n%s", out)
+	}
+}
+
+// The same view's `error` branch, which the refusal test cannot reach: a
+// refusal is routed to `drift` by GHState, so a refused target never exercises
+// this one. Round 8's mutation battery found `stateReason(t)` here could be
+// replaced with a literal without failing anything.
+func TestRenderWriteNoteCarriesAFailureReason(t *testing.T) {
+	st := newCLIVault(t)
+	seedProject(t, st, "demo", map[string]string{"ALPHA": "a", "BETA": "b"})
+	captureStdout(t, func() {
+		if err := runTargetAdd([]string{
+			"--project", "demo", "--render-as-secret",
+			"--gh-repo", "o/r", "--gh-environment", "home-server",
+			"--gh-secret", "PROD_ENV_FILE", "--no-preflight",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	targets, err := st.RenderTargetsForProject("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A delivery that was attempted and failed — LastState is not `refused`, so
+	// GHState returns `error` rather than routing it to `drift`.
+	const transport = "403 Resource not accessible by personal access token"
+	if err := st.UpdateTargetPush(targets[0].ID, "error", transport, nil, "2026-08-20T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+
+	out := captureStdout(t, func() {
+		if err := runRender([]string{"--project", "demo"}); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	if !strings.Contains(out, transport) {
+		t.Errorf("the note does not carry the transport failure:\n%s", out)
+	}
+	// Through stateReason, so the four views cannot word one fact four ways —
+	// and so a literal here fails rather than passing silently.
+	if !strings.Contains(out, "the last push failed: ") {
+		t.Errorf("the note does not use the shared wording:\n%s", out)
+	}
+	if strings.Contains(out, "declined") {
+		t.Errorf("a failure was worded as a refusal:\n%s", out)
+	}
+}
