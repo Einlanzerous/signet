@@ -230,6 +230,14 @@ channel also writes against every secret the value was composed from,
 transitively and across projects. That rule lives in `internal/disclose`; a new
 egress path inherits it rather than restating it.
 
+**Adding a channel means updating three places**, and they are deliberately not
+collapsed into one: `internal/disclose`'s list, which is the authoritative
+count and the one a maintainer is told to treat as a checklist; the **Boundary**
+section above, because that is where the security perimeter is stated and where
+the agent-allowlist decision is made; and here. The count went stale in all
+three during the change that introduced the fifth and sixth channels, which is
+the argument for naming the obligation rather than trusting a cross-reference.
+
 **This makes renders wordy on purpose.** A 95-key render writes 95 per-secret
 entries beside its one per-target entry. That is the trade — an entry that is
 not *on* the credential is not findable *from* it — but it means the default
@@ -300,8 +308,7 @@ manages leaks a value signet knows perfectly well.
   (stdout), `signet exec` (a child process's environment), rendered env-file
   targets, the sealed push to GitHub Actions, and signet's own read of the
   GitHub PAT. Every one records against the credential — see "Where plaintext
-  leaves, and what the ledger records" for what that means and why the count is
-  worth keeping current here rather than only there.
+  leaves, and what the ledger records" for what that means.
 - **Ledger attribution**: CLI writes record `human` unless `SIGNET_ACTOR_ROLE`
   says otherwise. Agents driving allowlisted verbs should set it to
   `rule_engine`, or their changes are indistinguishable from a person's in a

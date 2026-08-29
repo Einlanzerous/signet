@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -79,18 +80,43 @@ func TestRenderAuditsTheInputsOfADerivedSecret(t *testing.T) {
 		}
 		// An investigator who arrives here because this secret is an INPUT has
 		// the same question as one who arrives at it directly, so the entry has
-		// to lead back the same way: to the target, and to the render entry
-		// holding the full account. It named the file and nothing else until
-		// the review on #43 caught the asymmetry with the direct entry beside it.
+		// to lead back the same way: to the target, and one level up the chain.
 		if e.TargetID == "" {
 			t.Error("an input's entry carries no TargetID, so it cannot be tied back to the render")
 		}
-		if !strings.Contains(e.Details, "(carried by #") {
-			t.Errorf("an input's entry does not cite the render it belonged to: %q", e.Details)
+		// The NUMBER, not the prefix. `(carried by #N)` and `(render #N)`
+		// resolve to different kinds of entry — the key's own secret.render row
+		// and the KindRender account of the whole render — and asserting only
+		// the token let the wrong sequence be threaded here without failing:
+		// substituting the render root's seq for the key's kept the suite
+		// green. So look up what the citation must point at and require it.
+		key := keyEntryFor(t, st, "csrv", "DSN")
+		want := fmt.Sprintf("(carried by #%d)", key.Seq)
+		if !strings.Contains(e.Details, want) {
+			t.Errorf("an input's entry does not cite the key entry that carried it — want %s, got %q", want, e.Details)
+		}
+		// And that it is not the render root, which is the substitution this
+		// guards against and which reads identically at the prefix.
+		if strings.Contains(e.Details, "(render #") {
+			t.Errorf("an input's entry cites the render root, not the key entry: %q", e.Details)
 		}
 		return
 	}
 	t.Fatal("rendering a derived secret to disk left no trace on the input whose value it carries")
+}
+
+// keyEntryFor returns a secret's own per-key render entry — the direct
+// disclosure, not the one written because something derives from it. That is
+// what an input's `(carried by #N)` must resolve to.
+func keyEntryFor(t *testing.T, st *store.Store, project, name string) store.AuditEntry {
+	t.Helper()
+	for _, e := range renderEntriesFor(t, st, project, name) {
+		if strings.HasPrefix(e.Details, "plaintext written to ") {
+			return e
+		}
+	}
+	t.Fatalf("no per-key render entry for %s/%s", project, name)
+	return store.AuditEntry{}
 }
 
 // renderEntriesFor returns the render disclosures recorded against a secret.

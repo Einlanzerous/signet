@@ -195,7 +195,11 @@ func pushEntriesFor(t *testing.T, st *store.Store, project, name string) []store
 // answer here and round 3 refuted it. The input entry carries no digest at all
 // now — auditRenderedKeys reassigns Details to a string holding only the
 // citation.
-func TestPushRenderAuditsDerivedInputsByPushSequence(t *testing.T) {
+//
+// The CARRYING sequence specifically — the key's own entry, `(carried by #N)`
+// — not the push's, which is the distinct `(push #N)` on the per-key row. The
+// name said ByPushSequence for a round after those became two tokens.
+func TestPushRenderAuditsDerivedInputsByCarryingSequence(t *testing.T) {
 	gh, _, _, _ := renderServer(t)
 	st, key, _ := renderFixture(t, gh.BaseURL, []string{"ALPHA", "DSN"}, map[string]string{"ALPHA": "a"})
 
