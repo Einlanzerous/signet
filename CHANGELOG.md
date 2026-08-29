@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.9.2](https://github.com/Einlanzerous/signet/compare/v1.9.1...v1.9.2) (2026-08-29)
+
+
+### Bug Fixes
+
+* **ci:** gate the release on the suite that is supposed to guard it (SGNT-27) ([#42](https://github.com/Einlanzerous/signet/issues/42)) ([8da740b](https://github.com/Einlanzerous/signet/commit/8da740bd5396809e3a4e07ce2cf6b6ae48bc7095))
+* **cli:** say why a refused push left a target stale (SGNT-35) ([#44](https://github.com/Einlanzerous/signet/issues/44)) ([cdfd1a2](https://github.com/Einlanzerous/signet/commit/cdfd1a2faae4ce2fffe1c3e0995f2768f73409bb))
+
 ## [1.9.1](https://github.com/Einlanzerous/signet/compare/v1.9.0...v1.9.1) (2026-08-23)
 
 
