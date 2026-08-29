@@ -672,3 +672,98 @@ before anyone noticed. When adding a `case` to the dispatch switch, say in the
 PR whether the verb should be allowlisted and why. The question is not only
 "does it mutate": `exec` mutates nothing and discloses plaintext, which is the
 property that actually matters.
+
+## Releasing, and the gate on it
+
+Releases are automated. Conventional commits on `main` drive release-please,
+which maintains a release PR; merging it tags, builds the static
+`linux/amd64` binary, attaches it plus a checksum to the GitHub Release, and
+dispatches `signet-released` to construct-server, which deploys it to
+`imperial-construct` after the `signet-prod` approval gate.
+
+**The suite gates all of that.** `release.yml` calls `ci.yml` as a reusable
+workflow and every later job is `needs:`-dependent on it, so a commit that does
+not pass produces no tag, no GitHub Release, no binary, and no deploy dispatch.
+
+This is not the original wiring. Until SGNT-27, `Release Please` and `ci` were
+separate workflows fired by the same push with no dependency between them, and
+**v1.7.0 was tagged, built and published from a commit whose `ci` run was red.**
+The released binary happened to be fine — the failure was a flaky test (SGNT-26)
+— which is luck, not design. The reason it mattered here more than it would in
+most repos is that a broken release reached the one human checkpoint *wearing
+the same clothes as a good one*: the `signet-prod` gate shows an approver what
+is being deployed, not whether it built clean.
+
+Because `ci.yml` now runs on `main` only through that call, there is no longer a
+separate `ci` *workflow* run on a `main` commit — the same signal appears as the
+`ci / test` check of that commit's `Release Please` run. Pull requests are
+unchanged, and `main` carries no branch protection or ruleset that named the old
+check.
+
+**The suite runs twice on a release**, and the second run is the load-bearing
+one. `ci` gates release-please, so no tag is cut while `main` is red.
+`verify-tag` then re-runs the suite **against the tag itself** and gates the
+binary and the deploy dispatch on that.
+
+The second gate exists because the tag is not necessarily the commit that was
+pushed: release-please ties a release to the release PR and tags that PR's
+*merge commit*. Gate the pushed commit only, and this is reachable — the
+release-PR merge fails `ci`, the operator pushes a fix, the fix's run passes
+`ci` **on the fix** and cuts the release **at the still-red merge commit**.
+`verify-tag` is correct whether or not those two commits can actually diverge,
+which is why it is a job rather than a comment asserting that they cannot.
+
+**When something is blocked, the run says which of the two it was**, because
+the states differ and so does the recovery:
+
+| job | what happened | what exists |
+|---|---|---|
+| `blocked` | `ci` failed on the pushed commit | nothing — no tag, no release, no dispatch |
+| `tag-unverified` | the suite failed against the tag | a tag and an empty GitHub Release; no binary, no dispatch |
+
+A release that simply never appears is its own kind of invisible, which is why
+both are announced rather than implied by an absent tag.
+
+**Recovering from `blocked` usually needs nothing manual.** Push the fix to
+`main`; that push runs the workflow again and release-please picks up every
+commit since the last release. The release is delayed, not lost.
+
+The exception is when the blocked commit was itself a **release-PR merge**.
+Pushing a fix does not move the release: release-please tags that merge commit,
+so the next green run cuts at the still-red commit and lands you in
+`tag-unverified` below. Re-running the blocked run is the cleaner recovery
+there.
+
+**Recovering from `tag-unverified` needs a decision**, and it is the one case
+where "push the fix" is not the answer. The tag already exists and pushing a fix
+does not move it — release-please releases the merged release PR at its own
+merge commit.
+
+- **A flake** — use **Re-run failed jobs** on that run. Not *Re-run all jobs*:
+  that re-runs release-please, which will not release the same PR twice (it
+  already carries `autorelease: tagged`), so `release_created` comes back empty,
+  every job below it skips, and **the run goes green having attached nothing**.
+  Re-running only the failed jobs preserves release-please's outputs, so
+  `verify-tag` and `build` see a real tag.
+- **A real failure** — that commit should not ship. Fix forward and cut a new
+  version, **and delete the empty tag and Release**. Cutting a newer version
+  does not make the empty one installable; it stays published with nothing in
+  it, and anyone installing by that tag gets nothing.
+
+**An empty release cannot go quiet.** While *any* published release has no
+assets, the `orphan-release` job fails on every later run of this workflow —
+including after a newer version has been cut, which is the case that would
+otherwise let one slip out of view. It is skipped on the run that cuts a
+release, excludes drafts, and passes when every release carries its binary, so
+it only speaks when there is something to say — and it keeps saying it until
+someone acts, rather than reporting once in a run nobody revisits.
+
+One consequence worth knowing: while `main` is red, release-please does not run
+at all, so **the release PR stops updating too**. That is intended — the release
+PR describes a release that currently cannot be cut.
+
+The deploy half is deliberately *not* gated here. `deploy-signet.yml` lives in
+construct-server and could check the release commit's status independently,
+which would also cover releases cut by other means; that is a second layer and
+a different repo's change. This one stops the bad tag existing in the first
+place.
