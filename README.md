@@ -439,9 +439,11 @@ construct-server (95 keys)  gh-render  o/r · home-server · PROD_ENV_FILE  drif
   * o/r · home-server · PROD_ENV_FILE — push declined: this render drops 1 key(s) …
 ```
 
-`signet status`, `signet target list`, `signet render --check` and the note at
-the end of a `render` all do this, through one function, so they cannot come to
-word one fact four ways. A **refusal** reads as `push declined` and a **failure**
+`signet status`, `signet target list` and `signet render --check` all do this,
+through one function. The note at the end of a `render` is prose and prints no
+state word, so it carries the same reason inline rather than marking anything —
+but it comes from that same function, so the four cannot word one fact four
+ways. A **refusal** reads as `push declined` and a **failure**
 as `last push failed`, because the two are different facts: after a refusal the
 deployed environment is intact and stale, and after a failure that is not known.
 

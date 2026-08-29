@@ -184,11 +184,12 @@ func (t *Target) GHState(cur *Version, digest string) string {
 	// a refusal happened.
 	//
 	// It is true now, for the two states that hide a reason — this one, when
-	// LastState is `refused`, and `error`. Both are marked with a trailing `*`
-	// in every CLI view, with the reason printed under the table (`signet
-	// status`, `signet target list`) or beneath the state (`signet render
-	// --check`, and the note at the end of a `render`). The mirror's TargetView
-	// carries LastError as its own field, as it always did.
+	// LastState is `refused`, and `error`. Three CLI views mark them with a
+	// trailing `*` and print the reason: under the table for `signet status`
+	// and `signet target list`, beneath the state for `signet render --check`.
+	// The fourth, the note at the end of a `render`, prints no state word at
+	// all — it is prose — so it carries the reason inline instead. The mirror's
+	// TargetView carries LastError as its own field, as it always did.
 	//
 	// The qualifier is load-bearing and is the whole sentence's honesty: no
 	// other state is marked, because LastError outlives the refusal it records

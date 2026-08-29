@@ -182,7 +182,7 @@ func TestARefusalAndAFailureAreWordedDifferently(t *testing.T) {
 	refused := &store.Target{LastState: store.TargetRefused, LastError: "boom"}
 	failed := &store.Target{LastState: "error", LastError: "boom"}
 
-	if got := stateReason(refused); !strings.HasPrefix(got, "the last push was declined") {
+	if got := stateReason(refused); !strings.HasPrefix(got, "the last push attempt was declined") {
 		t.Errorf("a refusal reads as %q", got)
 	}
 	if got := stateReason(failed); !strings.HasPrefix(got, "the last push failed") {
@@ -323,7 +323,7 @@ func TestADriftedTargetStillQuotesAResolvedRefusalAsHistory(t *testing.T) {
 	// ends in an imperative — "re-add them, or pass --allow-shrink" — and
 	// framing it as a report of what signet said stops that reading as an
 	// instruction the operator has not yet followed.
-	if !strings.Contains(out, "the last push was declined:") {
+	if !strings.Contains(out, "the last push attempt was declined:") {
 		t.Errorf("the reason is not worded as history, so its imperative tail reads as an order:\n%s", out)
 	}
 	if strings.Contains(out, "* o/r · home-server · PROD_ENV_FILE — push declined") {

@@ -2830,12 +2830,22 @@ func (n *stateNotes) print() {
 // Both are past tense on purpose. A refusal's text frequently ends in an
 // imperative — "set them, or drop them from the target", "re-add them, or pass
 // --allow-shrink" — and the reason is not re-derived, so that tail can outlive
-// the condition it describes. "the last push was declined" frames what follows
-// as a quotation of what signet said at the time; "push declined" read as a
-// statement about now, and told operators to do things they had already done.
+// the condition it describes. Past tense frames what follows as a quotation of
+// what signet said at the time; the present tense told operators to do things
+// they had already done.
+//
+// "attempt" is load-bearing, not padding. ShrinkError's own text opens "this
+// render drops N key(s) the last push delivered: …", so "the last push was
+// declined: this render drops 1 key(s) the last push delivered: BETA" names two
+// DIFFERENT pushes the same way — the attempt that was refused, and the last
+// successful delivery PushedKeys() read out of the row. Left to right that says
+// the declined push delivered BETA, which is the one thing a refusal guarantees
+// did not happen, and it is the distinction the doc above calls the whole
+// point. It also blunts the past tense: a reader who cannot tell which push is
+// meant does not get the quotation framing either.
 func stateReason(t *store.Target) string {
 	if t.LastState == store.TargetRefused {
-		return "the last push was declined: " + t.LastError
+		return "the last push attempt was declined: " + t.LastError
 	}
 	return "the last push failed: " + t.LastError
 }
