@@ -9,17 +9,30 @@
 // # Why this is a package and not a helper on a call site
 //
 // The rule belongs to the derivation graph, not to any one channel that reads
-// it, and this repo has now rediscovered that five times: `reveal` (SGNT-18),
-// `exec` (SGNT-32), `render`, the rendered-target push, and the GitHub PAT read
-// in internal/ops (all three SGNT-34, the last found by review). Each time it
-// was found as an unaudited read channel in a vault whose premise is that
-// plaintext leaves only in audited ways.
+// it, and this repo has now rediscovered that six times:
 //
-// The count is load-bearing and was wrong here once already: this comment said
-// "four" while `ops.ResolveGHToken` was a fifth, in the package whose stated
-// purpose is that a new channel inherits the rule. If you add a channel, add it
-// to this list — and if you find one missing from the list, it is a bug in the
-// channel, not in the list.
+//	reveal                    SGNT-18
+//	exec                      SGNT-32
+//	render                    SGNT-34
+//	the single-secret push    SGNT-34 (PushSecret, found by review)
+//	the rendered-target push  SGNT-34 (PushRender)
+//	the GitHub PAT read       SGNT-34 (ops.ResolveGHToken, found by review)
+//
+// The two push halves are listed separately because they were two separate
+// gaps, found and fixed separately: PushRender recorded no SecretID at all,
+// while PushSecret recorded one and skipped the derivation. auditPushedInputs
+// binds both.
+//
+// Each was an unaudited read channel in a vault whose premise is that plaintext
+// leaves only in audited ways.
+//
+// The count is load-bearing and has now been wrong here twice — "four" while
+// ops.ResolveGHToken was a fifth, then "five" while PushSecret was a sixth, in
+// the package whose stated purpose is that a new channel inherits the rule. So
+// read the list in one direction only: **a channel missing from it is a bug in
+// the list, not evidence that the channel is not one.** The earlier wording
+// said the opposite, which would have told a maintainer auditing coverage to
+// treat a correctly-audited PushSecret as broken.
 //
 // Stated once per channel it gets restated or forgotten. The traversal lives
 // here so a fifth channel inherits it rather than reimplementing it — and so

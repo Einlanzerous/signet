@@ -101,8 +101,15 @@ func auditRenderedKeys(st *store.Store, res *PushResult, t *store.Target, cfg st
 			noteAuditErr(res, err, "sync.push (key "+k+")")
 			continue
 		}
-		rec.Details = fmt.Sprintf("value delivered to %s in the %s render of %s/%s, which derives from it",
-			cfg.Destination(), t.Project, sec.Project, sec.Name)
+		// The digest travels with it. Without it every push of this blob writes
+		// an input entry identical to the last, so `audit --secret <input>`
+		// returns N rows that cannot be told apart — while the direct entry
+		// three lines up cites the digest for exactly this reason. Round 1 of
+		// the review on #43 found this asymmetry on the CLI render path; it was
+		// fixed there and left here, which is the fix-at-the-instance shape
+		// REVIEW.md names first.
+		rec.Details = fmt.Sprintf("value delivered to %s in the %s render of %s/%s, which derives from it · #%s",
+			cfg.Destination(), t.Project, sec.Project, sec.Name, digest)
 		auditPushedInputs(st, res, sec, rec)
 	}
 }

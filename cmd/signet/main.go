@@ -751,11 +751,11 @@ func runReveal(args []string) error {
 //
 // The rule — *a disclosure of a derived secret is a disclosure of its inputs* —
 // belongs to the derivation graph rather than to any one channel that reads it,
-// and it now has five of them: `reveal`, `exec`, `render`, the rendered-target
-// push, and the PAT read in internal/ops. It therefore lives in
-// internal/disclose, which those packages reach too; this is the CLI's binding
-// of it to the actor, role and kind that every disclosure from a terminal
-// shares.
+// and it now has six of them: `reveal`, `exec`, `render`, both halves of the
+// sealed push, and the PAT read in internal/ops. internal/disclose holds the
+// list and the traversal, and is the one to keep current; this is only the
+// CLI's binding of it to the actor, role and kind that every disclosure from a
+// terminal shares.
 //
 // Without it the entry on the derived secret is the only trace, and
 // `signet audit --secret <input>` shows nothing for a read that crossed

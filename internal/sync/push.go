@@ -162,10 +162,15 @@ func PushSecret(ctx context.Context, st *store.Store, key []byte, gh *GHClient, 
 			// GitHub sends theirs — off-box, to a destination nothing can read
 			// back. Found while checking whether `sync` shared `render`'s gap
 			// (SGNT-34); it is the same one SGNT-18 closed for `reveal`.
+			// `provenance` for the same reason the direct entry above carries
+			// it: without it, every push of this derived secret writes an
+			// identical row on each input and an investigator cannot tell one
+			// delivery from the next. For a derived secret it is the resolved
+			// value's digest, which is the only currency it has.
 			auditPushedInputs(st, &res, sec, store.AuditRecord{
 				Actor: actor, Action: "sync.push", TargetID: t.ID,
-				Details: fmt.Sprintf("value delivered to %s via push of %s/%s, which derives from it",
-					cfg.Destination(), sec.Project, sec.Name),
+				Details: fmt.Sprintf("value delivered to %s via push of %s/%s, which derives from it · %s",
+					cfg.Destination(), sec.Project, sec.Name, provenance),
 				EventKind: kind, ActorRole: role, Status: status,
 			})
 		}

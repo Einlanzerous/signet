@@ -48,6 +48,9 @@ func TestPushRenderIsAuditedPerSecret(t *testing.T) {
 		if !strings.Contains(entries[0].Details, "o/r") {
 			t.Errorf("%s's entry does not name the destination: %q", name, entries[0].Details)
 		}
+		if !strings.Contains(entries[0].Details, "#") {
+			t.Errorf("%s's entry cites no digest, so two pushes are indistinguishable: %q", name, entries[0].Details)
+		}
 	}
 
 	// The per-target entry stays. It is the record of the push — the key count,
@@ -105,9 +108,16 @@ func TestPushAuditsTheInputsOfADerivedSecret(t *testing.T) {
 	}
 
 	for _, e := range pushEntriesFor(t, st, "csrv", "ALPHA") {
-		if strings.Contains(e.Details, "derives from it") {
-			return
+		if !strings.Contains(e.Details, "derives from it") {
+			continue
 		}
+		// An input's entry has to distinguish one delivery from the next, or a
+		// secret pushed on every deploy returns N identical rows. The direct
+		// entry cites its provenance; so does this one.
+		if !strings.Contains(e.Details, "#") {
+			t.Errorf("an input's entry cites no provenance, so two pushes are indistinguishable: %q", e.Details)
+		}
+		return
 	}
 	t.Fatal("pushing a derived secret to GitHub left no trace on the input whose value it carries")
 }
@@ -157,4 +167,55 @@ func pushEntriesFor(t *testing.T, st *store.Store, project, name string) []store
 		}
 	}
 	return out
+}
+
+// The rendered blob can carry a DERIVED key, in which case the push discloses
+// that key's inputs too — and their entries need the same digest the direct
+// ones carry, or a target pushed on every deploy writes rows against its inputs
+// that cannot be told apart. Round 1 of the review on #43 found this asymmetry
+// on the CLI render path; it was fixed there and left here.
+func TestPushRenderAuditsDerivedInputsWithTheDigest(t *testing.T) {
+	gh, _, _, _ := renderServer(t)
+	st, key, _ := renderFixture(t, gh.BaseURL, []string{"ALPHA", "DSN"}, map[string]string{"ALPHA": "a"})
+
+	// DSN derives from ALPHA and is carried by the render target.
+	if _, _, err := store.MutateValue(st, func(m *store.Mutation) (*store.Secret, store.AuditRecord, error) {
+		sec, err := m.CreateSecret("csrv", "DSN", "", false, "")
+		if err != nil {
+			return nil, store.AuditRecord{}, err
+		}
+		if err := m.SetDerivation(sec.ID, "wrapper[{{csrv/ALPHA}}]wrapper"); err != nil {
+			return nil, store.AuditRecord{}, err
+		}
+		return sec, store.AuditRecord{
+			Actor: "test", Action: "secret.derive", SecretID: sec.ID, Details: "fixture",
+			EventKind: store.KindSecretWrite, ActorRole: store.RoleHuman,
+		}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	targets, err := st.RenderTargetsForProject("csrv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"ALPHA": "a", "DSN": "wrapper[a]wrapper"}
+	res, err := PushRender(context.Background(), st, key, gh, &targets[0], want, RenderPushOptions{}, "test", store.RoleHuman)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.State != "in sync" || res.AuditErr != "" {
+		t.Fatalf("push did not succeed cleanly: %+v", res)
+	}
+
+	for _, e := range pushEntriesFor(t, st, "csrv", "ALPHA") {
+		if !strings.Contains(e.Details, "derives from it") {
+			continue
+		}
+		if !strings.Contains(e.Details, "#") {
+			t.Errorf("the input's entry cites no digest, so two pushes are indistinguishable: %q", e.Details)
+		}
+		return
+	}
+	t.Fatal("a render carrying a derived key left no trace on the input whose value it carries")
 }
