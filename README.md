@@ -746,15 +746,17 @@ merge commit.
   Re-running only the failed jobs preserves release-please's outputs, so
   `verify-tag` and `build` see a real tag.
 - **A real failure** — that commit should not ship. Fix forward and cut a new
-  version, deleting the empty tag and Release if you would rather not keep one
-  in the history.
+  version, **and delete the empty tag and Release**. Cutting a newer version
+  does not make the empty one installable; it stays published with nothing in
+  it, and anyone installing by that tag gets nothing.
 
-**An empty release cannot go quiet.** While the version in
-`.release-please-manifest.json` has a published Release with no assets, the
-`orphan-release` job fails on every later run of this workflow. It is skipped on
-the run that cuts a release and passes when the binary is attached, so it only
-speaks when there is something to say — and it keeps saying it until someone
-acts, rather than reporting once in a run nobody revisits.
+**An empty release cannot go quiet.** While *any* published release has no
+assets, the `orphan-release` job fails on every later run of this workflow —
+including after a newer version has been cut, which is the case that would
+otherwise let one slip out of view. It is skipped on the run that cuts a
+release, excludes drafts, and passes when every release carries its binary, so
+it only speaks when there is something to say — and it keeps saying it until
+someone acts, rather than reporting once in a run nobody revisits.
 
 One consequence worth knowing: while `main` is red, release-please does not run
 at all, so **the release PR stops updating too**. That is intended — the release
