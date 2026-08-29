@@ -212,10 +212,15 @@ func PushRender(ctx context.Context, st *store.Store, key []byte, gh *GHClient, 
 	if res.Note != "" {
 		detail += " (" + res.Note + ")"
 	}
-	recordPush(st, &res, store.AuditRecord{
+	seq := recordPush(st, &res, store.AuditRecord{
 		Actor: actor, Action: "sync.push", TargetID: t.ID,
 		Details: detail, EventKind: kind, ActorRole: role, Status: status,
 	}, "in sync", "", &prov, nowRFC3339())
+	// The entry above is the record of the push. It carries no SecretID — a
+	// blob composed from many secrets has no single one to name — which left
+	// every key in it invisible to `audit --secret`, the query asked from the
+	// credential's side. See internal/sync/audit.go (SGNT-34).
+	auditRenderedKeys(st, &res, t, cfg, kind, actor, role, digest, seq)
 	return res, nil
 }
 

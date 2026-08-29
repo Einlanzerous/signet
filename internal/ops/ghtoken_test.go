@@ -417,3 +417,62 @@ func TestGHTokenResolvesADerivedPAT(t *testing.T) {
 		t.Errorf("got %q", got.Value)
 	}
 }
+
+// The fifth disclosure channel (SGNT-34, found by review). resolve.Current is
+// used here precisely so a DERIVED PAT works, and a derived PAT's plaintext is
+// its inputs' — decrypted and put into an Authorization header. Recording only
+// against the PAT left `signet audit --secret <input>` empty for a read that
+// sent that credential off-box, on the one secret that can rewrite every other
+// destination in the vault.
+func TestResolveGHTokenAuditsTheInputsOfADerivedPAT(t *testing.T) {
+	st, key := newVault(t)
+	putSecret(t, st, key, "ops", "GH_PAT_INNER", "ghp_the_real_token", "")
+	// The configuration ResolveGHToken's own comment says it supports: the
+	// well-known PAT ref is a derivation over another secret.
+	if _, _, err := store.MutateValue(st, func(m *store.Mutation) (*store.Secret, store.AuditRecord, error) {
+		sec, err := m.CreateSecret(GHTokenProject, GHTokenName, "", false, "")
+		if err != nil {
+			return nil, store.AuditRecord{}, err
+		}
+		if err := m.SetDerivation(sec.ID, "{{ops/GH_PAT_INNER}}"); err != nil {
+			return nil, store.AuditRecord{}, err
+		}
+		return sec, store.AuditRecord{
+			Actor: "test", Action: "secret.derive", SecretID: sec.ID, Details: "test fixture",
+			EventKind: store.KindSecretWrite, ActorRole: store.RoleHuman,
+		}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	tok, err := ResolveGHToken(st, key, "", "cli:test", store.RoleHuman)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.Value != "ghp_the_real_token" {
+		t.Fatalf("the derived PAT did not resolve to its input's value: %q", tok.Value)
+	}
+
+	inner, err := st.GetSecret("ops", "GH_PAT_INNER")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := st.ListAudit(0, inner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Action != ActionSecretRead || !strings.Contains(e.Details, "derives from it") {
+			continue
+		}
+		// `sync` reads the PAT on every run, so an input entry with nothing to
+		// distinguish it from the last leaves a wall of identical rows. A
+		// provenance would not fix that — it is a function of the value — so
+		// this cites the direct entry by ledger sequence.
+		if !strings.Contains(e.Details, "(carried by #") {
+			t.Errorf("the input's entry does not cite the read it belonged to: %q", e.Details)
+		}
+		return
+	}
+	t.Fatal("reading a derived PAT left no trace on the input whose value it carries")
+}

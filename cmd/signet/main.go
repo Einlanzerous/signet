@@ -43,6 +43,7 @@ import (
 	"github.com/Einlanzerous/signet/internal/api"
 	"github.com/Einlanzerous/signet/internal/config"
 	"github.com/Einlanzerous/signet/internal/derive"
+	"github.com/Einlanzerous/signet/internal/disclose"
 	"github.com/Einlanzerous/signet/internal/envfile"
 	"github.com/Einlanzerous/signet/internal/ops"
 	"github.com/Einlanzerous/signet/internal/resolve"
@@ -720,17 +721,24 @@ func runReveal(args []string) error {
 	} else {
 		details = fmt.Sprintf("revealed %s/%s version %d #%s to stdout", *project, *name, r.Version.VersionNo, r.Version.VHash)
 	}
-	if _, err := a.st.AppendAudit(store.AuditRecord{
+	revealed, err := a.st.AppendAudit(store.AuditRecord{
 		Actor: cliActor(), Action: "secret.reveal", SecretID: sec.ID,
 		Details:   details,
 		EventKind: store.KindSecretReveal, ActorRole: cliRole(),
 		Status: &store.AuditStatus{Outcome: store.OutcomeDelivered},
-	}); err != nil {
+	})
+	if err != nil {
 		return err
 	}
 
-	if err := a.auditDerivedInputs(sec, "secret.reveal",
-		fmt.Sprintf("value disclosed via reveal of %s/%s, which derives from it", *project, *name)); err != nil {
+	// Cited by sequence, as every other channel's input entries are: the direct
+	// entry above names the derivation, and without a back-reference an input's
+	// ledger reads the same after three reveals as after one.
+	if err := a.auditDerivedInputs(sec, store.AuditRecord{
+		Action: "secret.reveal",
+		Details: fmt.Sprintf("value disclosed via reveal of %s/%s, which derives from it (carried by #%d)",
+			*project, *name, revealed.Seq),
+	}); err != nil {
 		return err
 	}
 	// The provenance goes to stderr so `reveal` stays pipeable: the value alone
@@ -747,10 +755,12 @@ func runReveal(args []string) error {
 // secret, whose plaintext its value carries.
 //
 // The rule — *a disclosure of a derived secret is a disclosure of its inputs* —
-// belongs to the derivation graph, not to any one channel that reads it.
-// `reveal` and `exec` both disclose, and a third will; stated once per verb it
-// is restated or forgotten, which is how the gap this closes existed for
-// `reveal` in the first place.
+// belongs to the derivation graph rather than to any one channel that reads it,
+// and it now has six of them: `reveal`, `exec`, `render`, both halves of the
+// sealed push, and the PAT read in internal/ops. internal/disclose holds the
+// list and the traversal, and is the one to keep current; this is only the
+// CLI's binding of it to the actor, role and kind that every disclosure from a
+// terminal shares.
 //
 // Without it the entry on the derived secret is the only trace, and
 // `signet audit --secret <input>` shows nothing for a read that crossed
@@ -758,25 +768,18 @@ func runReveal(args []string) error {
 // leaves only in audited ways; "audited" has to mean audited where someone
 // investigating that credential would look.
 //
-// detail is the caller's, because what an investigator needs differs between a
-// reveal to a terminal and an injection into a process — but the traversal and
-// the kind are not negotiable, and are therefore not the caller's to get wrong.
-func (a *app) auditDerivedInputs(sec *store.Secret, action, detail string) error {
-	inputs, err := resolve.Inputs(a.st, sec)
-	if err != nil {
-		return err
-	}
-	for _, in := range inputs {
-		if _, err := a.st.AppendAudit(store.AuditRecord{
-			Actor: cliActor(), Action: action, SecretID: in.ID,
-			Details:   detail,
-			EventKind: store.KindSecretReveal, ActorRole: cliRole(),
-			Status: &store.AuditStatus{Outcome: store.OutcomeDelivered},
-		}); err != nil {
-			return err
-		}
-	}
-	return nil
+// rec carries the caller's Action, Details, and — where the channel has one —
+// TargetID. What an investigator needs differs between a reveal to a terminal,
+// an injection into a process and a file on disk, so those are the caller's; a
+// record rather than positional strings because an input's entry should be as
+// findable as the direct one beside it, and TargetID was silently droppable
+// while this took a fixed argument list.
+func (a *app) auditDerivedInputs(sec *store.Secret, rec store.AuditRecord) error {
+	rec.Actor = cliActor()
+	rec.ActorRole = cliRole()
+	rec.EventKind = store.KindSecretReveal
+	rec.Status = &store.AuditStatus{Outcome: store.OutcomeDelivered}
+	return disclose.Inputs(a.st, sec, rec)
 }
 
 // ---- rotate -----------------------------------------------------------------
@@ -1433,7 +1436,11 @@ func runRender(args []string) error {
 		}
 		return nil
 	}
-	want, err := a.projectValuesStrict(*project)
+	// The secrets come back alongside the values because the ledger entries
+	// below need the SecretID behind each key, and resolving the project has
+	// already listed them — asking a second time was two full ListSecrets
+	// passes for one render.
+	want, secrets, err := a.projectValuesStrict(*project)
 	if err != nil {
 		return err
 	}
@@ -1478,12 +1485,23 @@ func runRender(args []string) error {
 		if err := a.st.UpdateTargetPush(t.ID, "in sync", "", &store.PushProvenance{}, time.Now().UTC().Format(time.RFC3339)); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: rendered %s but could not record its state: %v\n", cfg.Path, err)
 		}
-		if _, err := a.st.AppendAudit(store.AuditRecord{
+		rendered, err := a.st.AppendAudit(store.AuditRecord{
 			Actor: cliActor(), Action: "render", TargetID: t.ID,
 			Details:   fmt.Sprintf("rendered %d keys → %s (mode %s)%s", len(pairs), cfg.Path, cfg.Mode, note),
 			EventKind: store.KindRender, ActorRole: cliRole(),
 			Status: &store.AuditStatus{Outcome: store.OutcomeDelivered},
-		}); err != nil {
+		})
+		if err != nil {
+			return err
+		}
+		// The entry above records what the render did. It does not record what
+		// the render disclosed, and those are asked from opposite ends: a deploy
+		// script auditing renders reads the target's history, while someone
+		// asking "where has this password been written" reads the credential's.
+		// Until SGNT-34 the second question was answered for `reveal` and `exec`
+		// and silently not for the channel that leaves plaintext sitting in a
+		// file — the longest-lived exposure of the three.
+		if err := a.auditRenderedSecrets(t.ID, cfg.Path, rendered.Seq, cfg.Keys, secrets); err != nil {
 			return err
 		}
 		fmt.Printf("rendered %s (%d keys%s)\n", cfg.Path, len(pairs), note)
@@ -1605,16 +1623,22 @@ func renderedTargetNote(t *store.Target, state string) renderNote {
 // listing means the operator cannot see the vault at the moment they most need
 // to — including the entry that is broken.
 func (a *app) projectValues(project string) (map[string]string, map[string]error, error) {
-	secrets, err := a.st.ListSecrets()
+	secrets, err := a.projectSecrets(project)
 	if err != nil {
 		return nil, nil, err
 	}
+	want, problems := a.resolveInto(secrets)
+	return want, problems, nil
+}
+
+// resolveInto reduces a project's secrets to their current values, collecting
+// per-secret failures rather than failing the project. Shared by the lenient
+// and strict readers so the two cannot come to disagree about what "absent"
+// and "broken" mean.
+func (a *app) resolveInto(secrets map[string]store.Secret) (map[string]string, map[string]error) {
 	want := map[string]string{}
 	problems := map[string]error{}
 	for _, sec := range secrets {
-		if sec.Project != project {
-			continue
-		}
 		r, err := resolve.Current(a.st, a.key, &sec)
 		switch {
 		case errors.Is(err, resolve.ErrNoVersion):
@@ -1627,7 +1651,106 @@ func (a *app) projectValues(project string) (map[string]string, map[string]error
 		}
 		want[sec.Name] = r.Value
 	}
-	return want, problems, nil
+	return want, problems
+}
+
+// auditRenderedSecrets records a render against each secret whose plaintext it
+// wrote to disk, so `signet audit --secret <ref>` answers from the credential's
+// side.
+//
+// ── The two decisions SGNT-34 asked to be made rather than inherited ───────
+//
+// **One entry per key, not one for the render.** A 95-key render writes 95
+// additional entries, and on a deploy path that runs often. It is the same
+// trade `exec` took, for the same reason: the query these exist to serve is
+// `audit --secret`, which filters on secret_id, and a single entry naming a
+// project answers it empty for every secret in that project. The volume is the
+// feature — an entry that is not on the credential is not findable from it.
+//
+// What keeps the cost down is that each entry is *short* and refers to the
+// render's own entry by sequence rather than restating it. The render entry
+// already carries the key count, the mode, and what happened to unmanaged keys;
+// duplicating that 95 times would be the expensive version of this. The key
+// name is likewise absent because it is the secret's own name, and the entry is
+// already keyed to the secret.
+//
+// **KindSecretReveal, not KindRender.** The per-target entry stays KindRender —
+// it records a render. These record a disclosure, and share the kind with
+// `reveal` and `exec` so one query answers "what disclosed this value". A
+// per-channel kind would leave the credential-side question needing to know
+// about every channel that ever existed, which is the fragmentation the shared
+// kind was chosen to avoid.
+func (a *app) auditRenderedSecrets(targetID, path string, seq int64, keys []string, secrets map[string]store.Secret) error {
+	for _, k := range keys {
+		sec, ok := secrets[k]
+		if !ok {
+			// Unreachable: the write loop above refuses a key the vault cannot
+			// supply, and `want` is built from these same secrets. Loud anyway
+			// — silently skipping would be an unrecorded disclosure, which is
+			// the exact condition this function exists to prevent.
+			return fmt.Errorf("rendered key %s to %s but no secret backs it — the render is written and the ledger is incomplete", k, path)
+		}
+		detail := fmt.Sprintf("plaintext written to %s (render #%d)", path, seq)
+		written, err := a.st.AppendAudit(store.AuditRecord{
+			Actor: cliActor(), Action: "secret.render", SecretID: sec.ID, TargetID: targetID,
+			Details:   detail,
+			EventKind: store.KindSecretReveal, ActorRole: cliRole(),
+			Status: &store.AuditStatus{Outcome: store.OutcomeDelivered},
+		})
+		if err != nil {
+			return err
+		}
+		// A derived secret's value carries its inputs', so writing it to disk
+		// writes theirs — see internal/disclose for why the traversal is not
+		// repeated here.
+		//
+		// The TargetID and a sequence travel with it. An investigator who
+		// arrives at this secret because it is an INPUT has the same question
+		// as one who arrives at it directly, and an entry that named the file
+		// but not the render it belonged to answered half of it.
+		//
+		// It cites the KEY's entry, not the render's, so the chain is
+		// input → key → render → target, one level per hop. That is the chain
+		// internal/sync/audit.go builds for the same event delivered to GitHub,
+		// and the two render channels should not answer an investigator
+		// differently.
+		//
+		// `carried by`, not `render`, because the two hops resolve to different
+		// kinds of entry: `(render #N)` on the key's own row points at the
+		// KindRender account of the whole render, and this points at that key's
+		// per-secret row. One token for both sent a reader following it off an
+		// input entry to a per-secret row where they expected the render.
+		if err := a.auditDerivedInputs(&sec, store.AuditRecord{
+			Action:   "secret.render",
+			TargetID: targetID,
+			Details: fmt.Sprintf("value written to %s via render of %s/%s, which derives from it (carried by #%d)",
+				path, sec.Project, sec.Name, written.Seq),
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// projectSecrets returns the project's secrets, keyed by the name a target's
+// key set refers to them by.
+//
+// It exists so that "which secrets does this project have" is decided once.
+// projectValues reduces them to values, which is all most callers want; render
+// needs the secrets themselves, because an audit entry for a disclosure has to
+// carry the SecretID and a value cannot supply one.
+func (a *app) projectSecrets(project string) (map[string]store.Secret, error) {
+	secrets, err := a.st.ListSecrets()
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]store.Secret{}
+	for _, sec := range secrets {
+		if sec.Project == project {
+			out[sec.Name] = sec
+		}
+	}
+	return out, nil
 }
 
 // ghDrift returns what GHState needs to judge a secret's gh-actions
@@ -1650,15 +1773,19 @@ func (a *app) ghDrift(sec *store.Secret) (*store.Version, string, error) {
 // projectValuesStrict is projectValues for callers that must not proceed on a
 // partial answer — render, which would otherwise write a file missing a key it
 // is responsible for.
-func (a *app) projectValuesStrict(project string) (map[string]string, error) {
-	want, problems, err := a.projectValues(project)
+// It returns the secrets alongside their values: a caller strict enough to
+// refuse a partial answer is also the caller that has to record what it
+// disclosed, and a value cannot supply a SecretID.
+func (a *app) projectValuesStrict(project string) (map[string]string, map[string]store.Secret, error) {
+	secrets, err := a.projectSecrets(project)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	want, problems := a.resolveInto(secrets)
 	for _, name := range sortedKeys(problems) {
-		return nil, fmt.Errorf("%s/%s cannot be resolved: %w", project, name, problems[name])
+		return nil, nil, fmt.Errorf("%s/%s cannot be resolved: %w", project, name, problems[name])
 	}
-	return want, nil
+	return want, secrets, nil
 }
 
 // sortedKeys returns a map's keys in order, so a failure reports the same

@@ -310,21 +310,24 @@ func (a *app) auditExec(inject map[string]injected, command string, redacted boo
 	}
 	for _, name := range sortedInjected(inject) {
 		in := inject[name]
-		if _, err := a.st.AppendAudit(store.AuditRecord{
+		disclosed, err := a.st.AppendAudit(store.AuditRecord{
 			Actor: cliActor(), Action: "secret.exec", SecretID: in.secret.ID,
 			Details: fmt.Sprintf("injected %s/%s into the environment of %q%s",
 				in.secret.Project, in.secret.Name, command, note),
 			EventKind: store.KindSecretReveal, ActorRole: cliRole(),
 			Status: &store.AuditStatus{Outcome: store.OutcomeDelivered},
-		}); err != nil {
+		})
+		if err != nil {
 			return err
 		}
 		// A derived secret's value carries its inputs', so injecting it
 		// discloses them too — see auditDerivedInputs for why the traversal
 		// lives there rather than here.
-		if err := a.auditDerivedInputs(&in.secret, "secret.exec",
-			fmt.Sprintf("value disclosed to %q via exec of %s/%s, which derives from it",
-				command, in.secret.Project, in.secret.Name)); err != nil {
+		if err := a.auditDerivedInputs(&in.secret, store.AuditRecord{
+			Action: "secret.exec",
+			Details: fmt.Sprintf("value disclosed to %q via exec of %s/%s, which derives from it (carried by #%d)",
+				command, in.secret.Project, in.secret.Name, disclosed.Seq),
+		}); err != nil {
 			return err
 		}
 	}
