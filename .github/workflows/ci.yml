@@ -11,11 +11,14 @@ name: ci
 # from a commit whose `ci` run was red, because the two workflows fired on the
 # same push and neither consulted the other.
 #
-# `push: branches: [main]` was removed rather than kept alongside the call: it
-# would run this suite a second time on every push to main, in the same
-# concurrency group, for a signal `release.yml` now produces on the same commit.
-# Nothing required a check literally named `ci` on main — main carries no branch
-# protection and no ruleset — so the signal moved rather than disappeared.
+# `push: branches: [main]` was removed rather than kept alongside the call,
+# because it would run this suite a second time on every push to main for a
+# signal `release.yml` now produces on the same commit. The duplication is the
+# whole argument: the two runs would NOT collide, since the group below is
+# keyed on the workflow name and `cancel-in-progress` evaluates false on both
+# push paths. Nothing required a check literally named `ci` on main — main
+# carries no branch protection and no ruleset — so the signal moved rather than
+# disappeared.
 on:
   pull_request:
   workflow_call:

@@ -15,9 +15,16 @@ permissions:
   contents: write
   pull-requests: write
 
-# Releases queue, they never cancel (SGNT-27). `build` tags, uploads a binary
-# and dispatches a deploy; a run cancelled between those steps leaves a release
-# nobody can install from. Overlapping pushes to main wait their turn instead.
+# An in-progress release is never cancelled (SGNT-27). `build` tags, uploads a
+# binary and dispatches a deploy; a run cancelled between those steps leaves a
+# release nobody can install from.
+#
+# This is not a queue, and the distinction matters in a file about what does and
+# does not get cut: GitHub holds at most one PENDING run per group, so of two
+# pushes arriving while a release is in flight the first is dropped before it
+# starts and only the second runs. Nothing is lost — release-please picks up
+# every commit since the last release — and the old `push: main` trigger on
+# ci.yml superseded that run too, with `cancel-in-progress: true`.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
@@ -132,8 +139,25 @@ jobs:
     permissions:
       contents: write
     steps:
+      # The tag release-please just created, NOT the run's HEAD.
+      #
+      # Those are the same commit in the ordinary case, and were always the same
+      # commit before the workflow-level `concurrency` above existed, because
+      # every push to main got its own release run. They can now differ: of two
+      # pushes arriving while a release is in flight, the first is dropped
+      # before it starts, so the release-PR merge can be cut by a later run
+      # whose HEAD is a different commit. Nothing in this job would notice —
+      # it would compile one commit, stamp its sha, and upload the result to a
+      # tag pointing at another.
+      #
+      # Naming the tag makes the mismatch unrepresentable rather than unlikely:
+      # this job builds what it uploads, by construction. Flagged as
+      # pre-existing in the review on #42; fixed here because the concurrency
+      # change above is what makes it reachable.
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -151,8 +175,13 @@ jobs:
       - name: Build linux/amd64
         env:
           VERSION: ${{ needs.release-please.outputs.version }}
-          GIT_SHA: ${{ github.sha }}
         run: |
+          # From the checkout, not from github.sha: the two can differ per the
+          # Checkout step above, and the sha this stamps is the one /healthz
+          # reports to Switchyard's delivery reconciler as what is running. A
+          # sha naming a commit the binary was not built from is worse than
+          # none, which is why version.Get() has an absent case at all.
+          GIT_SHA="$(git rev-parse HEAD)"
           asset="signet-${VERSION}-linux-amd64"
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
             -ldflags "-s -w \
