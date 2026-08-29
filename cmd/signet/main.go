@@ -1691,27 +1691,34 @@ func (a *app) auditRenderedSecrets(targetID, path string, seq int64, keys []stri
 			return fmt.Errorf("rendered key %s to %s but no secret backs it — the render is written and the ledger is incomplete", k, path)
 		}
 		detail := fmt.Sprintf("plaintext written to %s (render #%d)", path, seq)
-		if _, err := a.st.AppendAudit(store.AuditRecord{
+		written, err := a.st.AppendAudit(store.AuditRecord{
 			Actor: cliActor(), Action: "secret.render", SecretID: sec.ID, TargetID: targetID,
 			Details:   detail,
 			EventKind: store.KindSecretReveal, ActorRole: cliRole(),
 			Status: &store.AuditStatus{Outcome: store.OutcomeDelivered},
-		}); err != nil {
+		})
+		if err != nil {
 			return err
 		}
 		// A derived secret's value carries its inputs', so writing it to disk
 		// writes theirs — see internal/disclose for why the traversal is not
 		// repeated here.
 		//
-		// The TargetID and the render's sequence travel with it. An investigator
-		// who arrives at this secret because it is an INPUT has the same
-		// question as one who arrives at it directly, and an entry that named
-		// the file but not the render it belonged to answered half of it.
+		// The TargetID and a sequence travel with it. An investigator who
+		// arrives at this secret because it is an INPUT has the same question
+		// as one who arrives at it directly, and an entry that named the file
+		// but not the render it belonged to answered half of it.
+		//
+		// It cites the KEY's entry, not the render's, so the chain is
+		// input → key → render → target, one level per hop. That is the chain
+		// internal/sync/audit.go builds for the same event delivered to GitHub,
+		// and the two render channels should not answer an investigator
+		// differently.
 		if err := a.auditDerivedInputs(&sec, store.AuditRecord{
 			Action:   "secret.render",
 			TargetID: targetID,
 			Details: fmt.Sprintf("value written to %s via render of %s/%s, which derives from it (render #%d)",
-				path, sec.Project, sec.Name, seq),
+				path, sec.Project, sec.Name, written.Seq),
 		}); err != nil {
 			return err
 		}

@@ -64,16 +64,21 @@ func auditPushedInputs(st *store.Store, res *PushResult, sec *store.Secret, rec 
 //
 // One entry per key, as `render` and `exec` do, and for the same reason: the
 // query these serve filters on secret_id, so an entry naming only the project
-// answers it empty for every secret in that project. Each is kept short and
-// cites the push's own ledger sequence, which ties it to the target entry
-// holding the full account — the key count, the scope, and any keys the push
-// added.
+// answers it empty for every secret in that project.
 //
-// The sequence rather than the digest, which these used to carry: a digest is a
-// function of the VALUE, so a target pushed on every deploy with nothing
-// rotating between them produced byte-identical rows against every key, which
-// is the state the citation exists to prevent. The digest stays on the direct
-// entry, where the question it answers — did the blob change — is the right one.
+// Each cites the push's ledger sequence, which ties it to the target entry
+// holding the full account — the key count, the scope, and any keys the push
+// added — and each input's entry then cites the KEY entry above it. So the
+// chain an investigator walks is input → key → push → target, one level per
+// hop, and it is the same chain the CLI render builds.
+//
+// The sequence is load-bearing and the digest cannot stand in for it: a digest
+// is a function of the VALUE, so a target pushed on every deploy with nothing
+// rotating between them wrote byte-identical rows against every key. That is
+// the state this citation prevents, and it survived one round here because the
+// seq was threaded into this function and then not read — an unused parameter
+// is not a compile error and `go vet` does not flag one. The digest stays
+// alongside, answering the different question of whether the blob changed.
 //
 // Failures here do not fail the push. It has already happened, the blob is at
 // the destination, and a caller that treated an incomplete ledger as a failed
@@ -98,8 +103,13 @@ func auditRenderedKeys(st *store.Store, res *PushResult, t *store.Target, cfg st
 		}
 		rec := store.AuditRecord{
 			Actor: actor, Action: "sync.push", SecretID: sec.ID, TargetID: t.ID,
-			Details: fmt.Sprintf("plaintext delivered in the %s render → %s · #%s",
-				t.Project, cfg.Destination(), digest),
+			// The digest answers "did the blob change"; the sequence answers
+			// "which push was this". Both, because they are different
+			// questions and this entry is asked both — the digest ties it to
+			// the target entry's account of the delivery, the sequence
+			// distinguishes five deploys of an unchanged blob from one.
+			Details: fmt.Sprintf("plaintext delivered in the %s render → %s · #%s (push #%d)",
+				t.Project, cfg.Destination(), digest, seq),
 			EventKind: kind, ActorRole: role,
 			Status: &store.AuditStatus{Outcome: store.OutcomeDelivered},
 		}

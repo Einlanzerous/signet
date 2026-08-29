@@ -51,6 +51,15 @@ func TestPushRenderIsAuditedPerSecret(t *testing.T) {
 		if !strings.Contains(entries[0].Details, "#") {
 			t.Errorf("%s's entry cites no digest: %q", name, entries[0].Details)
 		}
+		// And the push, which is the half a digest cannot supply: a digest is
+		// a function of the value, so five deploys of an unchanged blob would
+		// otherwise write five byte-identical rows against this key. The seq
+		// was threaded into auditRenderedKeys and left unread for a round —
+		// an unused parameter is not a compile error and go vet does not flag
+		// one, so only an assertion catches it.
+		if !strings.Contains(entries[0].Details, "(push #") {
+			t.Errorf("%s's entry does not cite the push it belonged to: %q", name, entries[0].Details)
+		}
 	}
 
 	// The per-target entry stays. It is the record of the push — the key count,
