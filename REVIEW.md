@@ -33,7 +33,7 @@ unguarded; a refusal was extracted for the CLI while the API kept its own copy.
 > `grep` for the other callers. If the answer is "the caller must remember",
 > that is a finding — say what would make it unrepresentable instead.
 
-**A comment that asserts a property the code does not have.** Four instances.
+**A comment that asserts a property the code does not have.** Five instances.
 Doc comments here are unusually load-bearing — they carry reasoning that is not
 recoverable from the code — which is exactly why a false one is expensive: it
 stops the next reader checking. Treat a comment claiming "every X goes through

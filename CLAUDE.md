@@ -100,8 +100,9 @@ by parsing the free-text `Actor` string. `RoleDaemon` and `RoleHealer` are not
 declarable by an API caller: they mean "signet did this on its own initiative",
 and a forged one would be covered by the chain hash and therefore permanent.
 
-Cited: SGNT-14 (`fix(store): make mutation and audit append atomic`),
-`fix(audit): close chain-fork race, role forgery, and status encoding gaps`.
+Cited: `e66319e` (#12) — `fix(store): make mutation and audit append atomic`
+(SGNT-14); `39b2ec0` — `fix(audit): close chain-fork race, role forgery, and
+status encoding gaps`, which predates the PR flow and so has no number.
 
 ### 4. Plaintext leaves only in audited ways — audited where an investigator looks
 
