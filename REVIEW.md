@@ -33,7 +33,7 @@ unguarded; a refusal was extracted for the CLI while the API kept its own copy.
 > `grep` for the other callers. If the answer is "the caller must remember",
 > that is a finding — say what would make it unrepresentable instead.
 
-**A comment that asserts a property the code does not have.** Four instances.
+**A comment that asserts a property the code does not have.** Five instances.
 Doc comments here are unusually load-bearing — they carry reasoning that is not
 recoverable from the code — which is exactly why a false one is expensive: it
 stops the next reader checking. Treat a comment claiming "every X goes through
@@ -82,8 +82,16 @@ Important finding under twelve nits has failed at its job.
 ## Always check
 
 **Plaintext never leaves except where it is meant to.** Values leave the vault
-in exactly two audited ways — `signet reveal` to stdout, and rendered file
-targets — plus the sealed push to GitHub Actions.
+in five audited ways: `signet reveal` to stdout, `signet exec` into a child
+process's environment, rendered file targets, the sealed push to GitHub Actions,
+and signet's own read of the GitHub PAT.
+
+`internal/disclose` holds the authoritative list — it splits the push into its
+two halves, so it says six — and a channel missing from that list is a bug in
+the list. This count has gone stale four times: "exactly two" survived `exec`
+arriving, then "four" survived the PAT read, then "five" survived `PushSecret`,
+then this file survived the README being corrected. Update all three places, or
+none of them will be right.
 
 - Does a new code path put a decrypted value into an error message, a log line,
   a ledger `Details` field, or an HTTP response? The API returns metadata only.
