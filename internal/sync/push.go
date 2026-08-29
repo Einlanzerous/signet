@@ -158,6 +158,16 @@ func PushSecret(ctx context.Context, st *store.Store, key []byte, gh *GHClient, 
 				Actor: actor, Action: "sync.push", SecretID: sec.ID, TargetID: t.ID,
 				Details: detail, EventKind: kind, ActorRole: role, Status: status,
 			}, "in sync", "", &prov, nowRFC3339())
+			// A derived secret's value carries its inputs', so sending it to
+			// GitHub sends theirs — off-box, to a destination nothing can read
+			// back. Found while checking whether `sync` shared `render`'s gap
+			// (SGNT-34); it is the same one SGNT-18 closed for `reveal`.
+			auditPushedInputs(st, &res, sec, store.AuditRecord{
+				Actor: actor, Action: "sync.push", TargetID: t.ID,
+				Details: fmt.Sprintf("value delivered to %s via push of %s/%s, which derives from it",
+					cfg.Destination(), sec.Project, sec.Name),
+				EventKind: kind, ActorRole: role, Status: status,
+			})
 		}
 		results = append(results, res)
 	}
