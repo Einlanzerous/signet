@@ -672,3 +672,52 @@ before anyone noticed. When adding a `case` to the dispatch switch, say in the
 PR whether the verb should be allowlisted and why. The question is not only
 "does it mutate": `exec` mutates nothing and discloses plaintext, which is the
 property that actually matters.
+
+## Releasing, and the gate on it
+
+Releases are automated. Conventional commits on `main` drive release-please,
+which maintains a release PR; merging it tags, builds the static
+`linux/amd64` binary, attaches it plus a checksum to the GitHub Release, and
+dispatches `signet-released` to construct-server, which deploys it to
+`imperial-construct` after the `signet-prod` approval gate.
+
+**The suite gates all of that.** `release.yml` calls `ci.yml` as a reusable
+workflow and every later job is `needs:`-dependent on it, so a commit that does
+not pass produces no tag, no GitHub Release, no binary, and no deploy dispatch.
+
+This is not the original wiring. Until SGNT-27, `Release Please` and `ci` were
+separate workflows fired by the same push with no dependency between them, and
+**v1.7.0 was tagged, built and published from a commit whose `ci` run was red.**
+The released binary happened to be fine — the failure was a flaky test (SGNT-26)
+— which is luck, not design. The reason it mattered here more than it would in
+most repos is that a broken release reached the one human checkpoint *wearing
+the same clothes as a good one*: the `signet-prod` gate shows an approver what
+is being deployed, not whether it built clean.
+
+Because `ci.yml` now runs on `main` only through that call, there is no longer a
+separate `ci` *workflow* run on a `main` commit — the same signal appears as the
+`ci / test` check of that commit's `Release Please` run. Pull requests are
+unchanged, and `main` carries no branch protection or ruleset that named the old
+check.
+
+**When a release is blocked**, the `Release Please` run goes red and its
+`blocked` job writes a summary saying so — that a release was withheld, and
+that nothing was tagged or dispatched. A release that simply never appears is
+its own kind of invisible, which is why the refusal is announced rather than
+implied by an absent tag.
+
+**Recovering needs nothing manual.** Push the fix to `main`; that push runs the
+workflow again and release-please picks up every commit since the last release,
+including the blocked one. The release is delayed, not lost — no re-tagging, no
+cleanup. If the failure was a genuine flake, re-running the workflow is enough,
+though fixing the flake is the better answer.
+
+One consequence worth knowing: while `main` is red, release-please does not run
+at all, so **the release PR stops updating too**. That is intended — the release
+PR describes a release that currently cannot be cut.
+
+The deploy half is deliberately *not* gated here. `deploy-signet.yml` lives in
+construct-server and could check the release commit's status independently,
+which would also cover releases cut by other means; that is a second layer and
+a different repo's change. This one stops the bad tag existing in the first
+place.

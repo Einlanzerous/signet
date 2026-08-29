@@ -15,8 +15,78 @@ permissions:
   contents: write
   pull-requests: write
 
+# Releases queue, they never cancel (SGNT-27). `build` tags, uploads a binary
+# and dispatches a deploy; a run cancelled between those steps leaves a release
+# nobody can install from. Overlapping pushes to main wait their turn instead.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  # ── The gate (SGNT-27) ────────────────────────────────────────────────────
+  #
+  # v1.7.0 was tagged, built and published with assets from a commit whose `ci`
+  # run failed. `Release Please` and `ci` were separate workflows triggered by
+  # the same push with no dependency between them, so nothing consulted the
+  # other's result and a red suite stopped neither a tag, a binary, a GitHub
+  # Release, nor the `signet-released` dispatch that offers it for deployment.
+  #
+  # That mattered more here than it would in most repos: a broken release
+  # reached the `signet-prod` approval gate wearing the same clothes as a good
+  # one, because that gate shows an approver WHAT is being deployed and not
+  # whether it built clean.
+  #
+  # Calling ci.yml rather than coordinating with it across workflows is
+  # deliberate. `workflow_run` would have worked, but it runs in a context
+  # detached from the commit that triggered it and reports a blocked release as
+  # a run that never happened. As a `needs:` edge, the suite runs against
+  # `github.sha` — the pushed commit, no head-sha subtleties — inside this run,
+  # so "why was this release blocked" is answered by opening the release's own
+  # run rather than by cross-referencing another workflow.
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  # A red suite blocks the release; this is what says so out loud. `needs: ci`
+  # alone would leave a failed run whose title is a test job — accurate, and not
+  # the same as being told that a release was withheld and what to do about it.
+  # A release that simply never appears is its own kind of invisible.
+  blocked:
+    needs: ci
+    if: failure()
+    runs-on: ubuntu-latest
+    # It reads nothing and writes nothing but its own summary. The workflow-level
+    # `contents: write` exists for release-please and the asset upload; a job that
+    # only reports a refusal has no business holding it.
+    permissions: {}
+    steps:
+      - name: Report the withheld release
+        run: |
+          {
+            echo "## Release blocked — \`ci\` failed on this commit"
+            echo
+            echo "\`${GITHUB_SHA}\` did not pass the suite, so this run stopped before"
+            echo "release-please. **No tag, no GitHub Release, no binary, and no"
+            echo "\`signet-released\` dispatch** — construct-server was never offered a"
+            echo "deploy, and the \`signet-prod\` approver will see nothing for this commit."
+            echo
+            echo "The release PR was also left un-updated: release-please did not run."
+            echo
+            echo "### Recovering"
+            echo
+            echo "Push the fix to \`main\`. That push runs this workflow again, and"
+            echo "release-please picks up every commit since the last release —"
+            echo "including the one blocked here — so the release is delayed, not lost."
+            echo "No manual re-tagging, and nothing to clean up."
+            echo
+            echo "If the failure was a flake rather than a real defect, re-running this"
+            echo "workflow is enough; prefer fixing the flake (see SGNT-26, which is how"
+            echo "this gap was found)."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error title=Release blocked::ci failed on ${GITHUB_SHA} — no tag, no release, no deploy dispatch. See the run summary."
+          exit 1
+
   release-please:
+    needs: ci
     runs-on: ubuntu-latest
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}

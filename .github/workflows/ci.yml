@@ -2,17 +2,39 @@ name: ci
 
 # Go format/vet/test + a static build check. Signet is pure Go (modernc sqlite,
 # no cgo), so there are no service containers — the whole suite runs in-process.
+#
+# ── Who runs this, and why `push: main` is gone (SGNT-27) ──────────────────
+#
+# Two callers: pull requests directly, and `release.yml`, which calls this as a
+# reusable workflow and will not tag, publish or dispatch a deploy unless it
+# passes. That gate is the whole point — v1.7.0 was tagged, built and published
+# from a commit whose `ci` run was red, because the two workflows fired on the
+# same push and neither consulted the other.
+#
+# `push: branches: [main]` was removed rather than kept alongside the call: it
+# would run this suite a second time on every push to main, in the same
+# concurrency group, for a signal `release.yml` now produces on the same commit.
+# Nothing required a check literally named `ci` on main — main carries no branch
+# protection and no ruleset — so the signal moved rather than disappeared.
 on:
   pull_request:
-  push:
-    branches: [main]
+  workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # In a called workflow the `github` context is the CALLER's, so this group is
+  # `ci-ci-…` for a pull request and `ci-Release Please-…` for the release gate.
+  # Naming the workflow keeps those apart; without it a future caller sharing a
+  # ref would land in one group with the cancellation below.
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Superseded PR runs are worth cancelling. A run the release gate is waiting
+  # on is not: cancelling it either blocks a release that should have been cut
+  # or, if the cancellation reaches the caller once `build` has started, leaves
+  # a tag whose binary was never attached. `github.event_name` is the caller's
+  # too, so this is false on the release path by construction.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
