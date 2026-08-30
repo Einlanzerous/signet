@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.9.3](https://github.com/Einlanzerous/signet/compare/v1.9.2...v1.9.3) (2026-08-30)
+
+
+### Bug Fixes
+
+* **cli:** say why a render is empty or incomplete, in every view (SGNT-45) ([#47](https://github.com/Einlanzerous/signet/issues/47)) ([8e92f39](https://github.com/Einlanzerous/signet/commit/8e92f391a104b8a1bf9eb2fdf7c6088a7ea55f7f))
+* **state:** order GHState's fingerprint tests, and answer honestly with no fingerprint (SGNT-43) ([#46](https://github.com/Einlanzerous/signet/issues/46)) ([d17378d](https://github.com/Einlanzerous/signet/commit/d17378d5a3c65bcbb25a756f4d2fb4c1824fa6ed))
+* **sync:** report a push that landed but was not recorded (SGNT-44) ([#48](https://github.com/Einlanzerous/signet/issues/48)) ([f28216c](https://github.com/Einlanzerous/signet/commit/f28216c949ba780e637180f7b54a31adadcdf961))
+
 ## [1.9.2](https://github.com/Einlanzerous/signet/compare/v1.9.1...v1.9.2) (2026-08-29)
 
 
