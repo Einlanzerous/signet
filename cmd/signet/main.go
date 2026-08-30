@@ -110,12 +110,22 @@ func main() {
 		usage(os.Stderr)
 		os.Exit(2)
 	}
-	// A child's exit status is passed through rather than collapsed into
-	// log.Fatal's 1. `signet exec -- pytest` is asked to run pytest, and a
-	// script wrapping it needs pytest's answer; reporting 1 for every non-zero
-	// exit would make the wrapper lossy in exactly the place it is transparent
-	// everywhere else. Nothing is logged either: the child has already said
-	// whatever it had to say.
+	// An exact exit status, rather than the 1 log.Fatal would collapse it to.
+	// Two reasons, three verbs — see exitError.
+	//
+	// `exec` passes a CHILD's status through: `signet exec -- pytest` is asked
+	// to run pytest, and a script wrapping it needs pytest's answer; reporting
+	// 1 for every non-zero exit would make the wrapper lossy in exactly the
+	// place it is transparent everywhere else.
+	//
+	// `sync` and `rotate` produce exitUnrecorded, where the code is signet's
+	// OWN verdict and 1 would be the wrong one — a push that reached its
+	// destination and could not be recorded needs a different response from a
+	// push that never landed.
+	//
+	// Nothing is logged for either. For `exec` the child has already said
+	// whatever it had to say; for the other two the report above the summary is
+	// the message.
 	var ec *exitError
 	if errors.As(err, &ec) {
 		os.Exit(ec.code)
@@ -1081,7 +1091,7 @@ func rotateFanOut(a *app, sec *store.Secret, dependents []store.Secret) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	pushed := 0
+	pushed, unrecorded := 0, 0
 	var stale []store.Secret
 	var renderFailed []string
 	markStale := func(sec store.Secret) {
@@ -1108,11 +1118,13 @@ func rotateFanOut(a *app, sec *store.Secret, dependents []store.Secret) error {
 		for _, r := range results {
 			if r.State == "in sync" {
 				pushed++
-				fmt.Printf("  ✓ %s → %s (%s)\n", ref, r.Repo, r.Secret)
-				// A reconciled out-of-band change is why this push was not a
-				// routine fan-out; sync reports it and so must this.
-				if r.Note != "" {
-					fmt.Printf("    note: %s\n", r.Note)
+				// Through notePush, like `sync`: a rotation is the case where an
+				// unrecorded push costs most. The value that just replaced a
+				// live credential is the one an investigator will later ask
+				// `signet audit` about, and this is the path most likely to be
+				// running unattended.
+				if !notePush(fmt.Sprintf("%s → %s (%s)", ref, r.Repo, r.Secret), &r) {
+					unrecorded++
 				}
 				continue
 			}
@@ -1144,9 +1156,8 @@ func rotateFanOut(a *app, sec *store.Secret, dependents []store.Secret) error {
 		dest := res.Dest
 		if res.State == "in sync" {
 			pushed++
-			fmt.Printf("  ✓ %s render → %s\n", t.Project, dest)
-			if res.Note != "" {
-				fmt.Printf("    note: %s\n", res.Note)
+			if !notePush(fmt.Sprintf("%s render → %s", t.Project, dest), &res) {
+				unrecorded++
 			}
 			continue
 		}
@@ -1158,8 +1169,7 @@ func rotateFanOut(a *app, sec *store.Secret, dependents []store.Secret) error {
 
 	if len(stale) > 0 || len(renderFailed) > 0 {
 		var msg strings.Builder
-		fmt.Fprintf(&msg, "rotated, but %d destination(s) did not receive the new value (%d push(es) succeeded) — the old value is still live there",
-			len(stale)+len(renderFailed), pushed)
+		msg.WriteString(rotateHeadline(len(stale)+len(renderFailed), pushed, unrecorded))
 		if len(stale) > 0 {
 			// Names the secrets whose destinations actually failed, which are
 			// not necessarily the rotated one: a derived dependent can fail on
@@ -1172,7 +1182,42 @@ func rotateFanOut(a *app, sec *store.Secret, dependents []store.Secret) error {
 		}
 		return errors.New(msg.String())
 	}
+	if unrecorded > 0 {
+		// Every destination has the new value — this is not the "old value is
+		// still live" failure above, and must not be worded as one. What is
+		// wrong is signet's account of the rotation, and the exit code says
+		// which of the two it is (see exitUnrecorded).
+		fmt.Printf("rotated and delivered, but %d push(es) were not fully recorded — the report above names each\n", unrecorded)
+		return &exitError{code: exitUnrecorded}
+	}
 	return nil
+}
+
+// rotateHeadline words the summary of a rotation whose fan-out did not fully
+// succeed. syncVerdict's counterpart, extracted for the same reason: the count
+// is the deliverable and it cannot be driven end to end without a GitHub
+// destination to push to.
+//
+// The `unrecorded` clause is what keeps the two verbs from disagreeing about
+// the mixed case. `pushed` counts a delivered-but-unrecorded push as a success
+// — it was one, the destination has the value — so stating it unqualified here
+// would be the same unmarked tick notePush stops making one line up. The exit
+// code cannot carry the distinction in this branch, because 1 wins over
+// exitUnrecorded exactly as it does for `sync`; the sentence has to.
+func rotateHeadline(undelivered, pushed, unrecorded int) string {
+	// The clause goes INSIDE the parenthesis, beside the count it qualifies.
+	// Appended after the em-dash it read as "one of the destinations that did
+	// not receive the new value", because that is the nearest antecedent and
+	// the clause it welded onto — "the old value is still live there" — is
+	// about exactly those. It means one of the pushes that SUCCEEDED, so the
+	// misreading sends an operator to investigate the failed destination when
+	// the unrecorded push is a delivered one. Found by the reviewer on #48.
+	succeeded := fmt.Sprintf("%d push(es) succeeded", pushed)
+	if unrecorded > 0 {
+		succeeded += fmt.Sprintf(", %d of them not fully recorded", unrecorded)
+	}
+	return fmt.Sprintf("rotated, but %d destination(s) did not receive the new value (%s) — the old value is still live there",
+		undelivered, succeeded)
 }
 
 // ---- derive -----------------------------------------------------------------
@@ -3208,6 +3253,113 @@ func runTargetRm(args []string) error {
 
 // ---- sync -------------------------------------------------------------------
 
+// ── A push that landed but was not recorded (SGNT-44) ──────────────────────
+//
+// PushResult.AuditErr and StateErr exist so that an unrecorded mutation of a
+// live destination is not silent. Both were set by internal/sync and read by
+// nobody in this package: `grep -rn AuditErr cmd/` returned nothing. A push that
+// reached GitHub and wrote none of its ledger entries printed a `✓`, counted as
+// a success, and exited 0. The only trace was a log.Printf on stderr, which a
+// deploy script is usually redirecting.
+//
+// That is REVIEW.md's named shape — "a path that returns success because nothing
+// explicitly failed" — landing on the vault's own audit guarantee. store.Mutate
+// exists so a change the ledger cannot record does not happen; a push to GitHub
+// is the one mutation that cannot be rolled back when the ledger refuses, so
+// being loud is the only guarantee left.
+
+// exitUnrecorded is the exit status of a run whose pushes all reached their
+// destinations but could not all be written to signet's own records.
+//
+// Distinct from 1 — and this is the whole reason it exists — because the two
+// demand OPPOSITE responses from a deploy script. A transport failure means the
+// destination does not have the value: stop, the environment is not ready. An
+// unrecorded push means it does: continuing is correct, and aborting the deploy
+// over it would be acting on the wrong fact. Collapsing them into 1 makes the
+// script do the wrong thing in whichever case it was not written for.
+//
+// Non-zero rather than a printed warning because a deploy script has no other
+// way to notice, which is the same argument `render --check`'s exit code
+// already carries. Exiting 0 leaves the ledger's guarantee enforceable by a
+// human's eyes alone.
+//
+// 1 still wins when a run has both: something not reaching its destination is
+// the more urgent fact, and the report above the summary names each one.
+const exitUnrecorded = 3
+
+// pushRecordGaps names what a DELIVERED push failed to write to signet's own
+// records, in the order an operator would act on them. Empty for a push that
+// was fully recorded, which is the overwhelming majority.
+//
+// Delivered only, and the qualifier is not decoration: recordPush is called
+// from both branches and sets StateErr in either, so a push GitHub REFUSED can
+// also fail to record — leaving last_state and last_error holding what they
+// held before the attempt, and a later `status` showing a currency without the
+// failure that explains it. Nothing here reads that; it is SGNT-48, and it is a
+// different report (the `✗` line already carries the transport error, so the
+// question is what the record should say, not what the terminal should).
+//
+// The two are kept apart because they cost different things. A missing ledger
+// entry means `signet audit --secret <ref>` will not show this disclosure — the
+// chain has a hole where a credential left the vault, and the question the
+// ledger exists to answer ("where has this credential been") now returns an
+// incomplete answer with no sign that it is incomplete. A missing target-state
+// write means GHState compares against a version or digest the destination no
+// longer holds, so the target reports a currency nobody has established, and
+// nothing later corrects it.
+func pushRecordGaps(r *syncpkg.PushResult) []string {
+	var gaps []string
+	if r.AuditErr != "" {
+		gaps = append(gaps, "NOT IN THE LEDGER — "+r.AuditErr+
+			" (the value left the vault; `signet audit` will not show it)")
+	}
+	if r.StateErr != "" {
+		gaps = append(gaps, "TARGET STATE NOT UPDATED — "+r.StateErr+
+			" (this destination will report the currency it had before this push)")
+	}
+	return gaps
+}
+
+// notePush prints one push that reached its destination and reports whether
+// signet fully recorded it.
+//
+// subject is the caller's own description of what went where. The four call
+// sites — `sync` and `rotate` each push both single secrets and rendered blobs
+// — name a destination TWO ways: `project/NAME → repo (SECRET)` for a secret
+// and `<project> render → <dest>` for a blob. The two verbs assemble the first
+// from different pieces (`rotate` holds the ref already joined, `sync` has the
+// project and name apart), which is why the subject is passed in rather than
+// composed here from a PushResult.
+//
+// Everything after the subject is the same claim in all four, which is exactly
+// why it lives here: the `✓` means "done and accounted for", and there were
+// four places able to make it and none checking. REVIEW.md's first defect class
+// is a guarantee added at one call site while the others keep the old
+// behaviour.
+func notePush(subject string, r *syncpkg.PushResult) bool {
+	gaps := pushRecordGaps(r)
+	if len(gaps) == 0 {
+		fmt.Printf("  ✓ %s\n", subject)
+	} else {
+		// Not a `✓`. The push did land, and the line says so — hiding that
+		// would be its own dishonesty, since the destination really does hold
+		// the new value and an operator who re-runs on that belief is right.
+		// But an unqualified tick is the claim this whole change exists to stop
+		// making.
+		fmt.Printf("  ! %s — DELIVERED, NOT FULLY RECORDED\n", subject)
+	}
+	// A reconciled out-of-band change is why this push was not a routine
+	// fan-out. Printed for both outcomes: it describes the delivery, which
+	// happened either way.
+	if r.Note != "" {
+		fmt.Printf("    note: %s\n", r.Note)
+	}
+	for _, g := range gaps {
+		fmt.Printf("    %s\n", g)
+	}
+	return len(gaps) == 0
+}
+
 func runSync(args []string) error {
 	fs := flag.NewFlagSet("sync", flag.ExitOnError)
 	ref := fs.String("secret", "", "only sync this secret (project/NAME)")
@@ -3287,7 +3439,7 @@ func runSync(args []string) error {
 		return checkRenders(a, renderTargets)
 	}
 
-	pushed, failed := 0, 0
+	pushed, failed, unrecorded := 0, 0, 0
 	// The credential is resolved inside this guard, not above it: the fallback
 	// decrypts the vault's root credential, and doing that for a run with no
 	// destinations would record an authentication that never happened.
@@ -3309,9 +3461,8 @@ func runSync(args []string) error {
 			for _, r := range results {
 				if r.State == "in sync" {
 					pushed++
-					fmt.Printf("  ✓ %s/%s → %s (%s)\n", toSync[i].Project, toSync[i].Name, r.Repo, r.Secret)
-					if r.Note != "" {
-						fmt.Printf("    note: %s\n", r.Note)
+					if !notePush(fmt.Sprintf("%s/%s → %s (%s)", toSync[i].Project, toSync[i].Name, r.Repo, r.Secret), &r) {
+						unrecorded++
 					}
 				} else {
 					failed++
@@ -3356,9 +3507,8 @@ func runSync(args []string) error {
 			}
 			if res.State == "in sync" {
 				pushed++
-				fmt.Printf("  ✓ %s render → %s\n", t.Project, res.Dest)
-				if res.Note != "" {
-					fmt.Printf("    note: %s\n", res.Note)
+				if !notePush(fmt.Sprintf("%s render → %s", t.Project, res.Dest), &res) {
+					unrecorded++
 				}
 				continue
 			}
@@ -3371,11 +3521,52 @@ func runSync(args []string) error {
 			}
 		}
 	}
-	fmt.Printf("sync complete: %d pushed, %d failed\n", pushed, failed)
-	if failed > 0 {
+	summary, code := syncVerdict(pushed, failed, unrecorded)
+	fmt.Println(summary)
+	switch code {
+	case 1:
+		// os.Exit rather than a returned exitError: this is the pre-existing
+		// path, and changing how it exits is not what this ticket is for.
 		os.Exit(1)
+	case exitUnrecorded:
+		// Returned rather than os.Exit'd so the run's deferred close still
+		// happens and the command stays drivable from a test. main exits with
+		// the code and logs nothing — the report above is the message.
+		return &exitError{code: exitUnrecorded}
 	}
 	return nil
+}
+
+// syncVerdict turns a run's counts into what the terminal says and what the
+// process exits with.
+//
+// Extracted so the rule has one home and can be checked without a GitHub
+// destination to push to: the summary line and the exit code are the two things
+// SGNT-44 had to decide, and a decision that can only be exercised by talking to
+// api.github.com is a decision nothing will notice changing.
+//
+// The precedence is the part worth stating. A run with both a failure and an
+// unrecorded push exits 1, because "something did not reach its destination" is
+// the more urgent fact and the one whose response — stop the deploy — is right
+// for both. The report above the summary names every case individually, so the
+// code being a single number loses nothing an operator needs.
+//
+// The third count appears only when non-zero, unlike the two that are the
+// outcome of every push. A permanent ", 0 not fully recorded" trains the eye to
+// skip the position where the number matters, which is the failure SGNT-31
+// named for the render warning.
+func syncVerdict(pushed, failed, unrecorded int) (summary string, exitCode int) {
+	summary = fmt.Sprintf("sync complete: %d pushed, %d failed", pushed, failed)
+	if unrecorded > 0 {
+		summary += fmt.Sprintf(", %d not fully recorded", unrecorded)
+	}
+	switch {
+	case failed > 0:
+		return summary, 1
+	case unrecorded > 0:
+		return summary, exitUnrecorded
+	}
+	return summary, 0
 }
 
 // renderTargetsToSync selects the rendered targets a run covers. An unfiltered
