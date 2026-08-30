@@ -240,7 +240,11 @@ func TestRenderCheckReportsAnIncompleteRender(t *testing.T) {
 	if !strings.Contains(out, "INCOMPLETE") || !strings.Contains(out, "PENDING") {
 		t.Fatalf("check did not report the unresolvable key:\n%s", out)
 	}
-	if !strings.Contains(out, "sync will refuse this target") {
+	// The promise, not the phrasing: since SGNT-45 this sentence is produced
+	// once (renderConditionReason) and printed by all four views, so pinning
+	// its exact words here would pin three other views' output through a test
+	// that names only this one.
+	if !strings.Contains(out, "sync will refuse") {
 		t.Fatalf("check does not say what happens next:\n%s", out)
 	}
 }
@@ -735,7 +739,7 @@ func TestRenderWriteSendsANeverPushedTargetToTheAgainstCheck(t *testing.T) {
 // word an all-clear and suppress the suggestion — this bug exactly, one state
 // along, which is how it would come back.
 func TestAnUnknownRenderStateIsNotReportedAsAnAllClear(t *testing.T) {
-	note := renderedTargetNote(&store.Target{}, "refused")
+	note := renderedTargetNote(&store.Target{}, answered("refused"))
 	if !note.wantsSync {
 		t.Fatal("an unrecognized state suppressed the sync suggestion")
 	}

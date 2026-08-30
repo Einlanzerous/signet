@@ -1524,7 +1524,8 @@ func runRender(args []string) error {
 			if err != nil {
 				return err
 			}
-			note := renderedTargetNote(&renderTargets[i], renderState(&renderTargets[i], cfg, want, a.key))
+			state, _ := renderState(&renderTargets[i], cfg, want, a.key)
+			note := renderedTargetNote(&renderTargets[i], state)
 			if note.wantsSync {
 				undelivered++
 			}
@@ -1566,14 +1567,26 @@ type renderNote struct {
 // same conditions — EMPTY, INCOMPLETE, never pushed — so that an operator
 // grepping a terminal for one of them finds both commands rather than whichever
 // they happened to run.
-func renderedTargetNote(t *store.Target, state string) renderNote {
+func renderedTargetNote(t *store.Target, s shownState) renderNote {
+	state := s.judged
 	switch state {
 	case "empty":
-		return renderNote{text: "EMPTY — this target manages no keys, so sync will refuse it rather than deliver an empty environment"}
+		// The reason comes from renderState rather than being written again
+		// here. It used to be a literal, and `render --check` held a second one
+		// a few words different — two views wording one refusal two ways, which
+		// is what routing them through one function is supposed to prevent
+		// (SGNT-45).
+		return renderNote{text: "EMPTY — " + s.reason}
 	case "incomplete":
 		return renderNote{
-			text: "INCOMPLETE — managed key(s) have no value in the vault, so sync will refuse it",
-			hint: "signet render --project %s --check    # names them",
+			text: "INCOMPLETE — " + s.reason,
+			// The keys are named in the reason above; what --check can add is
+			// why one of them has no value. Qualified, because for a key that
+			// is simply unset it adds nothing — resolveInto skips
+			// resolve.ErrNoVersion, so such a key reaches neither `want` nor
+			// `problems` and gets no detail line. Promising more than that
+			// sends the operator at a command with nothing further to say.
+			hint: "signet render --project %s --check    # says why, where a key has more than \"not set\" behind it",
 		}
 	case "never":
 		// Not "stale", which would claim this render made it so — it has never
@@ -1868,11 +1881,21 @@ func printRenderCheck(t *store.Target, project string, want map[string]string, p
 	}
 	fmt.Printf("%s → %s (%d keys)\n", project, cfg.Destination(), len(cfg.Keys))
 
-	if len(cfg.Keys) == 0 {
+	// renderState rather than an inline GHState or a second key-set inspection:
+	// `status`, `target list`, this report and the note at the end of a write
+	// all answer "is this destination current?", and a second copy of the
+	// answer is how they come to disagree. This view held that second copy
+	// until SGNT-45 — its own `len(cfg.Keys) == 0` test, its own missing-key
+	// loop, and its own wording for both — which is why the other two printed
+	// the bare state word: there was nothing shared to print.
+	state, refusal := renderState(t, cfg, want, key)
+
+	var empty *syncpkg.EmptyRenderError
+	if errors.As(refusal, &empty) {
 		// No diff is worth printing against a target that manages nothing: it
 		// would list the reference file's every key as one that would be
 		// dropped, which is true and useless.
-		fmt.Printf("  EMPTY — this target manages no keys, so sync will refuse it rather than deliver an empty environment\n")
+		fmt.Printf("  EMPTY — %s\n", state.reason)
 		fmt.Printf("    signet target add-key --project %s --gh-secret %s --name NAME\n", project, cfg.SecretName)
 		return true, nil
 	}
@@ -1881,37 +1904,29 @@ func printRenderCheck(t *store.Target, project string, want map[string]string, p
 	// Reported before any diff, because an incomplete render is not a
 	// difference of opinion with the reference file — it is a push that will be
 	// refused whatever the reference says.
-	var missing []string
-	for _, k := range cfg.Keys {
-		if _, ok := want[k]; !ok {
-			missing = append(missing, k)
-		}
-	}
-	if len(missing) > 0 {
+	var incomplete *syncpkg.MissingKeysError
+	if errors.As(refusal, &incomplete) {
 		blocking = true
-		sort.Strings(missing)
-		fmt.Printf("  INCOMPLETE — %d managed key(s) have no value in the vault, so sync will refuse this target:\n", len(missing))
-		for _, k := range missing {
-			reason := "no value set"
+		fmt.Printf("  INCOMPLETE — %s\n", state.reason)
+		// What this view adds that the one-line note cannot: why a particular
+		// key has no value. Only keys with an actual explanation are listed —
+		// a bare "no value set" beside a name the line above already printed
+		// tells the reader nothing, and burying the two derivations that ARE
+		// broken among ninety-three of those is how the detail stops being
+		// read.
+		for _, k := range incomplete.Keys {
 			if err, broken := problems[k]; broken {
-				reason = err.Error()
+				fmt.Printf("    %-40s %s\n", k, err)
 			}
-			fmt.Printf("    %-40s %s\n", k, reason)
 		}
 	} else {
-		// renderState rather than an inline GHState: `status`, this report and
-		// the note at the end of a write all answer "is this destination
-		// current?", and a second copy of the answer is how they would come to
-		// disagree. The branches above have already excluded the two states it
-		// reports that this one words for itself.
-		state := renderState(t, cfg, want, key)
-		fmt.Printf("  state: %s\n", markState(t, answered(state)))
+		fmt.Printf("  state: %s\n", markState(t, state))
 		// Not a table, so the reason goes directly under the state it explains
 		// rather than into a footnote. `drift` on a refused target is the case
 		// this exists for: true about currency, silent about the decision that
 		// caused it.
-		if stateHidesItsReason(t, state) {
-			fmt.Printf("    %s\n", stateReason(t))
+		if reason := stateReasonFor(t, state); reason != "" {
+			fmt.Printf("    %s\n", reason)
 		}
 	}
 
@@ -2776,7 +2791,8 @@ func runTargetList(args []string) error {
 			if wantSecret != nil {
 				owner = t.Project + "/" + wantSecret.Name
 			}
-			emit(&t, owner, t.Kind, cfg.Destination(), answered(renderState(&t, cfg, want, a.key)), t.LastPushedAt)
+			state, _ := renderState(&t, cfg, want, a.key)
+			emit(&t, owner, t.Kind, cfg.Destination(), state, t.LastPushedAt)
 
 		case "file":
 			// File targets belong to a project rather than one secret, so a
@@ -2851,10 +2867,20 @@ func anyUnresolved(d syncpkg.FileDrift, problems map[string]error) bool {
 // The marker and the sentence live here, once, because three views print them
 // and REVIEW.md's first defect class is what happens when a rule like that is
 // applied at one call site.
+//
+// SGNT-45 added the second source a state's reason can come from — a condition
+// derived from the vault rather than a decision quoted from the last push — and
+// put it behind the same marker, for the same reason. stateReasonFor is where
+// the two meet.
 
 // stateHidesItsReason reports whether the state word withholds a reason the
-// target is still carrying — the one predicate the mark and the note both key
-// off, so they cannot disagree about when to fire.
+// target is still carrying in LastError.
+//
+// It answers for QUOTED reasons only. Since SGNT-45 there is a second kind —
+// one derived from the target's present condition, carried on shownState — and
+// stateReasonFor is what combines them. That is the predicate the mark and the
+// note both key off now, so they cannot disagree about when to fire; this
+// function is one of its two inputs.
 //
 // It turns on the STATE, not on LastError. That field is a historical record:
 // `UpdateTargetPush`'s prov == nil branch writes it and nothing clears it short
@@ -2934,11 +2960,14 @@ func anyUnresolved(d syncpkg.FileDrift, problems map[string]error) bool {
 //
 //	never, in sync    the refusal is genuinely over — the vault and the
 //	                  destination agree, or have never disagreed.
-//	empty, incomplete conditions rather than history, so a stale reason would
-//	                  mislead. Only `render --check` spells them out; `target
-//	                  list` and `status` print the bare word, which is this
-//	                  ticket's own complaint one state over and is tracked as
-//	                  SGNT-45 rather than fixed here.
+//	empty, incomplete conditions rather than history. They carry a reason —
+//	                  every view has printed one since SGNT-45 — but a DERIVED
+//	                  one, recomputed from the vault as it stands, which never
+//	                  passes through LastError and so is not this function's to
+//	                  answer for. See renderConditionReason and stateReasonFor.
+//	                  They were once listed here as deliberate exceptions that
+//	                  showed no reason at all; that was this ticket's own
+//	                  complaint one state over, and it is no longer true.
 //
 // `unresolved` is not in this list because it is not a state GHState produces —
 // see shownState, which keeps the layer's answer under the substitution.
@@ -2973,6 +3002,22 @@ func stateHidesItsReason(t *store.Target, state string) bool {
 type shownState struct {
 	shown  string
 	judged string
+	// reason is a note DERIVED from the target's present condition rather than
+	// recovered from its push history (SGNT-45).
+	//
+	// The two sources cannot be merged into one. A history reason lives in
+	// LastError, outlives the decision it records, and is therefore gated on
+	// the state — see stateHidesItsReason. A derived one is recomputed on every
+	// view from the vault as it stands, so it is true by construction and needs
+	// no gate: `empty` and `incomplete` have no LastError to quote, because
+	// nothing was ever attempted.
+	//
+	// It rides on shownState rather than being passed beside it so that the
+	// mark and the note keep reading one value, which is what this type exists
+	// for. Adding a second parameter to markState and add would have made a
+	// caller able to mark a row and collect no note — the exact false alarm the
+	// pairing was introduced to make unrepresentable.
+	reason string
 }
 
 // answered wraps a state the layer produced, with nothing substituted.
@@ -2981,7 +3026,33 @@ func answered(state string) shownState { return shownState{shown: state, judged:
 // substituting puts a call site's own word in the column while keeping the
 // layer's answer for the mark and the note.
 func (s shownState) substituting(word string) shownState {
-	return shownState{shown: word, judged: s.judged}
+	return shownState{shown: word, judged: s.judged, reason: s.reason}
+}
+
+// because attaches a reason derived from the target's present condition.
+func (s shownState) because(reason string) shownState {
+	return shownState{shown: s.shown, judged: s.judged, reason: reason}
+}
+
+// stateReasonFor answers what, if anything, belongs under a row showing this
+// state — the single predicate the mark and the note both read, so that a
+// marked row without a note (or a note with no marked row to explain) stays
+// unrepresentable across BOTH sources of a reason.
+//
+// A derived reason wins over a quoted one, though today nothing produces both:
+// the states that carry history are the ones GHState answers, and the states
+// that carry a condition are answered before GHState is reached. The precedence
+// is stated rather than left to chance because the derived reason is the one
+// recomputed from current state, and a stale quotation should never displace it
+// if a future state does carry both.
+func stateReasonFor(t *store.Target, s shownState) string {
+	if s.reason != "" {
+		return s.reason
+	}
+	if stateHidesItsReason(t, s.judged) {
+		return stateReason(t)
+	}
+	return ""
 }
 
 // markState appends a marker to a state whose reason the word does not carry.
@@ -2991,7 +3062,7 @@ func (s shownState) substituting(word string) shownState {
 // values. It means "there is a reason, and it is printed below" — see
 // stateNotes.
 func markState(t *store.Target, s shownState) string {
-	if !stateHidesItsReason(t, s.judged) {
+	if stateReasonFor(t, s) == "" {
 		return s.shown
 	}
 	return s.shown + "*"
@@ -3015,7 +3086,8 @@ type stateNotes struct {
 // a note without a marked row to explain is the same false alarm as a marked
 // row without a note.
 func (n *stateNotes) add(t *store.Target, dest string, s shownState) {
-	if !stateHidesItsReason(t, s.judged) {
+	reason := stateReasonFor(t, s)
+	if reason == "" {
 		return
 	}
 	if n.seen == nil {
@@ -3025,7 +3097,7 @@ func (n *stateNotes) add(t *store.Target, dest string, s shownState) {
 		return
 	}
 	n.seen[dest] = true
-	n.lines = append(n.lines, fmt.Sprintf("  * %s — %s", dest, stateReason(t)))
+	n.lines = append(n.lines, fmt.Sprintf("  * %s — %s", dest, reason))
 }
 
 // print writes the collected notes, if any. Callers flush their table first:
@@ -3070,26 +3142,79 @@ func stateReason(t *store.Target) string {
 	return "the last push failed: " + t.LastError
 }
 
-// renderState reduces a rendered target's drift to one word.
+// renderConditionReason words a refusal a render would raise right now, for the
+// note under a table (SGNT-45).
+//
+// `empty` and `incomplete` are the two states whose word is a CONDITION rather
+// than a verdict about currency, and the reason for them cannot come from
+// LastError: nothing was attempted, so there is no history to quote. It has to
+// be derived — which is the whole difference from the states SGNT-35 covered,
+// and the reason those two were left printing bare in `target list` and
+// `status` when the rest gained a reason.
+//
+// Derived from RenderBlob's typed refusal rather than from a second inspection
+// of the key set, because RenderBlob is the layer that owns "is this render
+// deliverable, and if not why" — it is what `sync` will refuse with, so a view
+// that reasons about the condition separately is a view that can come to
+// disagree with the command it is predicting. `render --check` had exactly that
+// shape: its own `len(cfg.Keys) == 0` test and its own missing-key loop, with
+// its own wording beside them.
+//
+// The wording is here rather than reused verbatim from the errors themselves
+// because these two read as a note under a row: the destination is already on
+// the row, and the errors name it again for a reader who has only the error.
+//
+// The fallback is not decoration. RenderBlob returns only these two today, and
+// a third that arrived without a branch here would otherwise print nothing at
+// all — an unexplained mark, which is the false alarm the mark exists to avoid.
+func renderConditionReason(err error) string {
+	var empty *syncpkg.EmptyRenderError
+	if errors.As(err, &empty) {
+		return "the target manages no keys, so sync will refuse it rather than deliver an empty environment — " +
+			"attach them with `signet target add-key`"
+	}
+	var missing *syncpkg.MissingKeysError
+	if errors.As(err, &missing) {
+		return fmt.Sprintf("%d managed key(s) have no value in the vault, so sync will refuse it: %s — "+
+			"set them, or drop them from the target", len(missing.Keys), strings.Join(missing.Keys, ", "))
+	}
+	return err.Error()
+}
+
+// renderState reduces a rendered target's drift to one word — and, when that
+// word reports a condition rather than a verdict about currency, the refusal
+// that produced it.
 //
 // The blob is delivered and compared whole, so there is no per-key state to
 // report: every key it carries shares the destination's currency. What a single
 // key can do is stop the whole render — a managed key the vault cannot supply
 // makes the next push a refusal, and "incomplete" says that before a sync
 // discovers it rather than after.
-func renderState(t *store.Target, cfg store.GHRenderConfig, want map[string]string, key []byte) string {
-	if len(cfg.Keys) == 0 {
-		// Distinct from "incomplete": nothing is missing, the target simply has
-		// no keys yet. Sync refuses it either way, but the fix is a different
-		// one and reporting both as incomplete would send the reader looking
-		// for a value that was never asked for.
-		return "empty"
-	}
+//
+// The refusal is returned alongside the word, not only worded into it, because
+// `render --check` prints a per-key breakdown of a MissingKeysError that a
+// one-line note cannot carry. Handing it back here is what stops that view
+// calling RenderBlob a second time and reasoning about the answer on its own —
+// four views answer "is this destination current?" and they route through this
+// function precisely so they cannot come to disagree.
+//
+// Callers that only display a state ignore it; the shownState already carries
+// everything a mark or a note needs.
+func renderState(t *store.Target, cfg store.GHRenderConfig, want map[string]string, key []byte) (shownState, error) {
 	content, err := syncpkg.RenderBlob(cfg, t.Project, want)
 	if err != nil {
-		return "incomplete"
+		// Distinct words for the two refusals: nothing is missing from an empty
+		// target, it simply has no keys yet. Sync refuses it either way, but
+		// the fix is a different one and reporting both as incomplete would
+		// send the reader looking for a value that was never asked for.
+		word := "incomplete"
+		var empty *syncpkg.EmptyRenderError
+		if errors.As(err, &empty) {
+			word = "empty"
+		}
+		return answered(word).because(renderConditionReason(err)), err
 	}
-	return t.GHState(nil, vault.ValueDigest(key, content))
+	return answered(t.GHState(nil, vault.ValueDigest(key, content))), nil
 }
 
 // fileState reduces a file target's drift to one word. With key set it reports
@@ -3667,7 +3792,7 @@ func runStatus(args []string) error {
 	}
 	type renderInfo struct {
 		cfg   store.GHRenderConfig
-		state string
+		state shownState
 		// Carried so the TARGETS column can mark a state whose reason the word
 		// does not hold, and name it below the table — see markState.
 		target *store.Target
@@ -3702,7 +3827,8 @@ func runStatus(args []string) error {
 			if err != nil {
 				return err
 			}
-			renderByProject[p] = append(renderByProject[p], renderInfo{cfg, renderState(&rts[i], cfg, want, a.key), &rts[i]})
+			state, _ := renderState(&rts[i], cfg, want, a.key)
+			renderByProject[p] = append(renderByProject[p], renderInfo{cfg, state, &rts[i]})
 		}
 	}
 
@@ -3758,8 +3884,8 @@ func runStatus(args []string) error {
 				continue
 			}
 			dest := ri.cfg.Repo + dotted(ri.cfg.Environment) + "→" + ri.cfg.SecretName
-			tgt = append(tgt, fmt.Sprintf("gh-render:%s [%s]", dest, markState(ri.target, answered(ri.state))))
-			notes.add(ri.target, dest, answered(ri.state))
+			tgt = append(tgt, fmt.Sprintf("gh-render:%s [%s]", dest, markState(ri.target, ri.state)))
+			notes.add(ri.target, dest, ri.state)
 		}
 		for _, fi := range fileByProject[sec.Project] {
 			if !fi.cfg.Manages(sec.Name) {

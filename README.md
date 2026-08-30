@@ -532,10 +532,38 @@ them: a target whose last push failed, on a secret that has *also* stopped
 resolving, would otherwise print a bare word and put the push failure back
 where only `signet audit` could reach it.
 
-`empty` and `incomplete` are unmarked because they are conditions rather than
-history. Note that only `render --check` currently spells them out; `target
-list` and `status` print the bare word, which is this section's own complaint
-one state over and is tracked as SGNT-45 rather than addressed here.
+`empty` and `incomplete` are marked too, from a **second source**. Their reason
+cannot be quoted from `LastError` — nothing was attempted, so there is no
+history to quote — so it is *derived* on every view from the vault as it stands:
+the keys a target manages but the vault cannot supply, or the fact that it
+manages none. Being recomputed rather than recalled, a derived reason is true by
+construction and needs no gate; the history reasons above need one precisely
+because they outlive the decision they record.
+
+One place produces the sentence, so `target list`, `status`, `render --check`
+and the note at the end of a `render` cannot describe one refusal two ways —
+the same property the quoted reasons have. It is the sentence `sync` itself
+would refuse with:
+
+```
+$ signet target list --project construct-server
+SECRET                     KIND       DESTINATION                        STATE        LAST SYNCED
+construct-server (3 keys)  gh-render  o/r · home-server · PROD_ENV_FILE  incomplete*  -
+
+  * o/r · home-server · PROD_ENV_FILE — 1 managed key(s) have no value in the
+    vault, so sync will refuse it: PENDING — set them, or drop them from the target
+```
+
+`render --check` prints that same sentence and then adds what a one-line note
+cannot: *why* a particular key has no value, for the keys that have an
+explanation beyond not being set.
+
+**One exception, and it is not about reasons.** `signet status` builds its
+`TARGETS` column per secret, attaching a rendered target to a row only when it
+carries that key. A target that manages *no* keys manages no secret, so `status`
+does not show it at all — in any state, with or without a reason. `target list`
+does. Tracked as **SGNT-46**, which is a change to that table's shape rather
+than to what a state says.
 
 **The table keeps its five columns.** A reason is free text of unbounded length
 — the shrink guard's runs to three lines — and a column for it would make every
