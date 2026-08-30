@@ -288,9 +288,9 @@ func TestAResolvedRefusalStopsBeingReported(t *testing.T) {
 }
 
 // And the predicate itself, at both boundaries: `error` always hides its
-// reason, `drift` only when a refusal is what put it there, and nothing else
-// ever does.
-func TestOnlyErrorAndARefusedDriftHideTheirReason(t *testing.T) {
+// reason, `drift` and `unknown` only when a refusal is what put them there, and
+// nothing else ever does.
+func TestOnlyErrorAndARefusedDriftOrUnknownHideTheirReason(t *testing.T) {
 	refused := &store.Target{LastState: store.TargetRefused, LastError: "boom"}
 	errored := &store.Target{LastState: "error", LastError: "boom"}
 	clean := &store.Target{LastState: "in sync"}
@@ -305,13 +305,16 @@ func TestOnlyErrorAndARefusedDriftHideTheirReason(t *testing.T) {
 		// The states a resolved refusal lands in. These are the regression.
 		{refused, "never", false},
 		{refused, "in sync", false},
-		// `unknown` is currently UNREACHABLE from GHState — its two tests are
-		// in the wrong order, so the branch is dead (SGNT-43). Pinned anyway,
-		// and flagged: when that is fixed, a target refused after a
-		// pre-fingerprint push lands here with a live refusal and this
-		// expectation becomes wrong. It is a decision to revisit with that
-		// fix, not a property to rely on.
-		{refused, "unknown", false},
+		// `unknown` — the expectation flipped with SGNT-43. It was pinned
+		// false while the branch was dead, flagged as a decision to revisit
+		// rather than a property to rely on, and this is that revisit: a
+		// target that recorded nothing to compare and is then refused lands
+		// here carrying a LIVE refusal, so suppressing the reason would be
+		// worse than in `drift`, where it is at least sometimes stale.
+		//
+		// No push path writes that row — GHState owns that claim; this is the
+		// answer if one ever does. See stateHidesItsReason's own note.
+		{refused, "unknown", true},
 		// Conditions rather than history, so a stale reason would mislead.
 		{refused, "empty", false},
 		{refused, "incomplete", false},

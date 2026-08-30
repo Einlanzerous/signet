@@ -483,11 +483,38 @@ ways. A **refusal** reads as `the last push attempt was declined` and a **failur
 as `last push failed`, because the two are different facts: after a refusal the
 deployed environment is intact and stale, and after a failure that is not known.
 
-**Only two states are marked** — `error`, and `drift` on a target whose last
-push was refused. The recorded reason outlives the refusal (nothing clears it
-short of a later successful push), so marking on its presence alone would show
-an operator who *fixed* a refusal a `never*` or `in sync*` still quoting the
-refusal they just fixed, at the moment they were checking whether the fix took.
+**Only three states are marked** — `error`, and `drift` or `unknown` on a
+target whose last push was refused. The recorded reason outlives the refusal
+(nothing clears it short of a later successful push), so marking on its presence
+alone would show an operator who *fixed* a refusal a `never*` or `in sync*`
+still quoting the refusal they just fixed, at the moment they were checking
+whether the fix took.
+
+`unknown` is on that list as a **guard, not a state you will see** — and the
+caveat comes first because everything after it is conditional. **No push path
+writes a row that reaches it:** every success path that writes a row `GHState`
+answers fills one of the two fingerprint columns, and every refusal or failure
+leaves the timestamp alone. (`render`'s file-target write fills neither and does
+set the timestamp — but file targets are answered by `fileState`, and `GHState`
+is never called on one. `GHState`'s own doc enumerates the writers in full, so
+the claim can be audited rather than trusted.)
+It is kept because the alternative is answering `drift` — a definite claim —
+off a column nobody wrote, which is the assumption `GHState` exists to refuse.
+A future push path that leaves a fingerprint unwritten gets the honest answer
+instead of inheriting the confident one.
+
+If one ever does, the word means *delivered once, with nothing recorded to
+compare* — signet cannot say whether the destination is current. A refusal
+leaves those columns untouched, so such a target that is then refused would
+carry a refusal **still in force**, and suppressing the reason under a word that
+already admits it cannot tell you anything would leave nothing to act on. That
+is why it is marked.
+
+It is deliberately narrow. An empty fingerprint alone is not enough: a target
+that recorded a **version id** was delivered a stored value, so if that secret
+is derived now the destination provably holds something the vault has replaced,
+and that is reported as `drift` — which is the one shape here a real vault does
+hold, reached by `derive --replace` on a secret with an existing target.
 
 **A reason is history, and is worded as history.** Nothing recomputes whether it
 still holds, so a `drift*` note can name a condition already fixed — set the key
@@ -508,7 +535,7 @@ where only `signet audit` could reach it.
 `empty` and `incomplete` are unmarked because they are conditions rather than
 history. Note that only `render --check` currently spells them out; `target
 list` and `status` print the bare word, which is this section's own complaint
-one state over and is not addressed here.
+one state over and is tracked as SGNT-45 rather than addressed here.
 
 **The table keeps its five columns.** A reason is free text of unbounded length
 — the shrink guard's runs to three lines — and a column for it would make every

@@ -1599,7 +1599,31 @@ func renderedTargetNote(t *store.Target, state string) renderNote {
 		}
 		return renderNote{text: "now stale", wantsSync: true}
 	case "unknown":
-		return renderNote{text: "delivered once, before signet recorded fingerprints — currency unknown until the next push", wantsSync: true}
+		// Carries its reason for the same case `drift` does, and by the same
+		// rule: a refusal is still in force, and nothing about an unrecorded
+		// fingerprint resolves it — so this is the view where suppressing it
+		// would cost the most, since the state word says only that signet
+		// cannot tell.
+		//
+		// The wording says nothing about how the row got here. If this ever
+		// fires it will be because a FUTURE push path left a fingerprint
+		// unwritten — see GHState, which owns the reachability claim — so
+		// naming an era would send the operator looking for the wrong thing and
+		// away from the push that failed to record.
+		//
+		// Inline rather than marked: this view prints prose and no state word,
+		// so there is nothing for a `*` to attach to.
+		//
+		// The internal break is a semicolon so the composed form takes the same
+		// shape as `drift`'s above — one em-dash introducing the reason, one
+		// colon inside it. With an em-dash here too, appending a reason put
+		// three clauses on two dashes; with a colon here, the sentence ended up
+		// with two colons.
+		const unrecorded = "delivered once, with nothing recorded to compare; currency unknown until the next push"
+		if stateHidesItsReason(t, state) {
+			return renderNote{text: fmt.Sprintf("%s — %s", unrecorded, stateReason(t)), wantsSync: true}
+		}
+		return renderNote{text: unrecorded, wantsSync: true}
 	case "error":
 		// The reason is carried rather than summarized. This was once the only
 		// place in the CLI that printed it — `status`, `target list` and
@@ -2842,18 +2866,24 @@ func anyUnresolved(d syncpkg.FileDrift, problems map[string]error) bool {
 // #44, and it is the failure this whole change is supposed to avoid rather than
 // commit.
 //
-// Only two states hide a reason:
+// Three states hide a reason:
 //
-//	error   GHState returns it only when LastError is non-empty, so the reason
-//	        is guaranteed present and the word never says what it was.
-//	drift   the refusal case. GHState routes a declined push here deliberately,
-//	        so the word is true about currency and silent about the decision.
+//	error    GHState returns it only when LastError is non-empty, so the reason
+//	         is guaranteed present and the word never says what it was.
+//	drift    the refusal case. GHState routes a declined push here deliberately,
+//	         so the word is true about currency and silent about the decision.
+//	unknown  the same refusal, on a target that recorded nothing to compare.
+//	         A row NO push path writes — GHState owns that claim and enumerates
+//	         the writers; do not restate the shape here, which is how three
+//	         copies of it went stale at once. Added by SGNT-43 as a guard; see
+//	         the decision below.
 //
-// The LastState test on `drift` is a restatement, not a filter: GHState returns
-// `error` whenever LastError is set and LastState is not `refused`, so inside
-// this branch the two are already equivalent. It is spelled out because the
-// reader of this function is asking which states can carry a reason, and
-// "refused pushes land in drift" is the non-obvious half of the answer.
+// The LastState test on `drift` and `unknown` is a restatement, not a filter:
+// GHState returns `error` whenever LastError is set and LastState is not
+// `refused`, so inside those branches the two are already equivalent. It is
+// spelled out because the reader of this function is asking which states can
+// carry a reason, and "refused pushes land in drift" is the non-obvious half of
+// the answer.
 //
 // ── What this does NOT do, and cannot ──────────────────────────────────────
 //
@@ -2872,25 +2902,43 @@ func anyUnresolved(d syncpkg.FileDrift, problems map[string]error) bool {
 // now. Recomputing currency would mean re-deriving each refusal kind here, and
 // the transport failures behind `error` cannot be re-derived at all.
 //
-// The other states are excluded for two different reasons, and conflating them
-// is how the last version of this comment got `unknown` backwards.
+// ── Why `unknown` is in the list (SGNT-43) ─────────────────────────────────
+//
+// It was excluded, on the stated grounds that currency is unrecorded there. The
+// exclusion was written while the state was UNREACHABLE — `GHState` compared
+// the digest before testing whether there was one, so the branch was dead.
+// Nothing had ever been shown under it, so nothing tested the reasoning.
+//
+// The case is decided the other way here, because the combination the state
+// admits is the one this whole mechanism exists for: a target that recorded
+// nothing to compare and is then REFUSED keeps both fingerprint columns empty
+// (`refuse` passes prov == nil, so UpdateTargetPush leaves them alone) and
+// lands here carrying a refusal that is still in force. Excluding it would
+// suppress the reason for a live refusal — the exact failure SGNT-35 was filed
+// about, one state over, and strictly worse than the `drift` case because there
+// the reason is at least sometimes stale.
+//
+// The original argument was not wrong about the state, only about which
+// question it answered. "Currency is unrecorded" is a fact about the DIGEST; it
+// says nothing about whether the last push decision is worth showing. The two
+// were conflated because no case forced them apart.
+//
+// Reachability, stated plainly: no push path writes a row that reaches
+// `unknown` — see GHState's own enumeration of the writers. So this decision,
+// like the state, is a guard. It is made now rather than left because the
+// alternative is a documented exclusion whose stated reason has already been
+// shown to be the wrong question, sitting in wait for whichever future push
+// path produces the row.
+//
+// The other states stay excluded:
 //
 //	never, in sync    the refusal is genuinely over — the vault and the
 //	                  destination agree, or have never disagreed.
-//	unknown           NOT that. `targets.go` introduces it as "delivered once,
-//	                  before signet recorded fingerprints — currency unknown
-//	                  until the next push", and renderedTargetNote's branch for
-//	                  it returns wantsSync. It is excluded because currency is
-//	                  UNRECORDED, not because anything is settled. It is also
-//	                  currently unreachable (see SGNT-43) — the moment it is
-//	                  not, a target refused after a pre-fingerprint push would
-//	                  land here carrying a LIVE refusal, and this exclusion
-//	                  would be wrong. Revisit it with that fix, not after.
 //	empty, incomplete conditions rather than history, so a stale reason would
 //	                  mislead. Only `render --check` spells them out; `target
 //	                  list` and `status` print the bare word, which is this
-//	                  ticket's own complaint one state over and is not fixed
-//	                  here.
+//	                  ticket's own complaint one state over and is tracked as
+//	                  SGNT-45 rather than fixed here.
 //
 // `unresolved` is not in this list because it is not a state GHState produces —
 // see shownState, which keeps the layer's answer under the substitution.
@@ -2901,7 +2949,7 @@ func stateHidesItsReason(t *store.Target, state string) bool {
 	switch state {
 	case "error":
 		return true
-	case "drift":
+	case "drift", "unknown":
 		return t.LastState == store.TargetRefused
 	}
 	return false

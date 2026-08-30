@@ -183,20 +183,41 @@ func (t *Target) GHState(cur *Version, digest string) string {
 	// was reachable only from `signet audit`, which requires already suspecting
 	// a refusal happened.
 	//
-	// It is true now, for the two states that hide a reason — this one, when
-	// LastState is `refused`, and `error`. Three CLI views mark them with a
-	// trailing `*` and print the reason: under the table for `signet status`
-	// and `signet target list`, beneath the state for `signet render --check`.
-	// The fourth, the note at the end of a `render`, prints no state word at
-	// all — it is prose — so it carries the reason inline instead. The mirror's
-	// TargetView carries LastError as its own field, as it always did.
+	// It is true now, for the three states that hide a reason — this one and
+	// `unknown`, when LastState is `refused`, and `error`. Three CLI views mark
+	// them with a trailing `*` and print the reason: under the table for
+	// `signet status` and `signet target list`, beneath the state for `signet
+	// render --check`. The fourth, the note at the end of a `render`, prints no
+	// state word at all — it is prose — so it carries the reason inline
+	// instead. The mirror's TargetView carries LastError as its own field, as
+	// it always did.
 	//
-	// The qualifier is load-bearing and is the whole sentence's honesty: no
-	// other state is marked, because LastError outlives the refusal it records
-	// — nothing clears it short of a later successful push — so an operator who
-	// fixes a refusal would otherwise see `never*` or `in sync*` still quoting
-	// it. Whoever changes those views owns keeping this true; it is the
-	// justification for the branch below, not decoration on it.
+	// The qualifier is load-bearing and is the whole sentence's honesty, so it
+	// is worth saying which states are excluded and why rather than only
+	// counting them. LastError outlives the refusal it records — nothing clears
+	// it short of a later successful push — so `never` and `in sync` are NOT
+	// marked: an operator who fixes a refusal would otherwise see `never*` or
+	// `in sync*` still quoting the refusal they just fixed. `unknown` is marked
+	// for the opposite reason (SGNT-43): nothing about an unrecorded
+	// fingerprint resolves a refusal, so one that landed there — IF a push path
+	// ever produces such a row; see the banner in the switch below, which is
+	// this comment's own retraction of the shape — would still be in force,
+	// while the state word says only that signet cannot tell.
+	//
+	// `empty` and `incomplete` are not marked and are not decided here at all —
+	// renderState answers those two before GHState is reached. Only
+	// `render --check` explains them, inline in printRenderCheck; the other
+	// views print the bare word. That is SGNT-45, not this.
+	//
+	// Whoever changes those views owns keeping this list true; it is the
+	// justification for the branch below, not decoration on it. The count was
+	// wrong for one review round after SGNT-43 made the branch live — the
+	// README and stateHidesItsReason were updated and this, the copy that
+	// presents the count as the justification, was not. It went wrong a second
+	// time because the grep that swept the correction through was tuned to one
+	// phrasing and this paragraph used another: when a claim like this changes,
+	// grep for the SUBJECT (`unknown`) and read every hit, not for the sentence
+	// you remember writing.
 	if t.LastError != "" && t.LastState != TargetRefused {
 		return "error"
 	}
@@ -204,18 +225,88 @@ func (t *Target) GHState(cur *Version, digest string) string {
 	case t.LastPushedAt == "":
 		return "never"
 	case digest != "":
+		// "Is there a fingerprint at all" is asked BEFORE the comparison, and
+		// the order is the whole correctness of this branch. A delivery that
+		// recorded no fingerprint has an empty LastPushedDigest, so
+		// `"" != digest` is trivially true — put the comparison first and every
+		// such target reports `drift`, a definite claim that the destination is
+		// stale made on the strength of a column nobody wrote. The two tests
+		// were in that order until SGNT-43, which made `unknown` dead code and
+		// put the wrong answer in its place.
+		//
+		// Saying "in sync" about it would be the same unchecked claim in the
+		// other direction. It is a real state: delivered once, currency unknown
+		// until the next push writes a fingerprint.
+		//
+		// An empty digest here does NOT mean currency is unrecorded. A STORED
+		// secret's push records no digest — resolve leaves Resolved.Digest
+		// empty for one, since its currency is answered by the version id — so
+		// converting that secret with `derive --replace` starts supplying a
+		// digest to compare against fingerprints the earlier pushes never
+		// wrote. The version id is what says so: PushSecret writes it only when
+		// r.Version != nil and PushRender never writes it, so inside this
+		// branch — where the secret resolves to a digest and is therefore
+		// derived NOW — a non-empty one means the last delivery was of a stored
+		// version the vault has since replaced. That is this function's own
+		// definition of drift, reached without a digest to compare.
+		//
+		// ── `unknown` is DEFENSIVE. Nothing writes a row that reaches it. ────
+		//
+		// Reaching it needs last_pushed_at set with BOTH fingerprint columns
+		// empty, and no signet has ever written that combination:
+		//
+		//   - UpdateTargetPush is the only writer of any last_pushed_* column,
+		//     and it sets last_pushed_at only for a non-empty pushedAt.
+		//   - Every prov == nil call site is a failure or a refusal, and each
+		//     passes pushedAt == "" — so none of them creates the row.
+		//   - The success paths always fill one column: resolve.Current returns
+		//     a Version or a Digest and never neither, and PushRender's digest
+		//     is a ValueDigest, never empty.
+		//   - `render`'s file-target loop does pass an empty provenance with a
+		//     timestamp — but file targets are answered by fileState, and
+		//     GHState is never called on one.
+		//
+		// Nor is there an archaeology population. Migrations 003 (derivation)
+		// and 004 (this column) shipped in the SAME commit, 70afeae (#23), so
+		// there was never a signet in which a derived secret existed and the
+		// digest column did not; and before it every successful push wrote
+		// cur.ID, so every pre-004 row carries a version id. An earlier version
+		// of this comment claimed that population, and it does not exist.
+		//
+		// The branch is kept anyway, and the ordering fixed, because the
+		// alternative is answering `drift` — a definite claim — off a column
+		// nobody wrote. That is the assumption this function exists to refuse
+		// (see the doc above), and a future push path that leaves the digest
+		// unwritten would inherit it silently. This is the answer if one ever
+		// does. It is not a bug being fixed today.
+		if t.LastPushedDigest == "" {
+			if t.LastPushedVersionID != "" {
+				return "drift"
+			}
+			return "unknown"
+		}
 		if t.LastPushedDigest != digest {
 			return "drift"
 		}
-		// A push that predates the digest column has nothing to compare, and
-		// saying "in sync" about it would be the same unchecked claim in a new
-		// place. It is a real state: delivered once, currency unknown until the
-		// next push writes a fingerprint.
-		if t.LastPushedDigest == "" {
-			return "unknown"
-		}
 		return "in sync"
 	case cur != nil && t.LastPushedVersionID != cur.ID:
+		// No emptiness guard here, and that is deliberate — this branch is NOT
+		// the mirror of the one above (asked for by the review on #46, and it
+		// would have been a regression).
+		//
+		// An empty version id here is EVIDENCE, not its absence. Reaching this
+		// branch means the secret resolves to a version and is therefore stored
+		// NOW; the column is cleared only by a push of a DERIVED value, because
+		// the provenance branch writes `last_pushed_version_id = NULLIF(?, '')`
+		// and a derived push supplies "". So an empty one means the destination
+		// holds a composed blob that a `derive --clear` has since replaced with
+		// a stored value — the vault has provably moved on, and `drift` is the
+		// right answer rather than "signet cannot tell".
+		//
+		// That is the exact mirror of the narrowing above, one conversion the
+		// other way: there a version id proves a stored delivery to a
+		// now-derived secret, here an empty one proves a derived delivery to a
+		// now-stored secret. Both are drift, and both are reachable.
 		return "drift" // vault moved on; destination holds an old version
 	default:
 		return "in sync"
