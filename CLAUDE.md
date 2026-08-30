@@ -153,6 +153,12 @@ The pattern is a path that returns success because nothing explicitly failed:
 - a preflight that probed the read and let the write fail later (SGNT-29)
 - a render that succeeded while leaving the environment holding values the file
   no longer had (SGNT-20)
+- a push that reached GitHub, wrote none of its ledger entries, printed a `✓`
+  and exited 0 — `PushResult.AuditErr` existed for exactly this and no CLI
+  caller read it (SGNT-44). Note the shape: the field was not missing, the
+  reasoning was not absent, and its own doc said "surfaced rather than
+  swallowed". Nothing surfaced it. A guarantee expressed as a struct field is
+  one until something reads it.
 
 Ask of any new path: what does this print when it goes wrong, and does the exit
 code say so? `render --check` returns non-zero specifically so a deploy script

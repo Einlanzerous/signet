@@ -140,7 +140,14 @@ func TestDroppedKeysIgnoresOrderAndReportsOnlyLosses(t *testing.T) {
 // gh-render target pointed at srv.
 func renderFixture(t *testing.T, baseURL string, keys []string, values map[string]string) (*store.Store, []byte, *store.Target) {
 	t.Helper()
-	st, err := store.Open(filepath.Join(t.TempDir(), "db"))
+	return renderFixtureAt(t, filepath.Join(t.TempDir(), "db"), baseURL, keys, values)
+}
+
+// renderFixtureAt is renderFixture at a caller-chosen path, for the tests that
+// need a second connection to the same database — see refuseWrites.
+func renderFixtureAt(t *testing.T, path, baseURL string, keys []string, values map[string]string) (*store.Store, []byte, *store.Target) {
+	t.Helper()
+	st, err := store.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -17,14 +17,23 @@ import (
 	"github.com/Einlanzerous/signet/internal/store"
 )
 
-// exitError carries a child process's exit status back to main, which exits
-// with it rather than with the 1 that log.Fatal would produce.
+// exitError carries a specific exit status back to main, which exits with it
+// rather than with the 1 that log.Fatal would produce — and without logging,
+// because a command returning one has already printed its own report.
 //
-// `exec` is the one verb whose exit code is not its own verdict: the caller
-// asked to run a command, and a script wrapping `signet exec -- pytest` needs
-// pytest's answer, not signet's opinion of it. Returned rather than
-// os.Exit'd at the call site so the command stays drivable from a test, which
-// is the same trade `render --check` makes with errRenderCheckBlocked.
+// Two reasons, three verbs — the reasons are what divide, and counting the
+// verbs instead sends a reader looking for one fewer producer than there is.
+//
+// `exec` is the one whose exit code is not its own verdict: the caller asked to
+// run a command, and a script wrapping `signet exec -- pytest` needs pytest's
+// answer, not signet's opinion of it.
+//
+// `sync` and `rotate` both use it for exitUnrecorded, where the code IS the
+// verdict and 1 would be the wrong one — see that constant.
+//
+// Returned rather than os.Exit'd at the call site so the command stays drivable
+// from a test, which is the same trade `render --check` makes with
+// errRenderCheckBlocked.
 type exitError struct{ code int }
 
 func (e *exitError) Error() string { return fmt.Sprintf("command exited %d", e.code) }

@@ -592,6 +592,51 @@ path, so attaching both would make the deployed value depend on which ran last
 while each reported itself in sync. `target add` refuses the second one,
 whichever kind it is, naming what already holds the destination.
 
+### A push that landed but was not recorded exits **3**
+
+Delivering to GitHub is the one mutation signet cannot roll back when the ledger
+refuses it: `store.Mutate` exists so a change the ledger cannot record does not
+happen, and that guarantee stops at the network. So the fallback is that it must
+be **loud** — which it was not. A push that reached GitHub and wrote none of its
+ledger entries printed a `✓`, counted as a success and exited 0; the only trace
+was a line on stderr, which a deploy script is usually redirecting.
+
+`sync` and `rotate` now qualify the line and count it:
+
+```
+  ✓ construct-server/API_TOKEN → o/r (API_TOKEN)
+  ! construct-server render → o/r · home-server · PROD_ENV_FILE — DELIVERED, NOT FULLY RECORDED
+    NOT IN THE LEDGER — database is locked (the value left the vault; `signet audit` will not show it)
+sync complete: 2 pushed, 0 failed, 1 not fully recorded
+```
+
+The delivery is still reported, because it really happened — an operator told
+this *failed* would re-run a push that has already changed a live environment.
+What is wrong is signet's account of it. Two things can be, and they cost
+different things:
+
+| | consequence |
+|---|---|
+| **ledger entry** | `signet audit --secret <ref>` will not show this disclosure. The chain has a hole where a credential left the vault, and nothing marks it as incomplete. |
+| **target state** | `GHState` compares against a version or digest the destination no longer holds, so the target reports a currency nobody established — and nothing later corrects it. |
+
+**Exit 3, not 1**, and that is the whole point of having it. The two demand
+opposite responses from a deploy script: a transport failure means the
+destination does **not** have the value, so stop — the environment is not ready.
+An unrecorded push means it **does**, so continuing is correct and aborting the
+deploy would be acting on the wrong fact. Collapsing them into 1 makes the script
+do the wrong thing in whichever case it was not written for. A run with both
+exits 1, since the undelivered push is the more urgent of the two and its
+response is right for both.
+
+The count appears in the summary only when it is non-zero. A permanent
+", 0 not fully recorded" trains the eye to skip the position where the number
+matters, which is the failure the render warning had (SGNT-31).
+
+The HTTP mirror never had this gap: `internal/api` serializes the whole
+`PushResult`, so a caller has always seen `audit_error` and `state_error` in the
+JSON. It was only the CLI that dropped them.
+
 ### The repository grant is a manual step, so signet checks it early
 
 The PAT is fine-grained: every new repo must be added to its **repository list**
