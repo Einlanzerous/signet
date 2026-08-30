@@ -204,10 +204,11 @@ func (t *Target) GHState(cur *Version, digest string) string {
 	// this comment's own retraction of the shape — would still be in force,
 	// while the state word says only that signet cannot tell.
 	//
-	// `empty` and `incomplete` are not marked and are not decided here at all —
-	// renderState answers those two before GHState is reached. Only
-	// `render --check` explains them, inline in printRenderCheck; the other
-	// views print the bare word. That is SGNT-45, not this.
+	// `empty` and `incomplete` carry a reason too, but not from here — they are
+	// answered by renderState before GHState is reached, and their reason is
+	// DERIVED from the vault as it stands rather than quoted from LastError
+	// (SGNT-45). cmd/signet's stateReasonFor is where the two sources join, and
+	// renderConditionReason is the one place that words the derived one.
 	//
 	// Whoever changes those views owns keeping this list true; it is the
 	// justification for the branch below, not decoration on it. The count was
