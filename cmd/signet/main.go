@@ -4112,6 +4112,12 @@ func runStatus(args []string) error {
 		//
 		// Emitted after the project's own rows: ListSecrets orders by project,
 		// so a change of project — or the end of the list — is that boundary.
+		//
+		// Which is also this fix's limit, stated here so the next reader does
+		// not have to discover it: a project with no secrets has no rows, so
+		// the boundary never fires and its targets are never fetched — the
+		// project set above is built from the secrets too. Such a target is
+		// still invisible here (SGNT-49).
 		if i+1 == len(secrets) || secrets[i+1].Project != sec.Project {
 			for _, ri := range renderByProject[sec.Project] {
 				if shownRenders[ri.target.ID] {

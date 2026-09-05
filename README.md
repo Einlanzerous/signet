@@ -582,6 +582,13 @@ A row rather than a line under the table, because a note with no marked row to
 explain is the same false alarm as a marked row with no note. With a row, the
 mark and the note come from the same two functions every other state uses.
 
+**One case is still missing**, and it is the same omission by a different route:
+`status` builds its project list from the secrets it lists, so a project whose
+*only* content is a rendered target has no rows at all and the target is not
+reached — which is reachable, since `target add --render-as-secret` on a fresh
+project succeeds with an empty key set. `target list` shows it. Tracked as
+**SGNT-49**.
+
 **The table keeps its five columns.** A reason is free text of unbounded length
 — the shrink guard's runs to three lines — and a column for it would make every
 row as wide as the worst refusal, in the two views whose job is scanning many

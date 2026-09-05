@@ -12,15 +12,23 @@ import (
 // env file containing nothing.
 func seedEmptyRender(t *testing.T, st *store.Store) {
 	t.Helper()
+	seedEmptyRenderFor(t, st, "demo", "PROD_ENV_FILE")
+}
+
+// seedEmptyRenderFor is seedEmptyRender for a named project, so a test can build
+// more than one of them. Each destination must differ: one GitHub secret can be
+// claimed by only one target.
+func seedEmptyRenderFor(t *testing.T, st *store.Store, project, ghSecret string) {
+	t.Helper()
 	// A populated project, so this is a target that manages nothing rather than
 	// a vault that holds nothing — those are different conditions and only the
 	// first is `empty`.
-	seedProject(t, st, "demo", map[string]string{"ALPHA": "a"})
+	seedProject(t, st, project, map[string]string{"ALPHA": "a"})
 	// Added through the store with a nil key set, which is the state `target
 	// add --render-as-secret` leaves when there is no file target to seed from,
 	// and the state a target reaches when its last key is dropped.
 	if _, err := st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
-		tgt, err := m.AddGHRenderTarget("demo", "o/r", "home-server", "PROD_ENV_FILE", nil)
+		tgt, err := m.AddGHRenderTarget(project, "o/r", "home-server", ghSecret, nil)
 		if err != nil {
 			return store.AuditRecord{}, err
 		}
@@ -384,6 +392,59 @@ func TestStatusShowsARenderTargetThatManagesNoSecret(t *testing.T) {
 	// the project's own.
 	if !strings.Contains(out, "ALPHA") {
 		t.Errorf("`status` lost the project's secrets:\n%s", out)
+	}
+}
+
+// The row is emitted at a project boundary in a list ordered by project, which
+// is the one piece of new logic a single-project fixture cannot exercise at all:
+// a boundary that fires late files a target under the next project's rows, and
+// one that fires early would drop a target that a later secret in the same
+// block matches.
+//
+// Three projects, so the middle one has a boundary on both sides and the last
+// exercises the end of the list rather than a change of project.
+func TestStatusFilesEachEmptyRenderTargetUnderItsOwnProject(t *testing.T) {
+	st := newCLIVault(t)
+	seedEmptyRenderFor(t, st, "aaa", "AAA_ENV_FILE")
+	seedProject(t, st, "mmm", map[string]string{"BETA": "b"})
+	seedEmptyRenderFor(t, st, "zzz", "ZZZ_ENV_FILE")
+
+	out := captureStdout(t, func() {
+		if err := runStatus(nil); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	for _, tc := range []struct{ project, ghSecret string }{
+		{"aaa", "AAA_ENV_FILE"},
+		{"zzz", "ZZZ_ENV_FILE"},
+	} {
+		rows := 0
+		for _, l := range strings.Split(out, "\n") {
+			if strings.Contains(l, tc.ghSecret) && strings.Contains(l, "(0 keys)") {
+				rows++
+				if !strings.HasPrefix(l, tc.project) {
+					t.Errorf("%s's empty target is filed under another project:\n%s", tc.project, l)
+				}
+			}
+		}
+		if rows != 1 {
+			t.Errorf("%s's empty target got %d rows, want 1:\n%s", tc.project, rows, out)
+		}
+	}
+
+	// In project order, which is what says the boundary fired in the right
+	// place rather than merely firing: aaa's target before mmm's only secret,
+	// and mmm's before zzz's target.
+	aaa, mmm, zzz := strings.Index(out, "AAA_ENV_FILE"), strings.Index(out, "BETA"), strings.Index(out, "ZZZ_ENV_FILE")
+	if !(aaa < mmm && mmm < zzz) {
+		t.Errorf("the rows are not in project order, so a boundary fired against the wrong block:\n%s", out)
+	}
+
+	// Both targets are marked, so both reasons must have been collected — the
+	// pairing stateNotes.add exists to hold, across projects.
+	if n := strings.Count(out, "  * "); n != 2 {
+		t.Errorf("%d notes under the table, want one per marked row (2):\n%s", n, out)
 	}
 }
 
