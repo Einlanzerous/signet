@@ -558,12 +558,29 @@ construct-server (3 keys)  gh-render  o/r · home-server · PROD_ENV_FILE  incom
 cannot: *why* a particular key has no value, for the keys that have an
 explanation beyond not being set.
 
-**One exception, and it is not about reasons.** `signet status` builds its
-`TARGETS` column per secret, attaching a rendered target to a row only when it
-carries that key. A target that manages *no* keys manages no secret, so `status`
-does not show it at all — in any state, with or without a reason. `target list`
-does. Tracked as **SGNT-46**, which is a change to that table's shape rather
-than to what a state says.
+**A target that manages no keys gets a row of its own.** `signet status` builds
+its `TARGETS` column per secret, attaching a rendered target to a row only when
+it carries that key — so a target managing *no* keys was attached to nothing and
+left the view entirely, in every state, with or without a reason. That is the
+omission `empty` could least afford: it is the refusal whose blob would be
+applied in full. Such a target is now listed after its project's rows, with the
+key count standing where a secret name would — the notation `target list`
+already uses to name a rendered target as a subject rather than a secret:
+
+```
+$ signet status
+PROJECT  SECRET    VHASH    STATUS  EXPIRES  TARGETS
+demo     ALPHA     #dc9ad8  active  -        file:/etc/demo/.env [in sync]
+demo     (0 keys)  -        -       -        gh-render:o/r·home-server→PROD_ENV_FILE [empty*]
+
+  * o/r·home-server→PROD_ENV_FILE — the target manages no keys, so sync will
+    refuse it rather than deliver an empty environment — attach them with
+    `signet target add-key`
+```
+
+A row rather than a line under the table, because a note with no marked row to
+explain is the same false alarm as a marked row with no note. With a row, the
+mark and the note come from the same two functions every other state uses.
 
 **The table keeps its five columns.** A reason is free text of unbounded length
 — the shrink guard's runs to three lines — and a column for it would make every
