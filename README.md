@@ -590,10 +590,14 @@ and both showing in `target list`:
   reached. Reachable: `target add --render-as-secret` on a fresh project
   succeeds with an empty key set. Tracked as **SGNT-49**.
 - A **file** target that manages no keys is attached by the same `Manages` gate
-  one loop below, and leaves the view the same way. Tracked as **SGNT-50**. It
-  is the milder of the two: a 0-key file render merges nothing, so no deployed
-  environment is shortened by it — which is why `EmptyRenderError`, and this
-  paragraph, are about rendered targets.
+  one loop below, and leaves the view the same way. Tracked as **SGNT-50**. A
+  plain `render` of one merges nothing, so it shortens no deployed environment
+  — which is why `EmptyRenderError`, and this paragraph, are about rendered
+  targets. `render --prune` is the exception and it is not a small one: a target
+  that manages nothing makes *every* key in the file unmanaged, so `--prune`
+  empties it. That deletion is loud where it happens — the render names the keys
+  it deleted, and `--check --prune` previews them — but it is loud in a view
+  other than the one that omits the target.
 
 **The table keeps its five columns.** A reason is free text of unbounded length
 — the shrink guard's runs to three lines — and a column for it would make every
