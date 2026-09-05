@@ -441,25 +441,86 @@ func TestAddKeyRefusesWhenTheNamedEnvironmentDoesNotMatch(t *testing.T) {
 	}
 }
 
+// breakDerivation turns an existing secret into a derived one whose input does
+// not exist, writing through the store rather than through `signet derive`.
+//
+// The CLI cannot build this state: runDerive validates its inputs up front, and
+// TestDeriveRejectsAnUnresolvableTemplate pins that it does. A real vault
+// reaches it the other way round — the derivation was valid when written, and
+// the input was removed afterwards — which is exactly the state `--check`
+// exists to survive and report on. Same shape as seedBrokenDerivation.
+func breakDerivation(t *testing.T, st *store.Store, project, name, template string) {
+	t.Helper()
+	sec, err := st.GetSecret(project, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sec == nil {
+		t.Fatalf("no secret %s/%s to break", project, name)
+	}
+	if _, err := st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
+		if err := m.SetDerivation(sec.ID, template); err != nil {
+			return store.AuditRecord{}, err
+		}
+		return store.AuditRecord{
+			Actor: "test", Action: "secret.derive", SecretID: sec.ID, Details: "fixture",
+			EventKind: store.KindSecretWrite, ActorRole: store.RoleHuman,
+			Status: &store.AuditStatus{Outcome: store.OutcomeUpdated},
+		}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // --check resolves leniently so it survives the state it reports on. That must
 // not turn an unresolvable secret into ordinary drift: `render` still refuses
-// to write, so reporting "changed" promises a repair that will not happen.
+// to write, so reporting the key as "changed" promises a repair that will not
+// happen.
+//
+// The key is absent from `want` rather than wrong in it, so the drift check
+// compares the file against an absent value as though it were an empty one and
+// calls the key "changed" — printDrift's problems lookup is the only thing
+// standing between that comparison and the report.
 func TestRenderCheckReportsUnresolvableSecretsAsSuchNotAsDrift(t *testing.T) {
 	st := newCLIVault(t)
-	path := seedProject(t, st, "csrv", map[string]string{"ALPHA": "a"})
-	if err := runSet([]string{"--project", "csrv", "--name", "PW", "--generate"}); err != nil {
-		t.Fatal(err)
+	path := seedProject(t, st, "csrv", map[string]string{"ALPHA": "a", "DSN": "postgres://u:pw@h/db"})
+	breakDerivation(t, st, "csrv", "DSN", "postgres://u:{{csrv/GONE}}@h/db")
+
+	out := captureStdout(t, func() {
+		if err := runRender([]string{"--project", "csrv", "--check"}); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	// Scoped to the file's own report. `render --check` prints a project-wide
+	// "cannot be resolved" section first, which names DSN too — an unscoped
+	// assertion passes on that alone and pins nothing about the drift report,
+	// which is how this test came to check nothing at all (SGNT-47).
+	report := reportFor(t, out, path)
+
+	if !strings.Contains(report, "unresolved") {
+		t.Fatalf("the file's report does not mark DSN as unresolvable:\n%s", report)
 	}
-	if err := runTargetAddKey([]string{"--project", "csrv", "--path", path, "--name", "PW"}); err != nil {
-		t.Fatal(err)
+	if strings.Contains(report, "changed") {
+		t.Errorf("a secret that could not be resolved was reported as ordinary drift, "+
+			"which promises a repair `signet render` would refuse to make:\n%s", report)
 	}
-	// A derivation whose input does not exist: resolvable yesterday, broken now.
-	if err := runDerive([]string{
-		"--project", "csrv", "--name", "DSN", "--from", "postgres://u:{{csrv/GONE}}@h/db",
-	}); err == nil {
-		// If derive validates its inputs up front this path is unavailable;
-		// fall back to breaking an existing derivation below.
-		t.Log("derive accepted a missing input")
+}
+
+// The other half of the same guard, and the more dangerous half: a managed key
+// holding the empty string matches an unresolvable secret's absent value
+// exactly, so every key reads "ok" and the honest-looking answer is "in sync".
+// That is a clean bill of health for a project `render` will not write at all.
+func TestRenderCheckDoesNotCallAFileInSyncWhileAKeyIsUnresolvable(t *testing.T) {
+	st := newCLIVault(t)
+	path := seedProject(t, st, "csrv", map[string]string{"ALPHA": "a", "DSN": "postgres://u:pw@h/db"})
+	breakDerivation(t, st, "csrv", "DSN", "postgres://u:{{csrv/GONE}}@h/db")
+	// Rewritten after the import so the file agrees with every value the vault
+	// can still produce: ALPHA matches, and DSN — which now resolves to nothing
+	// — is empty. Nothing here is "changed", so nothing but the unresolved
+	// secret can make this report anything other than clean.
+	if err := os.WriteFile(path, []byte("ALPHA=a\nDSN=\n"), 0o600); err != nil {
+		t.Fatal(err)
 	}
 
 	out := captureStdout(t, func() {
@@ -467,11 +528,27 @@ func TestRenderCheckReportsUnresolvableSecretsAsSuchNotAsDrift(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
-	// Whatever the project's state, the check must never claim a key is merely
-	// "changed" when its value could not be computed at all.
-	if strings.Contains(out, "cannot be resolved") && !strings.Contains(out, "unresolved") {
-		t.Fatalf("unresolvable secrets reported without marking the affected keys:\n%s", out)
+
+	report := reportFor(t, out, path)
+	if strings.Contains(report, "in sync") {
+		t.Fatalf("a file was called in sync while one of its keys could not be resolved:\n%s", report)
 	}
+	if !strings.Contains(report, "unresolved") {
+		t.Errorf("the file is not reported in sync, but its report does not say which key "+
+			"could not be resolved:\n%s", report)
+	}
+}
+
+// reportFor returns the slice of a `render --check` run's output that belongs to
+// one file target, so an assertion cannot be satisfied by the project-wide
+// section printed above it.
+func reportFor(t *testing.T, out, path string) string {
+	t.Helper()
+	i := strings.Index(out, path+":")
+	if i < 0 {
+		t.Fatalf("`render --check` printed no report for %s:\n%s", path, out)
+	}
+	return out[i:]
 }
 
 // A gh-actions target and a gh-render target can name the same GitHub secret,
