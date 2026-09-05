@@ -4029,7 +4029,10 @@ func runStatus(args []string) error {
 	// table. The column already packs several destinations into one cell; free
 	// text belongs nowhere near it.
 	var notes stateNotes
-	for _, sec := range secrets {
+	// Which rendered targets reached a row. A target that manages no keys
+	// reaches none, and until SGNT-46 that meant it left the view entirely.
+	shownRenders := map[string]bool{}
+	for i, sec := range secrets {
 		cur, digest, derr := a.ghDrift(&sec)
 		// A derived secret shows what it is composed from where a stored one
 		// shows its version hash. It has no version — and after a --replace
@@ -4077,6 +4080,7 @@ func runStatus(args []string) error {
 			dest := ri.cfg.Repo + dotted(ri.cfg.Environment) + "→" + ri.cfg.SecretName
 			tgt = append(tgt, fmt.Sprintf("gh-render:%s [%s]", dest, markState(ri.target, ri.state)))
 			notes.add(ri.target, dest, ri.state)
+			shownRenders[ri.target.ID] = true
 		}
 		for _, fi := range fileByProject[sec.Project] {
 			if !fi.cfg.Manages(sec.Name) {
@@ -4091,6 +4095,47 @@ func runStatus(args []string) error {
 			tgt = []string{"-"}
 		}
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", sec.Project, sec.Name, vhash, sec.Status, expires, strings.Join(tgt, ", "))
+
+		// A rendered target that manages no keys belongs to no secret's row, so
+		// the loop above never reaches it — and `status` showed a clean table
+		// for the one refusal internal/sync/render.go calls the more urgent of
+		// the two: the blob an `empty` target would deliver is a complete,
+		// well-formed env file containing nothing, which the consumer applies
+		// in full. The view an operator reaches for when something is wrong was
+		// the view that could not report it (SGNT-46).
+		//
+		// Given a row of its own rather than a footnote, because stateNotes.add
+		// rules the cheap fix out: a note without a marked row to explain is
+		// the same false alarm as a marked row without a note. With a row, the
+		// mark and the note come from markState and notes.add exactly as they
+		// do for every other state, and cannot come to disagree.
+		//
+		// Emitted after the project's own rows: ListSecrets orders by project,
+		// so a change of project — or the end of the list — is that boundary.
+		//
+		// Which is also this fix's limit, stated here so the next reader does
+		// not have to discover it: a project with no secrets has no rows, so
+		// the boundary never fires and its targets are never fetched — the
+		// project set above is built from the secrets too. Such a target is
+		// still invisible here (SGNT-49).
+		if i+1 == len(secrets) || secrets[i+1].Project != sec.Project {
+			for _, ri := range renderByProject[sec.Project] {
+				if shownRenders[ri.target.ID] {
+					continue
+				}
+				// The key count stands where a secret name would, which is how
+				// `target list` already names a rendered target as a subject
+				// rather than as a secret. It says what is true of any target
+				// that reaches this line: today only an empty one can, since
+				// add-key refuses a key with no secret behind it and nothing
+				// can be un-managed (SGNT-39), but the count does not become a
+				// false statement if that ever changes.
+				dest := ri.cfg.Repo + dotted(ri.cfg.Environment) + "→" + ri.cfg.SecretName
+				fmt.Fprintf(w, "%s\t(%d keys)\t-\t-\t-\tgh-render:%s [%s]\n",
+					sec.Project, len(ri.cfg.Keys), dest, markState(ri.target, ri.state))
+				notes.add(ri.target, dest, ri.state)
+			}
+		}
 	}
 	if err := w.Flush(); err != nil {
 		return err
