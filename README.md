@@ -558,14 +558,14 @@ construct-server (3 keys)  gh-render  o/r · home-server · PROD_ENV_FILE  incom
 cannot: *why* a particular key has no value, for the keys that have an
 explanation beyond not being set.
 
-**A target that manages no keys gets a row of its own.** `signet status` builds
-its `TARGETS` column per secret, attaching a rendered target to a row only when
-it carries that key — so a target managing *no* keys was attached to nothing and
-left the view entirely, in every state, with or without a reason. That is the
-omission `empty` could least afford: it is the refusal whose blob would be
-applied in full. Such a target is now listed after its project's rows, with the
-key count standing where a secret name would — the notation `target list`
-already uses to name a rendered target as a subject rather than a secret:
+**A rendered target that manages no keys gets a row of its own.** `signet
+status` builds its `TARGETS` column per secret, attaching a rendered target to a
+row only when it carries that key — so a target managing *no* keys was attached
+to nothing and left the view entirely, in every state, with or without a reason.
+That is the omission `empty` could least afford: it is the refusal whose blob
+would be applied in full. Such a target is now listed after its project's rows,
+with the key count standing where a secret name would — the notation `target
+list` already uses to name a rendered target as a subject rather than a secret:
 
 ```
 $ signet status
@@ -582,12 +582,18 @@ A row rather than a line under the table, because a note with no marked row to
 explain is the same false alarm as a marked row with no note. With a row, the
 mark and the note come from the same two functions every other state uses.
 
-**One case is still missing**, and it is the same omission by a different route:
-`status` builds its project list from the secrets it lists, so a project whose
-*only* content is a rendered target has no rows at all and the target is not
-reached — which is reachable, since `target add --render-as-secret` on a fresh
-project succeeds with an empty key set. `target list` shows it. Tracked as
-**SGNT-49**.
+**Two cases are still missing**, both the same omission by a different route,
+and both showing in `target list`:
+
+- `status` builds its project list from the secrets it lists, so a project whose
+  *only* content is a rendered target has no rows at all and the target is never
+  reached. Reachable: `target add --render-as-secret` on a fresh project
+  succeeds with an empty key set. Tracked as **SGNT-49**.
+- A **file** target that manages no keys is attached by the same `Manages` gate
+  one loop below, and leaves the view the same way. Tracked as **SGNT-50**. It
+  is the milder of the two: a 0-key file render merges nothing, so no deployed
+  environment is shortened by it — which is why `EmptyRenderError`, and this
+  paragraph, are about rendered targets.
 
 **The table keeps its five columns.** A reason is free text of unbounded length
 — the shrink guard's runs to three lines — and a column for it would make every
