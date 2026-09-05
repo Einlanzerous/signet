@@ -42,6 +42,25 @@ func seedEmptyRenderFor(t *testing.T, st *store.Store, project, ghSecret string)
 	}
 }
 
+// seedRenderManaging attaches a rendered target that manages the given keys, so
+// a test can build a target that DOES belong to a secret's row.
+func seedRenderManaging(t *testing.T, st *store.Store, project, ghSecret string, keys []string) {
+	t.Helper()
+	if _, err := st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
+		tgt, err := m.AddGHRenderTarget(project, "o/r", "home-server", ghSecret, keys)
+		if err != nil {
+			return store.AuditRecord{}, err
+		}
+		return store.AuditRecord{
+			Actor: "test", Action: "target.render", TargetID: tgt.ID, Details: "fixture",
+			EventKind: store.KindTargetConfig, ActorRole: store.RoleHuman,
+			Status: &store.AuditStatus{Outcome: store.OutcomeCreated},
+		}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // seedIncompleteRender builds a project whose rendered target manages a key the
 // vault cannot supply.
 //
@@ -396,17 +415,30 @@ func TestStatusShowsARenderTargetThatManagesNoSecret(t *testing.T) {
 }
 
 // The row is emitted at a project boundary in a list ordered by project, which
-// is the one piece of new logic a single-project fixture cannot exercise at all:
-// a boundary that fires late files a target under the next project's rows, and
-// one that fires early would drop a target that a later secret in the same
-// block matches.
+// is the one piece of new logic a single-project fixture cannot exercise at all.
+// Both directions are wrong in their own way:
 //
-// Three projects, so the middle one has a boundary on both sides and the last
-// exercises the end of the list rather than a change of project.
+//   - A boundary that fires LATE files a target under the next project's rows.
+//   - A boundary that fires EARLY DUPLICATES it: the check runs before every
+//     row that could still match, so a target matched by a later secret in the
+//     same block gets a subject row saying it belongs to none — and then the
+//     later row attaches it anyway. It does not drop the target, because
+//     shownRenders is still marked when that row is reached.
+//
+// So the fixture needs both shapes. Projects with one secret each cannot catch
+// the early direction: every row is a boundary there, and firing early is
+// indistinguishable from firing correctly — deleting the guard outright leaves
+// such a test green.
+//
+// Four projects: the second has a boundary on both sides, `nnn` holds a target
+// matched by the LAST of its two secrets, and the last exercises the end of the
+// list rather than a change of project.
 func TestStatusFilesEachEmptyRenderTargetUnderItsOwnProject(t *testing.T) {
 	st := newCLIVault(t)
 	seedEmptyRenderFor(t, st, "aaa", "AAA_ENV_FILE")
-	seedProject(t, st, "mmm", map[string]string{"BETA": "b"})
+	seedProject(t, st, "mmm", map[string]string{"MID": "m"})
+	seedProject(t, st, "nnn", map[string]string{"ALPHA": "a", "BETA": "b"})
+	seedRenderManaging(t, st, "nnn", "NNN_ENV_FILE", []string{"BETA"})
 	seedEmptyRenderFor(t, st, "zzz", "ZZZ_ENV_FILE")
 
 	out := captureStdout(t, func() {
@@ -433,10 +465,21 @@ func TestStatusFilesEachEmptyRenderTargetUnderItsOwnProject(t *testing.T) {
 		}
 	}
 
+	// The early direction: nnn's target belongs to BETA's row, which comes
+	// after ALPHA's. A boundary that fires before the block ends gives it a
+	// subject row claiming it belongs to none — while BETA's row, further down,
+	// carries the same destination.
+	for _, l := range strings.Split(out, "\n") {
+		if strings.Contains(l, "NNN_ENV_FILE") && strings.Contains(l, "keys)") {
+			t.Errorf("a target matched by a later secret in the same block got a "+
+				"subject row saying it belongs to none:\n%s", l)
+		}
+	}
+
 	// In project order, which is what says the boundary fired in the right
 	// place rather than merely firing: aaa's target before mmm's only secret,
 	// and mmm's before zzz's target.
-	aaa, mmm, zzz := strings.Index(out, "AAA_ENV_FILE"), strings.Index(out, "BETA"), strings.Index(out, "ZZZ_ENV_FILE")
+	aaa, mmm, zzz := strings.Index(out, "AAA_ENV_FILE"), strings.Index(out, "MID"), strings.Index(out, "ZZZ_ENV_FILE")
 	if !(aaa < mmm && mmm < zzz) {
 		t.Errorf("the rows are not in project order, so a boundary fired against the wrong block:\n%s", out)
 	}
