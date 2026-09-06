@@ -12,15 +12,42 @@ import (
 // env file containing nothing.
 func seedEmptyRender(t *testing.T, st *store.Store) {
 	t.Helper()
+	seedEmptyRenderFor(t, st, "demo", "PROD_ENV_FILE")
+}
+
+// seedEmptyRenderFor is seedEmptyRender for a named project, so a test can build
+// more than one of them. Each destination must differ: one GitHub secret can be
+// claimed by only one target.
+func seedEmptyRenderFor(t *testing.T, st *store.Store, project, ghSecret string) {
+	t.Helper()
 	// A populated project, so this is a target that manages nothing rather than
 	// a vault that holds nothing — those are different conditions and only the
 	// first is `empty`.
-	seedProject(t, st, "demo", map[string]string{"ALPHA": "a"})
+	seedProject(t, st, project, map[string]string{"ALPHA": "a"})
 	// Added through the store with a nil key set, which is the state `target
 	// add --render-as-secret` leaves when there is no file target to seed from,
 	// and the state a target reaches when its last key is dropped.
 	if _, err := st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
-		tgt, err := m.AddGHRenderTarget("demo", "o/r", "home-server", "PROD_ENV_FILE", nil)
+		tgt, err := m.AddGHRenderTarget(project, "o/r", "home-server", ghSecret, nil)
+		if err != nil {
+			return store.AuditRecord{}, err
+		}
+		return store.AuditRecord{
+			Actor: "test", Action: "target.render", TargetID: tgt.ID, Details: "fixture",
+			EventKind: store.KindTargetConfig, ActorRole: store.RoleHuman,
+			Status: &store.AuditStatus{Outcome: store.OutcomeCreated},
+		}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// seedRenderManaging attaches a rendered target that manages the given keys, so
+// a test can build a target that DOES belong to a secret's row.
+func seedRenderManaging(t *testing.T, st *store.Store, project, ghSecret string, keys []string) {
+	t.Helper()
+	if _, err := st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
+		tgt, err := m.AddGHRenderTarget(project, "o/r", "home-server", ghSecret, keys)
 		if err != nil {
 			return store.AuditRecord{}, err
 		}
@@ -93,17 +120,13 @@ func TestTargetListAndStatusSayWhyARenderIsEmptyOrIncomplete(t *testing.T) {
 		seed  func(*testing.T, *store.Store)
 		state string
 		says  []string
-		// inStatus is false for `empty`: `status` cannot show such a target at
-		// all, for a reason that has nothing to do with reasons — see
-		// TestStatusCannotShowARenderTargetThatManagesNoSecret.
-		inStatus bool
 	}{
 		{
-			name: "empty", state: "empty*", seed: seedEmptyRender, inStatus: false,
+			name: "empty", state: "empty*", seed: seedEmptyRender,
 			says: []string{"manages no keys", "signet target add-key"},
 		},
 		{
-			name: "incomplete", state: "incomplete*", seed: seedIncompleteRender, inStatus: true,
+			name: "incomplete", state: "incomplete*", seed: seedIncompleteRender,
 			// The offending key is named: an operator told only that something
 			// is missing has to run a second command to find out what.
 			says: []string{"have no value in the vault", "PENDING", "drop them from the target"},
@@ -118,12 +141,7 @@ func TestTargetListAndStatusSayWhyARenderIsEmptyOrIncomplete(t *testing.T) {
 				run  func() error
 			}{
 				{"target list", func() error { return runTargetList([]string{"--project", "demo"}) }},
-			}
-			if cond.inStatus {
-				views = append(views, struct {
-					name string
-					run  func() error
-				}{"status", func() error { return runStatus(nil) }})
+				{"status", func() error { return runStatus(nil) }},
 			}
 			for _, view := range views {
 				out := captureStdout(t, func() {
@@ -173,12 +191,11 @@ func TestAConditionReasonIsPrintedOncePerDestination(t *testing.T) {
 // own text, which is precisely why the other views had nothing to share.
 func TestAllFourViewsWordARenderRefusalTheSameWay(t *testing.T) {
 	for _, cond := range []struct {
-		name     string
-		seed     func(*testing.T, *store.Store)
-		inStatus bool
+		name string
+		seed func(*testing.T, *store.Store)
 	}{
-		{"empty", seedEmptyRender, false},
-		{"incomplete", seedIncompleteRender, true},
+		{"empty", seedEmptyRender},
+		{"incomplete", seedIncompleteRender},
 	} {
 		t.Run(cond.name, func(t *testing.T) {
 			st := newCLIVault(t)
@@ -198,12 +215,7 @@ func TestAllFourViewsWordARenderRefusalTheSameWay(t *testing.T) {
 				{"target list", func() error { return runTargetList([]string{"--project", "demo"}) }},
 				{"render --check", func() error { return runRender([]string{"--project", "demo", "--check"}) }},
 				{"render", func() error { return runRender([]string{"--project", "demo"}) }},
-			}
-			if cond.inStatus {
-				views = append(views, struct {
-					name string
-					run  func() error
-				}{"status", func() error { return runStatus(nil) }})
+				{"status", func() error { return runStatus(nil) }},
 			}
 			for _, view := range views {
 				out := captureStdout(t, func() {
@@ -342,25 +354,23 @@ func TestBothSourcesOfAReasonReachTheMarkAndTheNote(t *testing.T) {
 	}
 }
 
-// The one part of SGNT-45 that is NOT fixed, pinned so it is discovered rather
-// than rediscovered.
+// The one part of SGNT-45 that could not be fixed there, and SGNT-46 did.
 //
-// `status` builds its TARGETS column per secret, and attaches a rendered target
-// to a row only when `cfg.Manages(sec.Name)`. A target that manages no keys
-// manages no secret, so it is attached to nothing — `status` does not show it
-// in any state, with or without a reason. That is why the `empty` half of this
-// ticket's acceptance ("`target list` and `status` show why") is met by `target
-// list`, `render --check` and `render` and not by `status`.
+// `status` builds its TARGETS column per secret and attaches a rendered target
+// to a row only when `cfg.Manages(sec.Name)`. A target managing no keys manages
+// no secret, so it was attached to nothing and left the view entirely — in
+// every state, with or without a reason.
 //
-// It is pre-existing and structural, not a consequence of the change around it:
-// giving `status` somewhere to print a target that belongs to no secret's row
-// is a change to that table's shape, which is a different ticket from wording a
-// reason. Tracked as SGNT-46.
+// `empty` is the state that makes the omission matter: internal/sync/render.go
+// calls it the more urgent of the two refusals, because the blob such a target
+// would deliver is a complete, well-formed env file containing nothing, which
+// the consumer applies in full. The view an operator reaches for when something
+// is wrong was the one view that could not report it.
 //
-// If a future change gives `status` a home for such a target, this test should
-// FAIL — at which point the exclusions in the two tests above, the note in
-// stateHidesItsReason and the README paragraph all want updating together.
-func TestStatusCannotShowARenderTargetThatManagesNoSecret(t *testing.T) {
+// This test replaces the tripwire that pinned the gap, which was written to
+// fail when the gap closed and did: the exclusions in the two tests above and
+// the README paragraph were updated in the same change.
+func TestStatusShowsARenderTargetThatManagesNoSecret(t *testing.T) {
 	st := newCLIVault(t)
 	seedEmptyRender(t, st)
 
@@ -369,15 +379,129 @@ func TestStatusCannotShowARenderTargetThatManagesNoSecret(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
-	if strings.Contains(out, "PROD_ENV_FILE") {
-		t.Fatalf("`status` now shows a target that manages no keys — good, but the "+
-			"exclusions written around this gap are now wrong; see this test's doc:\n%s", out)
+
+	// Scoped to the row, not to the output. The note under the table names the
+	// destination too, so an unscoped assertion would pass on a target that
+	// still had no row — which is the whole subject of this test.
+	row := lineWith(t, out, "gh-render:")
+	if !strings.Contains(row, "PROD_ENV_FILE") {
+		t.Fatalf("the row does not name the destination:\n%s", row)
 	}
-	// The rest of the table is unaffected: the project's other targets still
-	// report, so this is one target missing rather than a broken view.
+	if !strings.Contains(row, "empty*") {
+		t.Fatalf("the row does not carry the target's state, marked:\n%s", row)
+	}
+	// The key count stands where a secret name would, because the row is about
+	// a target rather than a secret — the notation `target list` already uses.
+	if !strings.Contains(row, "(0 keys)") {
+		t.Errorf("the row does not say the target manages nothing:\n%s", row)
+	}
+
+	// And the mark has its reason under it, worded by the one function all four
+	// views share rather than by a copy this row introduced.
+	_, refusal := renderState(mustRenderTarget(t, st, "demo"))
+	if refusal == nil {
+		t.Fatal("the fixture is deliverable, so there is no refusal to word")
+	}
+	reason := renderConditionReason(refusal)
+	if !strings.Contains(out, reason) {
+		t.Errorf("the marked row has no reason under it.\nwant: %s\ngot:\n%s", reason, out)
+	}
+
+	// The rest of the table is unaffected: this adds a row, it does not replace
+	// the project's own.
 	if !strings.Contains(out, "ALPHA") {
-		t.Errorf("`status` lost the project's secrets, not just the empty target:\n%s", out)
+		t.Errorf("`status` lost the project's secrets:\n%s", out)
 	}
+}
+
+// The row is emitted at a project boundary in a list ordered by project, which
+// is the one piece of new logic a single-project fixture cannot exercise at all.
+// Both directions are wrong in their own way:
+//
+//   - A boundary that fires LATE files a target under the next project's rows.
+//   - A boundary that fires EARLY DUPLICATES it: the check runs before every
+//     row that could still match, so a target matched by a later secret in the
+//     same block gets a subject row saying it belongs to none — and then the
+//     later row attaches it anyway. It does not drop the target, because
+//     shownRenders is still marked when that row is reached.
+//
+// So the fixture needs both shapes. Projects with one secret each cannot catch
+// the early direction: every row is a boundary there, and firing early is
+// indistinguishable from firing correctly — deleting the guard outright leaves
+// such a test green.
+//
+// Four projects: the second has a boundary on both sides, `nnn` holds a target
+// matched by the LAST of its two secrets, and the last exercises the end of the
+// list rather than a change of project.
+func TestStatusFilesEachEmptyRenderTargetUnderItsOwnProject(t *testing.T) {
+	st := newCLIVault(t)
+	seedEmptyRenderFor(t, st, "aaa", "AAA_ENV_FILE")
+	seedProject(t, st, "mmm", map[string]string{"MID": "m"})
+	seedProject(t, st, "nnn", map[string]string{"ALPHA": "a", "BETA": "b"})
+	seedRenderManaging(t, st, "nnn", "NNN_ENV_FILE", []string{"BETA"})
+	seedEmptyRenderFor(t, st, "zzz", "ZZZ_ENV_FILE")
+
+	out := captureStdout(t, func() {
+		if err := runStatus(nil); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	for _, tc := range []struct{ project, ghSecret string }{
+		{"aaa", "AAA_ENV_FILE"},
+		{"zzz", "ZZZ_ENV_FILE"},
+	} {
+		rows := 0
+		for _, l := range strings.Split(out, "\n") {
+			if strings.Contains(l, tc.ghSecret) && strings.Contains(l, "(0 keys)") {
+				rows++
+				if !strings.HasPrefix(l, tc.project) {
+					t.Errorf("%s's empty target is filed under another project:\n%s", tc.project, l)
+				}
+			}
+		}
+		if rows != 1 {
+			t.Errorf("%s's empty target got %d rows, want 1:\n%s", tc.project, rows, out)
+		}
+	}
+
+	// The early direction: nnn's target belongs to BETA's row, which comes
+	// after ALPHA's. A boundary that fires before the block ends gives it a
+	// subject row claiming it belongs to none — while BETA's row, further down,
+	// carries the same destination.
+	for _, l := range strings.Split(out, "\n") {
+		if strings.Contains(l, "NNN_ENV_FILE") && strings.Contains(l, "keys)") {
+			t.Errorf("a target matched by a later secret in the same block got a "+
+				"subject row saying it belongs to none:\n%s", l)
+		}
+	}
+
+	// In project order, which is what says the boundary fired in the right
+	// place rather than merely firing: aaa's target before mmm's only secret,
+	// and mmm's before zzz's target.
+	aaa, mmm, zzz := strings.Index(out, "AAA_ENV_FILE"), strings.Index(out, "MID"), strings.Index(out, "ZZZ_ENV_FILE")
+	if !(aaa < mmm && mmm < zzz) {
+		t.Errorf("the rows are not in project order, so a boundary fired against the wrong block:\n%s", out)
+	}
+
+	// Both targets are marked, so both reasons must have been collected — the
+	// pairing stateNotes.add exists to hold, across projects.
+	if n := strings.Count(out, "  * "); n != 2 {
+		t.Errorf("%d notes under the table, want one per marked row (2):\n%s", n, out)
+	}
+}
+
+// lineWith returns the one output line containing needle, so an assertion about
+// a table row cannot be satisfied by the notes printed under the table.
+func lineWith(t *testing.T, out, needle string) string {
+	t.Helper()
+	for _, l := range strings.Split(out, "\n") {
+		if strings.Contains(l, needle) {
+			return l
+		}
+	}
+	t.Fatalf("no line of the output contains %q:\n%s", needle, out)
+	return ""
 }
 
 // seedBrokenDerivation gives the project a managed key whose secret exists and

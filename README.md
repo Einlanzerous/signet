@@ -558,12 +558,46 @@ construct-server (3 keys)  gh-render  o/r · home-server · PROD_ENV_FILE  incom
 cannot: *why* a particular key has no value, for the keys that have an
 explanation beyond not being set.
 
-**One exception, and it is not about reasons.** `signet status` builds its
-`TARGETS` column per secret, attaching a rendered target to a row only when it
-carries that key. A target that manages *no* keys manages no secret, so `status`
-does not show it at all — in any state, with or without a reason. `target list`
-does. Tracked as **SGNT-46**, which is a change to that table's shape rather
-than to what a state says.
+**A rendered target that manages no keys gets a row of its own.** `signet
+status` builds its `TARGETS` column per secret, attaching a rendered target to a
+row only when it carries that key — so a target managing *no* keys was attached
+to nothing and left the view entirely, in every state, with or without a reason.
+That is the omission `empty` could least afford: it is the refusal whose blob
+would be applied in full. Such a target is now listed after its project's rows,
+with the key count standing where a secret name would — the notation `target
+list` already uses to name a rendered target as a subject rather than a secret:
+
+```
+$ signet status
+PROJECT  SECRET    VHASH    STATUS  EXPIRES  TARGETS
+demo     ALPHA     #dc9ad8  active  -        file:/etc/demo/.env [in sync]
+demo     (0 keys)  -        -       -        gh-render:o/r·home-server→PROD_ENV_FILE [empty*]
+
+  * o/r·home-server→PROD_ENV_FILE — the target manages no keys, so sync will
+    refuse it rather than deliver an empty environment — attach them with
+    `signet target add-key`
+```
+
+A row rather than a line under the table, because a note with no marked row to
+explain is the same false alarm as a marked row with no note. With a row, the
+mark and the note come from the same two functions every other state uses.
+
+**Two cases are still missing**, both the same omission by a different route,
+and both showing in `target list`:
+
+- `status` builds its project list from the secrets it lists, so a project whose
+  *only* content is a rendered target has no rows at all and the target is never
+  reached. Reachable: `target add --render-as-secret` on a fresh project
+  succeeds with an empty key set. Tracked as **SGNT-49**.
+- A **file** target that manages no keys is attached by the same `Manages` gate
+  one loop below, and leaves the view the same way. Tracked as **SGNT-50**. A
+  plain `render` of one merges nothing, so it shortens no deployed environment
+  — which is why `EmptyRenderError`, and this paragraph, are about rendered
+  targets. `render --prune` is the exception and it is not a small one: a target
+  that manages nothing makes *every* key in the file unmanaged, so `--prune`
+  empties it. That deletion is loud where it happens — the render names the keys
+  it deleted, and `--check --prune` previews them — but it is loud in a view
+  other than the one that omits the target.
 
 **The table keeps its five columns.** A reason is free text of unbounded length
 — the shrink guard's runs to three lines — and a column for it would make every
