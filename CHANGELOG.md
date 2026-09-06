@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.9.4](https://github.com/Einlanzerous/signet/compare/v1.9.3...v1.9.4) (2026-09-06)
+
+
+### Bug Fixes
+
+* **cli:** show a rendered target that manages no keys in status (SGNT-46) ([#51](https://github.com/Einlanzerous/signet/issues/51)) ([7c441a7](https://github.com/Einlanzerous/signet/commit/7c441a7571e96f13cd3b5cfbb829026a9f87a88e))
+
 ## [1.9.3](https://github.com/Einlanzerous/signet/compare/v1.9.2...v1.9.3) (2026-08-30)
 
 
