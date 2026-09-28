@@ -2,6 +2,7 @@ package vault
 
 import (
 	"bytes"
+	"encoding/hex"
 	"path/filepath"
 	"testing"
 )
@@ -86,5 +87,63 @@ func TestRandomToken(t *testing.T) {
 	b, _ := RandomToken(32)
 	if len(a) != 32 || a == b {
 		t.Fatalf("bad tokens: %q %q", a, b)
+	}
+}
+
+func TestKeyedSaltIsAPureFunctionOfKeyAndContext(t *testing.T) {
+	key := bytes.Repeat([]byte{7}, KeySize)
+	a := KeyedSalt(key, 16, "scrypt", "p/A", "hunter2")
+	if len(a) != 16 {
+		t.Fatalf("got %d bytes, want 16", len(a))
+	}
+	if !bytes.Equal(a, KeyedSalt(key, 16, "scrypt", "p/A", "hunter2")) {
+		t.Error("the same key and context gave two different salts")
+	}
+	if bytes.Equal(a, KeyedSalt(key, 16, "scrypt", "p/A", "hunter3")) {
+		t.Error("a different context gave the same salt")
+	}
+	other := append([]byte{}, key...)
+	other[0] ^= 1
+	if bytes.Equal(a, KeyedSalt(other, 16, "scrypt", "p/A", "hunter2")) {
+		t.Error("a different key gave the same salt — it is precomputable without the vault")
+	}
+	// A shorter salt is a prefix of the longer: n only truncates.
+	if !bytes.Equal(a[:8], KeyedSalt(key, 8, "scrypt", "p/A", "hunter2")) {
+		t.Error("KeyedSalt(n=8) is not the prefix of KeyedSalt(n=16)")
+	}
+}
+
+// Without length prefixes ("ab","c") and ("a","bc") concatenate to the same
+// bytes, and a value could be chosen to collide with another secret's context.
+func TestKeyedSaltContextIsFramed(t *testing.T) {
+	key := bytes.Repeat([]byte{7}, KeySize)
+	if bytes.Equal(KeyedSalt(key, 16, "ab", "c"), KeyedSalt(key, 16, "a", "bc")) {
+		t.Error("two different contexts with the same concatenation share a salt")
+	}
+	if bytes.Equal(KeyedSalt(key, 16, "a", ""), KeyedSalt(key, 16, "a")) {
+		t.Error("a trailing empty part is indistinguishable from none")
+	}
+}
+
+// The salt is published inside every hash built on it, so it must not be the
+// same construction as ValueDigest, whose truncated outputs are published too.
+func TestKeyedSaltIsNotAValueDigest(t *testing.T) {
+	key := bytes.Repeat([]byte{7}, KeySize)
+	salt := hex.EncodeToString(KeyedSalt(key, 6, "hunter2"))
+	if salt == ValueDigest(key, "hunter2") {
+		t.Error("a salt over a value equals the value's published digest")
+	}
+}
+
+func TestKeyedSaltRejectsALengthItCannotFill(t *testing.T) {
+	for _, n := range []int{0, -1, 33} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("KeyedSalt(n=%d) did not panic", n)
+				}
+			}()
+			KeyedSalt(bytes.Repeat([]byte{7}, KeySize), n, "x")
+		}()
 	}
 }
