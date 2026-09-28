@@ -224,6 +224,10 @@ same password hashed in two secrets gives two different hashes; and each read
 costs one scrypt — about 30 ms and 16 MiB on this host — including each request
 to the mirror, which resolves every derived secret uncached.
 
+Determinism also means rotating back to an earlier password reproduces that
+password's earlier hash, byte for byte — a rotation to a new value always moves
+the salt, but nothing remembers the old ones.
+
 `scrypt` refuses an empty input rather than produce a hash that accepts an empty
 login. There is deliberately no bare `sha256`: an unsalted hash of a low-entropy
 secret is brute-forceable from wherever it lands, which is why signet keys its own

@@ -384,3 +384,27 @@ func TestTransformsListsWhatCanBeDeclaredSorted(t *testing.T) {
 		t.Errorf("Transforms() = %q", got)
 	}
 }
+
+// Usage text is generated from two lists, and is only as complete as they are
+// together. Every registry entry has to be in exactly one, so a name added later
+// cannot be missing from what an operator is shown.
+func TestEveryRegistryEntryIsListedAsDeclarableOrRefusedNotBoth(t *testing.T) {
+	listed := map[string]int{}
+	for _, n := range Transforms() {
+		listed[n]++
+	}
+	for _, n := range Refused() {
+		listed[n]++
+	}
+	for name := range transforms {
+		if listed[name] != 1 {
+			t.Errorf("%s is listed %d times across Transforms and Refused, want exactly once", name, listed[name])
+		}
+	}
+	if len(listed) != len(transforms) {
+		t.Errorf("Transforms and Refused name %d entries, the registry has %d", len(listed), len(transforms))
+	}
+	if got := strings.Join(Refused(), ","); got != "bcrypt" {
+		t.Errorf("Refused() = %q", got)
+	}
+}

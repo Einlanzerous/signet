@@ -277,3 +277,18 @@ func TestDependentsIncludeASecretThatHashesTheInput(t *testing.T) {
 		t.Fatalf("dependents of the password = %v, want the hash", got)
 	}
 }
+
+// The usage text is what an operator reads before trying bcrypt. It is built from
+// the registry, so it has to name what is refused as well as what is accepted.
+func TestDeriveUsageNamesTheDeclarableAndTheRefusedTransforms(t *testing.T) {
+	newCLIVault(t)
+	err := runDerive([]string{"--project", "p", "--name", "N"})
+	if err == nil {
+		t.Fatal("derive with no template succeeded")
+	}
+	for _, want := range []string{"base64", "hex", "scrypt", "bcrypt", "drift"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("usage does not mention %q:\n%s", want, err)
+		}
+	}
+}

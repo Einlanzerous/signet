@@ -1235,8 +1235,8 @@ func runDerive(args []string) error {
 		return fmt.Errorf("usage: signet derive --project <p> --name <N> --from '<template>' [--scope s] [--replace]\n"+
 			"       signet derive --project <p> --name <N> --clear\n"+
 			"  {{NAME}} refers to this project; {{other-project/NAME}} crosses projects\n"+
-			"  {{NAME | transform}} encodes or hashes it (%s); bcrypt is refused — its salt is random, so the value would drift",
-			strings.Join(derive.Transforms(), ", "))
+			"  {{NAME | transform}} encodes or hashes it (%s); refused, because the value would drift: %s",
+			strings.Join(derive.Transforms(), ", "), strings.Join(derive.Refused(), ", "))
 	}
 	if *clear && *from != "" {
 		return fmt.Errorf("--clear and --from are opposites; pass one")

@@ -74,12 +74,20 @@ var transforms = map[string]transform{
 		"Use scrypt, which signet salts deterministically"},
 }
 
-// Transforms returns the names that can be declared, sorted. It is what usage
-// text and the unknown-name error list, so neither can fall behind the registry.
-func Transforms() []string {
+// Transforms returns the names that can be declared, sorted. The unknown-name
+// error lists these, and so does the usage text, beside Refused.
+func Transforms() []string { return names(func(t transform) bool { return t.refused == "" }) }
+
+// Refused returns the names that are recognised but cannot be declared, sorted.
+// It is the other half of the registry: usage text built from Transforms alone
+// would say nothing about a name an operator is likely to try, so both halves
+// are generated and a test holds every entry to being in exactly one of them.
+func Refused() []string { return names(func(t transform) bool { return t.refused != "" }) }
+
+func names(keep func(transform) bool) []string {
 	var out []string
 	for name, t := range transforms {
-		if t.refused == "" {
+		if keep(t) {
 			out = append(out, name)
 		}
 	}
