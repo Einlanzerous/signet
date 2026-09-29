@@ -175,8 +175,68 @@ Consequences worth knowing:
   reasoned about without the master key. Do not put credential material in the
   literal text around the references.
 
-Hashing transforms (`scrypt`, `bcrypt`, `base64`) are **not** implemented;
-`derive` composes only. See SGNT-18.
+### Transforms
+
+A reference can be put through a named transform on its way into the template:
+
+```
+signet derive --project drydock --name DRYDOCK_AUTH_PASSWORD_HASH \
+  --from '{{DRYDOCK_AUTH_PASSWORD | scrypt}}'
+```
+
+| transform | output |
+|---|---|
+| `base64` | standard base64 with padding — a Kubernetes Secret's data field, half of a basic-auth header |
+| `hex` | lowercase hex |
+| `scrypt` | `scrypt$16384$8$1$<salt>$<hash>`, the format Drydock's `verifyPassword` reads |
+| `bcrypt` | **refused** at declaration, with the reason |
+
+The pipe has to have a space on each side. Names are not validated anywhere in
+signet, so `a|b` and `a:b` can be secret names, and whitespace inside a
+reference was already an error — which makes `NAME | scrypt` a form no stored
+template can contain, and leaves every existing template meaning what it meant.
+One transform per reference; to chain, derive an intermediate secret. Basic auth
+is base64 of `user:password`, so derive the pair (`{{USER}}:{{PW}}`) and then
+`Basic {{PAIR | base64}}`.
+
+**A transform must give the same output every time**, because the value is
+computed on every read and never stored. One that does not — any password hash
+with a random salt — would change on every render and make `render --check`
+report permanent drift: the failure derived secrets exist to remove, back again
+and louder, which teaches an operator to skip the drift report on the run where
+it is right. So this is enforced where a transform is *declared*: a name is
+accepted only if it is in the registry (`internal/derive/transform.go`), a suite
+test applies every entry repeatedly and compares, and `bcrypt` is recognised only to
+be refused — its library takes no salt from the caller, so there is no way to
+make it deterministic.
+
+**How `scrypt` gets a salt that is stable.** The salt is an HMAC, under the
+master key, of the deriving secret's name and the input value. That gives it the
+properties the alternatives each lack: it is the same on every read of an
+unchanged vault; it changes when the password does, which a salt fixed per secret
+would not; and without the master key it cannot be predicted, so putting the
+value in its own salt gives an attacker holding the hash nothing to precompute.
+Nothing extra is stored — the salt is written into the hash string, where a
+verifier looks for it. Consequences: the hash is a function of the master key, so
+a vault re-created under a different key renders a different hash (signet has no
+verb that changes the key, and a restore with the same key changes nothing); the
+same password hashed in two secrets gives two different hashes; and each read
+costs one scrypt — about 30 ms and 16 MiB on this host — including each request
+to the mirror, which resolves every derived secret uncached.
+
+Determinism also means rotating back to an earlier password reproduces that
+password's earlier hash, byte for byte — a rotation to a new value always moves
+the salt, but nothing remembers the old ones.
+
+`scrypt` refuses an empty input rather than produce a hash that accepts an empty
+login. There is deliberately no bare `sha256`: an unsalted hash of a low-entropy
+secret is brute-forceable from wherever it lands, which is why signet keys its own
+digests, and a hash you want in a config file is what `scrypt` is for.
+
+`reveal` treats a transformed secret like any composed one: the value on stdout,
+the template — transform included — on stderr, and an entry on each input's
+ledger. That entry is written whatever the transform: a `base64` discloses the
+input outright, and a `scrypt` still hands over something to attack offline.
 
 ## Running a command with secrets — `signet exec`
 

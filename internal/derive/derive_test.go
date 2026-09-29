@@ -5,11 +5,15 @@ import (
 	"testing"
 )
 
-// vault is a Lookup over a literal map. Keys are "project/NAME"; a value
-// beginning with "=" is a derivation rather than a literal.
-type vault map[string]string
+// testKey stands in for the vault's master key, which only a salted transform
+// reads.
+var testKey = []byte("0123456789abcdef0123456789abcdef")
 
-func (v vault) look(r Ref) (Entry, error) {
+// fakeVault is a Lookup over a literal map. Keys are "project/NAME"; a value
+// beginning with "=" is a derivation rather than a literal.
+type fakeVault map[string]string
+
+func (v fakeVault) look(r Ref) (Entry, error) {
 	s, ok := v[r.String()]
 	if !ok {
 		return Entry{Missing: true}, nil
@@ -21,11 +25,11 @@ func (v vault) look(r Ref) (Entry, error) {
 }
 
 func TestResolveComposesAcrossProjects(t *testing.T) {
-	v := vault{"construct-server/DRYDOCK_DB_PASSWORD": "hunter2"}
+	v := fakeVault{"construct-server/DRYDOCK_DB_PASSWORD": "hunter2"}
 	got, err := Resolve(
 		Ref{Project: "drydock", Name: "DRYDOCK_DATABASE_URL"},
 		"postgres://drydock_user:{{construct-server/DRYDOCK_DB_PASSWORD}}@127.0.0.1:5432/drydock",
-		v.look)
+		v.look, testKey)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,16 +42,16 @@ func TestResolveComposesAcrossProjects(t *testing.T) {
 // The motivating bug in one assertion: rotating the input changes the derived
 // value with nothing else touched. A stored copy could not do this.
 func TestRotatingAnInputChangesTheDerivedValue(t *testing.T) {
-	v := vault{"construct-server/PW": "old"}
+	v := fakeVault{"construct-server/PW": "old"}
 	const tmpl = "postgres://u:{{construct-server/PW}}@h/db"
 	origin := Ref{Project: "drydock", Name: "URL"}
 
-	before, err := Resolve(origin, tmpl, v.look)
+	before, err := Resolve(origin, tmpl, v.look, testKey)
 	if err != nil {
 		t.Fatal(err)
 	}
 	v["construct-server/PW"] = "new"
-	after, err := Resolve(origin, tmpl, v.look)
+	after, err := Resolve(origin, tmpl, v.look, testKey)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,8 +66,8 @@ func TestRotatingAnInputChangesTheDerivedValue(t *testing.T) {
 // A bare reference means "my own project" — the common case, and the one where
 // getting the default wrong would silently read another project's secret.
 func TestBareReferenceResolvesWithinTheDerivingProject(t *testing.T) {
-	v := vault{"drydock/USER": "drydock_user", "other/USER": "WRONG"}
-	got, err := Resolve(Ref{Project: "drydock", Name: "DSN"}, "u={{USER}}", v.look)
+	v := fakeVault{"drydock/USER": "drydock_user", "other/USER": "WRONG"}
+	got, err := Resolve(Ref{Project: "drydock", Name: "DSN"}, "u={{USER}}", v.look, testKey)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,12 +77,12 @@ func TestBareReferenceResolvesWithinTheDerivingProject(t *testing.T) {
 }
 
 func TestResolveChainsThroughDerivedInputs(t *testing.T) {
-	v := vault{
+	v := fakeVault{
 		"p/BASE":  "b",
 		"p/MID":   "=[{{BASE}}]",
 		"p/OUTER": "=<{{MID}}>",
 	}
-	got, err := Resolve(Ref{Project: "p", Name: "OUTER"}, "=<{{MID}}>"[1:], v.look)
+	got, err := Resolve(Ref{Project: "p", Name: "OUTER"}, "=<{{MID}}>"[1:], v.look, testKey)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,29 +93,29 @@ func TestResolveChainsThroughDerivedInputs(t *testing.T) {
 
 func TestResolveDetectsCycles(t *testing.T) {
 	cases := map[string]struct {
-		v      vault
+		v      fakeVault
 		origin Ref
 		tmpl   string
 	}{
 		"self": {
-			v:      vault{"p/A": "={{A}}"},
+			v:      fakeVault{"p/A": "={{A}}"},
 			origin: Ref{Project: "p", Name: "A"},
 			tmpl:   "{{A}}",
 		},
 		"mutual": {
-			v:      vault{"p/A": "={{B}}", "p/B": "={{A}}"},
+			v:      fakeVault{"p/A": "={{B}}", "p/B": "={{A}}"},
 			origin: Ref{Project: "p", Name: "A"},
 			tmpl:   "{{B}}",
 		},
 		"cross-project": {
-			v:      vault{"x/A": "={{y/B}}", "y/B": "={{x/A}}"},
+			v:      fakeVault{"x/A": "={{y/B}}", "y/B": "={{x/A}}"},
 			origin: Ref{Project: "x", Name: "A"},
 			tmpl:   "{{y/B}}",
 		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			_, err := Resolve(tc.origin, tc.tmpl, tc.v.look)
+			_, err := Resolve(tc.origin, tc.tmpl, tc.v.look, testKey)
 			if err == nil {
 				t.Fatal("cycle resolved instead of erroring")
 			}
@@ -129,7 +133,7 @@ func TestResolveDetectsCycles(t *testing.T) {
 // A missing input has to name the secret that wanted it. An operator reading a
 // failed render otherwise has to guess which of a project's entries asked.
 func TestMissingInputNamesBothEnds(t *testing.T) {
-	_, err := Resolve(Ref{Project: "drydock", Name: "DSN"}, "{{construct-server/GONE}}", vault{}.look)
+	_, err := Resolve(Ref{Project: "drydock", Name: "DSN"}, "{{construct-server/GONE}}", fakeVault{}.look, testKey)
 	if err == nil {
 		t.Fatal("expected an error")
 	}

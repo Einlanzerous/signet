@@ -12,6 +12,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"os"
@@ -132,6 +133,37 @@ func ValueDigest(key []byte, plaintext string) string {
 	mac := hmac.New(sha256.New, key)
 	mac.Write([]byte(plaintext))
 	return hex.EncodeToString(mac.Sum(nil))[:12]
+}
+
+// KeyedSalt returns n bytes that are a pure function of the master key and the
+// context strings, for a computation that must be salted and must also come out
+// the same every time it is read — a hash a derived secret produces at read
+// time, where a random salt would change the value on every render and make
+// `render --check` report permanent drift.
+//
+// It is an HMAC, so without the master key the salt is unpredictable, and that
+// is what lets a caller put the input value itself in the context: the salt then
+// changes when the input does, which a salt fixed per secret would not, while a
+// reader of the finished hash still cannot recompute or precompute it. The key
+// is first narrowed to a subkey for this purpose, so a salt is never an HMAC
+// under the same key ValueDigest publishes truncated outputs of.
+//
+// Each context string is length-prefixed, so ("ab", "c") and ("a", "bc") are
+// different contexts. n is at most 32.
+func KeyedSalt(key []byte, n int, context ...string) []byte {
+	if n < 1 || n > sha256.Size {
+		panic(fmt.Sprintf("vault: KeyedSalt length %d out of range 1..%d", n, sha256.Size))
+	}
+	sub := hmac.New(sha256.New, key)
+	sub.Write([]byte("signet/keyed-salt/v1"))
+	mac := hmac.New(sha256.New, sub.Sum(nil))
+	var prefix [8]byte
+	for _, c := range context {
+		binary.BigEndian.PutUint64(prefix[:], uint64(len(c)))
+		mac.Write(prefix[:])
+		mac.Write([]byte(c))
+	}
+	return mac.Sum(nil)[:n]
 }
 
 const tokenAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"

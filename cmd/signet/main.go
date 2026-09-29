@@ -1226,15 +1226,17 @@ func runDerive(args []string) error {
 	fs := flag.NewFlagSet("derive", flag.ExitOnError)
 	project := fs.String("project", "", "project (required)")
 	name := fs.String("name", "", "secret name (required)")
-	from := fs.String("from", "", "template, e.g. 'postgres://u:{{other/PW}}@h/db' (required)")
+	from := fs.String("from", "", "template, e.g. 'postgres://u:{{other/PW}}@h/db' or '{{PW | scrypt}}' (required)")
 	scope := fs.String("scope", "", "scope, when creating")
 	replace := fs.Bool("replace", false, "convert an existing stored secret, abandoning its stored value")
 	clear := fs.Bool("clear", false, "stop deriving; the last stored version becomes current again")
 	fs.Parse(args)
 	if *project == "" || *name == "" || (*from == "" && !*clear) {
-		return fmt.Errorf("usage: signet derive --project <p> --name <N> --from '<template>' [--scope s] [--replace]\n" +
-			"       signet derive --project <p> --name <N> --clear\n" +
-			"  {{NAME}} refers to this project; {{other-project/NAME}} crosses projects")
+		return fmt.Errorf("usage: signet derive --project <p> --name <N> --from '<template>' [--scope s] [--replace]\n"+
+			"       signet derive --project <p> --name <N> --clear\n"+
+			"  {{NAME}} refers to this project; {{other-project/NAME}} crosses projects\n"+
+			"  {{NAME | transform}} encodes or hashes it (%s); refused, because the value would drift: %s",
+			strings.Join(derive.Transforms(), ", "), strings.Join(derive.Refused(), ", "))
 	}
 	if *clear && *from != "" {
 		return fmt.Errorf("--clear and --from are opposites; pass one")
@@ -1286,7 +1288,7 @@ func runDerive(args []string) error {
 	// that will fail every render from now on, and the moment the operator can
 	// still fix it cheaply is now, while they are looking at the template.
 	origin := derive.Ref{Project: *project, Name: *name}
-	if _, err := derive.Resolve(origin, *from, resolve.Lookup(a.st, a.key)); err != nil {
+	if _, err := resolve.Expand(a.st, a.key, origin, *from); err != nil {
 		return fmt.Errorf("%w\n(the derivation was not saved)", err)
 	}
 
@@ -1321,8 +1323,14 @@ func runDerive(args []string) error {
 	}
 
 	fmt.Printf("%s %s/%s\n", verb, *project, *name)
-	for _, ref := range tmpl.Refs() {
-		fmt.Printf("  ← %s\n", ref.QualifiedIn(*project))
+	for _, u := range tmpl.Uses() {
+		// The transform is shown because a hash is not a copy: without it this
+		// reads as the input being composed in verbatim.
+		if u.Transform != "" {
+			fmt.Printf("  ← %s (%s)\n", u.Ref.QualifiedIn(*project), u.Transform)
+			continue
+		}
+		fmt.Printf("  ← %s\n", u.Ref.QualifiedIn(*project))
 	}
 	fmt.Println("no value is stored; it is expanded on every render, reveal and sync")
 	// Same gap `set` warns about, and easier to fall into here: a newly derived

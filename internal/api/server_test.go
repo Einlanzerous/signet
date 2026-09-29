@@ -718,3 +718,59 @@ func TestMirrorNeverReportsAnUnresolvableSecretInSync(t *testing.T) {
 		}
 	}
 }
+
+// The mirror resolves every derived secret on every request, through the same
+// resolve.Current as everything else, so a transform that needs the vault key
+// has to find it there. A scrypt-derived secret must come out resolved — not as
+// the "unresolved" state, which is what a missing key would produce — and
+// neither the password nor the hash made from it may appear anywhere in what the
+// mirror serves: it carries metadata, and a computed value is not metadata.
+func TestMirrorResolvesATransformedSecretAndPublishesNoValue(t *testing.T) {
+	srv, st, key, _ := testServer(t)
+
+	pw := seedSecret(t, st, "drydock", "DRYDOCK_AUTH_PASSWORD", false)
+	seedVersion(t, st, pw.ID, key, "hunter2-marker", store.Issued)
+	if _, err := st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
+		sec, err := m.CreateSecret("drydock", "DRYDOCK_AUTH_PASSWORD_HASH", "", false, "")
+		if err != nil {
+			return store.AuditRecord{}, err
+		}
+		if err := m.SetDerivation(sec.ID, "{{DRYDOCK_AUTH_PASSWORD | scrypt}}"); err != nil {
+			return store.AuditRecord{}, err
+		}
+		return fixtureRecord("secret.derive", store.KindSecretWrite), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	views, err := srv.buildViews()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sv *SecretView
+	for i := range views {
+		for j := range views[i].Secrets {
+			if views[i].Secrets[j].Name == "DRYDOCK_AUTH_PASSWORD_HASH" {
+				sv = &views[i].Secrets[j]
+			}
+		}
+	}
+	if sv == nil {
+		t.Fatal("the mirror dropped the transformed secret")
+	}
+	if sv.Unresolved != "" {
+		t.Errorf("a scrypt-derived secret is reported unresolved: %s", sv.Unresolved)
+	}
+	if sv.Derivation != "{{DRYDOCK_AUTH_PASSWORD | scrypt}}" {
+		t.Errorf("derivation = %q, want the template as declared", sv.Derivation)
+	}
+	body, err := json.Marshal(views)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, leak := range []string{"hunter2-marker", "scrypt$"} {
+		if strings.Contains(string(body), leak) {
+			t.Errorf("the mirror published %q:\n%s", leak, body)
+		}
+	}
+}

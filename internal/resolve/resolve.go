@@ -65,8 +65,7 @@ type Resolved struct {
 // broken derivation cannot be mistaken for an unwritten secret and skipped.
 func Current(st *store.Store, key []byte, sec *store.Secret) (Resolved, error) {
 	if sec.Derived() {
-		origin := derive.Ref{Project: sec.Project, Name: sec.Name}
-		v, err := derive.Resolve(origin, sec.Derivation, Lookup(st, key))
+		v, err := Expand(st, key, derive.Ref{Project: sec.Project, Name: sec.Name}, sec.Derivation)
 		if err != nil {
 			return Resolved{}, err
 		}
@@ -84,6 +83,19 @@ func Current(st *store.Store, key []byte, sec *store.Secret) (Resolved, error) {
 		return Resolved{}, fmt.Errorf("secret %s/%s: %w", sec.Project, sec.Name, err)
 	}
 	return Resolved{Value: string(plain), Version: cur}, nil
+}
+
+// Expand resolves a derivation template for the secret named origin against the
+// vault as it stands.
+//
+// It is the one place the vault's key is handed to derive, which is why the
+// derive verb calls it too, to check a template it has not saved yet: a second
+// call site building its own Lookup would have to remember the key, and a
+// transform that needs one — scrypt salts from it — would then work in
+// Current and refuse at declaration, or the reverse. Current is this with a
+// stored secret's template.
+func Expand(st *store.Store, key []byte, origin derive.Ref, tmpl string) (string, error) {
+	return derive.Resolve(origin, tmpl, Lookup(st, key), key)
 }
 
 // Lookup adapts the store to derive's resolver.
