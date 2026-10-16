@@ -986,7 +986,8 @@ version actually running.
 
 **The suite gates all of that.** `release.yml` calls `ci.yml` as a reusable
 workflow and every later job is `needs:`-dependent on it, so a commit that does
-not pass produces no tag, no GitHub Release, no binary, and no deploy dispatch.
+not pass produces no tag, no GitHub Release, no binary, and no
+`signet-released` announcement.
 
 This is not the original wiring. Until SGNT-27, `Release Please` and `ci` were
 separate workflows fired by the same push with no dependency between them, and

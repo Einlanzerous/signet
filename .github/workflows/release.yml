@@ -73,8 +73,8 @@ jobs:
             echo
             echo "\`${GITHUB_SHA}\` did not pass the suite, so this run stopped before"
             echo "release-please. **No tag, no GitHub Release, no binary, and no"
-            echo "\`signet-released\` dispatch** — construct-server was never offered a"
-            echo "deploy, and the \`signet-prod\` approver will see nothing for this commit."
+            echo "\`signet-released\` dispatch** — construct-server was not told about"
+            echo "this commit, and there is nothing from it to promote."
             echo
             echo "The release PR was also left un-updated: release-please did not run."
             echo
@@ -198,8 +198,8 @@ jobs:
             echo "the release PR's merge commit."
             echo
             echo "**No binary was attached and no \`signet-released\` dispatch was sent**,"
-            echo "so construct-server was never offered this release and the"
-            echo "\`signet-prod\` approver will see nothing."
+            echo "so construct-server was not told about this release and there is"
+            echo "nothing from it to promote."
             echo
             echo "### Recovering"
             echo
@@ -383,9 +383,10 @@ jobs:
           owner: Einlanzerous
           repositories: construct-server
 
-      # Ordering is load-bearing: this sits *after* the upload because the
-      # receiver's first act is `gh release download`. Dispatching earlier would
-      # race the deploy against a release that has no binary attached yet.
+      # This sits *after* the upload. Since SERV-130 the receiver only announces
+      # (construct-server's `deploy-signet` runs `announce` and skips `deploy`),
+      # so nothing downloads the binary on receipt and nothing races. The order
+      # is kept so the announcement never names a release with no binary yet.
       - name: Notify construct-server
         uses: peter-evans/repository-dispatch@v3
         with:

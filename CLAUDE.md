@@ -260,7 +260,9 @@ SERV-130 (construct-server#153), that dispatch only *announces*: its
 `deploy-signet` run is `announce` ✓, `deploy` skipped. Prod is a pin,
 `SIGNET_VERSION` in construct-server's `versions-host.env`, and moves only when
 **Promote / Rollback a Version** (service `signet`) commits it; that push runs
-the deploy behind the `signet-prod` gate. So after a release, the version is
-*available*, not live — `curl 127.0.0.1:4010/healthz` says which one is. v1.9.2
-and v1.9.3 both shipped while prod stayed on v1.9.1 (SGNT-52), so the check is
-not a formality.
+the deploy behind the `signet-prod` gate — a second, un-notified approval after
+`production-promote`, so a promote can be approved and its pin committed while
+prod still waits. So after a release the version is *available*, not live, and
+after a promote it may not be live yet either; `curl 127.0.0.1:4010/healthz`
+says which one is. v1.9.2 and v1.9.3 both shipped while prod stayed on v1.9.1
+(SGNT-52), so the check is not a formality.
