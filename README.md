@@ -977,8 +977,12 @@ property that actually matters.
 Releases are automated. Conventional commits on `main` drive release-please,
 which maintains a release PR; merging it tags, builds the static
 `linux/amd64` binary, attaches it plus a checksum to the GitHub Release, and
-dispatches `signet-released` to construct-server, which deploys it to
-`imperial-construct` after the `signet-prod` approval gate.
+dispatches `signet-released` to construct-server. That dispatch **announces
+and does not deploy** (SERV-130): prod is pinned by `SIGNET_VERSION` in
+construct-server's `versions-host.env`, and moves to `imperial-construct` only
+when **Promote / Rollback a Version** (service `signet`) commits a new pin, which
+runs the deploy behind the `signet-prod` approval gate. `/healthz` reports the
+version actually running.
 
 **The suite gates all of that.** `release.yml` calls `ci.yml` as a reusable
 workflow and every later job is `needs:`-dependent on it, so a commit that does
