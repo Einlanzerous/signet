@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.10.0](https://github.com/Einlanzerous/signet/compare/v1.9.3...v1.10.0) (2026-10-16)
+
+
+### Features
+
+* **derive:** named transforms — base64, hex, and a deterministically salted scrypt (SGNT-22) ([#53](https://github.com/Einlanzerous/signet/issues/53)) ([1b4c74f](https://github.com/Einlanzerous/signet/commit/1b4c74f793573f8cc44bf4472f42d49a66a85869))
+
+
+### Bug Fixes
+
+* **cli:** show a file target that manages no keys in status (SGNT-50) ([#54](https://github.com/Einlanzerous/signet/issues/54)) ([474ce6b](https://github.com/Einlanzerous/signet/commit/474ce6bbe10568f9d8d2face3f0d9fab7401dd67))
+* **cli:** show a rendered target that manages no keys in status (SGNT-46) ([#51](https://github.com/Einlanzerous/signet/issues/51)) ([7c441a7](https://github.com/Einlanzerous/signet/commit/7c441a7571e96f13cd3b5cfbb829026a9f87a88e))
+
 ## [1.9.3](https://github.com/Einlanzerous/signet/compare/v1.9.2...v1.9.3) (2026-08-30)
 
 
