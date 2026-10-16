@@ -3988,6 +3988,9 @@ func runStatus(args []string) error {
 	type fileInfo struct {
 		cfg   store.FileConfig
 		drift syncpkg.FileDrift
+		// Carried so the project boundary below can tell which file targets
+		// reached no secret's row (SGNT-50).
+		id string
 	}
 	type renderInfo struct {
 		cfg   store.GHRenderConfig
@@ -4015,7 +4018,7 @@ func runStatus(args []string) error {
 			if err != nil {
 				return err
 			}
-			fileByProject[p] = append(fileByProject[p], fileInfo{cfg, syncpkg.CheckFile(cfg.Path, want, cfg.Keys)})
+			fileByProject[p] = append(fileByProject[p], fileInfo{cfg, syncpkg.CheckFile(cfg.Path, want, cfg.Keys), ft.ID})
 		}
 		rts, err := a.st.RenderTargetsForProject(p)
 		if err != nil {
@@ -4040,6 +4043,8 @@ func runStatus(args []string) error {
 	// Which rendered targets reached a row. A target that manages no keys
 	// reaches none, and until SGNT-46 that meant it left the view entirely.
 	shownRenders := map[string]bool{}
+	// The same for file targets, which gate on Manages identically (SGNT-50).
+	shownFiles := map[string]bool{}
 	for i, sec := range secrets {
 		cur, digest, derr := a.ghDrift(&sec)
 		// A derived secret shows what it is composed from where a stored one
@@ -4098,6 +4103,7 @@ func runStatus(args []string) error {
 			// copy of the reduction, which meant a state added to FileDrift was
 			// reported by one view and silently read as "in sync" by the other.
 			tgt = append(tgt, fmt.Sprintf("file:%s [%s]", fi.cfg.Path, fileState(fi.drift, sec.Name)))
+			shownFiles[fi.id] = true
 		}
 		if len(tgt) == 0 {
 			tgt = []string{"-"}
@@ -4126,7 +4132,23 @@ func runStatus(args []string) error {
 		// the boundary never fires and its targets are never fetched — the
 		// project set above is built from the secrets too. Such a target is
 		// still invisible here (SGNT-49).
+		//
+		// File targets get the same row, for the same reason (SGNT-50). The
+		// file loop above gates on Manages exactly as the render loop does, so
+		// a file target managing no keys reached no row and left the view —
+		// and it is not harmless: every key in its file is unmanaged, so
+		// `render --prune` deletes them all. Its state is fileState's answer
+		// for the whole file, the word `target list` already prints for it,
+		// so the two views cannot disagree. A file target carries no refusal,
+		// so there is no mark and no note.
 		if i+1 == len(secrets) || secrets[i+1].Project != sec.Project {
+			for _, fi := range fileByProject[sec.Project] {
+				if shownFiles[fi.id] {
+					continue
+				}
+				fmt.Fprintf(w, "%s\t(%d keys)\t-\t-\t-\tfile:%s [%s]\n",
+					sec.Project, len(fi.cfg.Keys), fi.cfg.Path, fileState(fi.drift, ""))
+			}
 			for _, ri := range renderByProject[sec.Project] {
 				if shownRenders[ri.target.ID] {
 					continue
