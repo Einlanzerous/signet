@@ -1,0 +1,406 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Signet — system map",
+    "quality_profile": "showcase",
+    "locale": "en",
+    "repository": {
+      "url": "https://github.com/Einlanzerous/signet",
+      "revision": "a10a9fcd2dc42666c9cd6aecd6316287ea5236f2"
+    },
+    "views": [
+      {
+        "id": "write-path",
+        "label": "A secret's way out",
+        "focus": [
+          "cli",
+          "ghsync",
+          "vault",
+          "sqlite",
+          "github",
+          "audit"
+        ],
+        "note": "Values are opened by the vault and sealed to GitHub's key before they leave. One egress of several; each appends a ledger entry."
+      },
+      {
+        "id": "env-files",
+        "label": "Rendering env files",
+        "focus": [
+          "operator",
+          "cli",
+          "render",
+          "vault",
+          "envfiles"
+        ],
+        "note": "Render merges managed keys into the file in place; keys it does not manage are kept unless pruning is asked for."
+      },
+      {
+        "id": "mirror",
+        "label": "The blind mirror",
+        "focus": [
+          "switchyard",
+          "daemon",
+          "ghsync",
+          "github"
+        ],
+        "note": "The daemon reads the store directly. The API returns metadata, version hashes and sync state — never a plaintext value."
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "operator",
+      "type": "external",
+      "label": "Operator and agents",
+      "sublabel": "shell · allowlisted verbs",
+      "pos": [
+        40,
+        60
+      ],
+      "size": [
+        190,
+        64
+      ]
+    },
+    {
+      "id": "cli",
+      "type": "backend",
+      "label": "signet CLI",
+      "sublabel": "set · render · sync · exec · audit",
+      "pos": [
+        40,
+        220
+      ],
+      "size": [
+        190,
+        64
+      ],
+      "sources": [
+        {
+          "path": "cmd/signet/main.go",
+          "line": 76,
+          "end_line": 106,
+          "label": "verb dispatch"
+        },
+        {
+          "path": "cmd/signet/main.go",
+          "line": 204,
+          "end_line": 215,
+          "label": "setup"
+        }
+      ]
+    },
+    {
+      "id": "render",
+      "type": "backend",
+      "label": "Env-file render",
+      "sublabel": "merge in place · --check",
+      "pos": [
+        360,
+        60
+      ],
+      "size": [
+        170,
+        64
+      ],
+      "sources": [
+        {
+          "path": "cmd/signet/main.go",
+          "line": 1406,
+          "label": "render verb"
+        },
+        {
+          "path": "internal/envfile/envfile.go",
+          "line": 396,
+          "end_line": 424,
+          "label": "RenderInto"
+        }
+      ]
+    },
+    {
+      "id": "envfiles",
+      "type": "external",
+      "label": "Env files on disk",
+      "sublabel": "read by deploys",
+      "pos": [
+        670,
+        60
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "vault",
+      "type": "security",
+      "label": "AES-GCM vault",
+      "sublabel": "master key file · keyed digests",
+      "pos": [
+        360,
+        220
+      ],
+      "size": [
+        170,
+        64
+      ],
+      "sources": [
+        {
+          "path": "internal/vault/vault.go",
+          "line": 57,
+          "end_line": 70,
+          "label": "key load"
+        },
+        {
+          "path": "internal/vault/vault.go",
+          "line": 74,
+          "end_line": 97,
+          "label": "seal and open"
+        }
+      ]
+    },
+    {
+      "id": "sqlite",
+      "type": "database",
+      "label": "SQLite store",
+      "sublabel": "secrets · versions · targets",
+      "pos": [
+        670,
+        220
+      ],
+      "size": [
+        170,
+        64
+      ],
+      "sources": [
+        {
+          "path": "internal/store/store.go",
+          "line": 54,
+          "end_line": 80,
+          "label": "open, WAL"
+        },
+        {
+          "path": "internal/store/store.go",
+          "line": 183,
+          "label": "migrations"
+        },
+        {
+          "path": "internal/store/targets.go",
+          "line": 10,
+          "end_line": 20,
+          "label": "target registry"
+        }
+      ]
+    },
+    {
+      "id": "audit",
+      "type": "database",
+      "label": "Audit ledger",
+      "sublabel": "append-only · hash-chained",
+      "pos": [
+        960,
+        220
+      ],
+      "size": [
+        170,
+        64
+      ],
+      "sources": [
+        {
+          "path": "internal/store/audit.go",
+          "line": 262,
+          "end_line": 270,
+          "label": "chain hash"
+        },
+        {
+          "path": "internal/store/audit.go",
+          "line": 353,
+          "label": "append"
+        },
+        {
+          "path": "internal/store/audit.go",
+          "line": 508,
+          "end_line": 511,
+          "label": "verify"
+        }
+      ]
+    },
+    {
+      "id": "ghsync",
+      "type": "backend",
+      "label": "GitHub sync",
+      "sublabel": "gh: secret · gh-render: blob",
+      "pos": [
+        360,
+        380
+      ],
+      "size": [
+        170,
+        64
+      ],
+      "sources": [
+        {
+          "path": "internal/sync/push.go",
+          "line": 76,
+          "label": "PushSecret"
+        },
+        {
+          "path": "internal/sync/render.go",
+          "line": 141,
+          "label": "PushRender"
+        },
+        {
+          "path": "internal/sync/github.go",
+          "line": 332,
+          "end_line": 346,
+          "label": "sealed box"
+        }
+      ]
+    },
+    {
+      "id": "github",
+      "type": "external",
+      "label": "GitHub Actions",
+      "sublabel": "repo and environment secrets",
+      "pos": [
+        670,
+        380
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "daemon",
+      "type": "backend",
+      "label": "Host daemon",
+      "sublabel": "signet serve · reads the store",
+      "pos": [
+        40,
+        500
+      ],
+      "size": [
+        190,
+        64
+      ],
+      "sources": [
+        {
+          "path": "cmd/signet/main.go",
+          "line": 4287,
+          "end_line": 4304,
+          "label": "serve"
+        },
+        {
+          "path": "internal/api/server.go",
+          "line": 49,
+          "end_line": 62,
+          "label": "routes"
+        },
+        {
+          "path": "internal/config/config.go",
+          "line": 25,
+          "end_line": 31,
+          "label": "listen addresses"
+        }
+      ]
+    },
+    {
+      "id": "switchyard",
+      "type": "external",
+      "label": "Switchyard",
+      "sublabel": "admin UI · delivery poller",
+      "pos": [
+        40,
+        660
+      ],
+      "size": [
+        190,
+        64
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "operator-to-cli",
+      "from": "operator",
+      "to": "cli",
+      "label": "shell verbs",
+      "labelAt": [
+        135,
+        138
+      ]
+    },
+    {
+      "id": "cli-to-render",
+      "from": "cli",
+      "to": "render",
+      "label": "render"
+    },
+    {
+      "id": "render-to-envfiles",
+      "from": "render",
+      "to": "envfiles",
+      "label": "write managed keys",
+      "variant": "emphasis"
+    },
+    {
+      "id": "render-to-vault",
+      "from": "render",
+      "to": "vault",
+      "label": "open values",
+      "labelAt": [
+        445,
+        138
+      ]
+    },
+    {
+      "id": "cli-to-ghsync",
+      "from": "cli",
+      "to": "ghsync",
+      "label": "sync"
+    },
+    {
+      "id": "ghsync-to-vault",
+      "from": "ghsync",
+      "to": "vault",
+      "label": "open values"
+    },
+    {
+      "id": "ghsync-to-github",
+      "from": "ghsync",
+      "to": "github",
+      "label": "sealed PUT, HTTPS",
+      "variant": "security"
+    },
+    {
+      "id": "vault-to-sqlite",
+      "from": "vault",
+      "to": "sqlite",
+      "label": "ciphertext"
+    },
+    {
+      "id": "sqlite-to-audit",
+      "from": "sqlite",
+      "to": "audit",
+      "label": "change + entry"
+    },
+    {
+      "id": "switchyard-to-daemon",
+      "from": "switchyard",
+      "to": "daemon",
+      "label": "mirror + commands",
+      "labelAt": [
+        135,
+        618
+      ]
+    },
+    {
+      "id": "daemon-to-ghsync",
+      "from": "daemon",
+      "to": "ghsync",
+      "label": "sync, rotate"
+    }
+  ]
+}

@@ -64,6 +64,13 @@ jobs:
           # Empty resolves to the triggering ref, so the PR path is unchanged.
           ref: ${{ inputs.ref }}
 
+      # Checks docs/architecture.archify.json: every cited path and line must
+      # exist at the pinned commit. A pin that has merely fallen behind main
+      # warns; a path or line that no longer exists fails. Not path-filtered on
+      # purpose, so drift is noticed on PRs that never touch the map.
+      - name: Architecture map is renderable, and say if it has gone stale (SERV-159)
+        run: scripts/architecture-map-check.sh
+
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
