@@ -21,7 +21,7 @@
           "github",
           "audit"
         ],
-        "note": "Values are opened by the vault and sealed to GitHub's public key before they leave. The push is one of several egress channels; each one appends a ledger entry through the store."
+        "note": "Values are opened by the vault and sealed to GitHub's key before they leave. One egress of several; each appends a ledger entry."
       },
       {
         "id": "env-files",
@@ -276,7 +276,7 @@
       "id": "daemon",
       "type": "backend",
       "label": "Host daemon",
-      "sublabel": "signet serve · systemd · reads the store",
+      "sublabel": "signet serve · reads the store",
       "pos": [
         40,
         500
