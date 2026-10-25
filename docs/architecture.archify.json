@@ -17,10 +17,11 @@
           "cli",
           "ghsync",
           "vault",
+          "sqlite",
           "github",
           "audit"
         ],
-        "note": "Values are opened by the vault, sealed to GitHub's public key before they leave, and every egress appends a ledger entry."
+        "note": "Values are opened by the vault and sealed to GitHub's public key before they leave. The push is one of several egress channels; each one appends a ledger entry through the store."
       },
       {
         "id": "env-files",
@@ -43,7 +44,7 @@
           "ghsync",
           "github"
         ],
-        "note": "The API returns metadata, version hashes and sync state — never a plaintext value."
+        "note": "The daemon reads the store directly. The API returns metadata, version hashes and sync state — never a plaintext value."
       }
     ]
   },
@@ -275,7 +276,7 @@
       "id": "daemon",
       "type": "backend",
       "label": "Host daemon",
-      "sublabel": "signet serve · systemd",
+      "sublabel": "signet serve · systemd · reads the store",
       "pos": [
         40,
         500
