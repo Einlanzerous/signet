@@ -14,8 +14,9 @@ binary run under systemd on `imperial-construct` — **no container, no image** 
 and Switchyard's delivery reconciler polls its `/healthz` for build identity.
 
 Pure Go, no cgo (`modernc.org/sqlite`). The whole test suite runs in-process.
-`cmd/signet/main.go` holds every CLI verb and is large (SGNT-37 tracks the
-split); that is why the reviewer's effort tier is pinned at high.
+`cmd/signet/main.go` holds every CLI verb except `exec` (`exec.go`) and is large
+(SGNT-37 tracks the split); that is why the reviewer's effort tier is pinned at
+high.
 
 ## The invariants
 
@@ -48,10 +49,10 @@ Egress channels (`reveal`, `exec`, rendered targets, the sealed push, signet's
 own read of the GitHub PAT) must each leave an entry carrying `SecretID`, so
 `signet audit --secret <ref>` answers "where has this credential been". An entry
 naming only a `TargetID` leaves that query empty. `internal/disclose` holds the
-authoritative list. Egress channels share `KindSecretReveal` deliberately: a
-per-verb kind would silently halve the result of every existing `audit --secret`
-query. A disclosure of a derived secret is a disclosure of its inputs
-(`disclose.Inputs`). A decrypted value never reaches an error message, a log
+authoritative list. `reveal`, `exec`, rendered targets and the PAT read share
+`KindSecretReveal` so one kind answers "what disclosed this value"; the sealed
+push keeps `KindSyncPush` (`internal/disclose`). A disclosure of a derived
+secret is a disclosure of its inputs (`disclose.Inputs`). A decrypted value never reaches an error message, a log
 line, a ledger `Details` field or an HTTP response.
 
 ### 5. Hashes of secret material are keyed
