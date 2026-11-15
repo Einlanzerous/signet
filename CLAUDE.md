@@ -52,8 +52,9 @@ naming only a `TargetID` leaves that query empty. `internal/disclose` holds the
 authoritative list. `reveal`, `exec`, rendered targets and the PAT read share
 `KindSecretReveal` so one kind answers "what disclosed this value"; the sealed
 push keeps `KindSyncPush` (`internal/disclose`). A disclosure of a derived
-secret is a disclosure of its inputs (`disclose.Inputs`). A decrypted value never reaches an error message, a log
-line, a ledger `Details` field or an HTTP response.
+secret is a disclosure of its inputs (`disclose.Inputs`). A decrypted value
+never reaches an error message, a log line, a ledger `Details` field or an HTTP
+response.
 
 ### 5. Hashes of secret material are keyed
 
