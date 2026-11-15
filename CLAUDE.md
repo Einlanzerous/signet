@@ -48,9 +48,10 @@ Egress channels (`reveal`, `exec`, rendered targets, the sealed push, signet's
 own read of the GitHub PAT) must each leave an entry carrying `SecretID`, so
 `signet audit --secret <ref>` answers "where has this credential been". An entry
 naming only a `TargetID` leaves that query empty. `internal/disclose` holds the
-authoritative list. Egress channels share `KindSecretReveal` deliberately.
-A disclosure of a derived secret is a disclosure of its inputs
-(`auditDerivedInputs`). A decrypted value never reaches an error message, a log
+authoritative list. Egress channels share `KindSecretReveal` deliberately: a
+per-verb kind would silently halve the result of every existing `audit --secret`
+query. A disclosure of a derived secret is a disclosure of its inputs
+(`disclose.Inputs`). A decrypted value never reaches an error message, a log
 line, a ledger `Details` field or an HTTP response.
 
 ### 5. Hashes of secret material are keyed
@@ -90,7 +91,8 @@ the full 40-char commit or JSON `null`. Read through `version.Get()`, never the
 package vars: a linker flag stamped empty links `""` over the default, so the
 fallback lives in `Get()`. The injectors are `.github/workflows/release.yml` and
 the `Makefile`; they must agree, and the `Makefile` needs `sed 's/^v//'`.
-Example: a `|| echo dev` outside a subshell never fired and VERSION was empty.
+Example: a `|| echo dev` outside a subshell never fired and VERSION was empty
+(`||` binds to the pipeline, so `sed`'s exit status wins; `df2b21d`).
 
 ### 10. Doc comments are load-bearing
 
@@ -108,6 +110,10 @@ human, needs an allowlist decision before it ships and nothing prompts for one
 paths require an explicit flag (`--replace`, `--prune`).
 
 ## Working in this repo
+
+Tests are named as sentences describing the property, not the function
+(`TestServeLogsACleanStop`). Confirm a regression test fails against the pre-fix
+code, and make its failure output the production symptom.
 
 **Migrations are append-only** (`internal/store/store.go`, `migrations`); never
 edit a shipped one. Commits are conventional (PRINCIPLES §3) and reference the
