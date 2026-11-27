@@ -15,6 +15,7 @@ signet import --project lyceum ~/projects/lyceum/.env
 signet generate --project construct-server --name API_TOKEN   # signet mints it
 signet set --project construct-server --name API_TOKEN        # value on stdin
 signet rotate --secret construct-server/API_TOKEN             # new value + fan-out
+signet expire --secret construct-server/API_TOKEN --on 2027-02-24   # date only, value untouched
 signet target add --secret construct-server/RELEASE_BOT_PRIVATE_KEY \
     --gh-repo Einlanzerous/purser
 signet target list [--secret <p>/<NAME>] [--project <p>]
@@ -103,6 +104,15 @@ since it also pushes.
 **`signet import` records imported values as externally issued**, so a secret
 whose value came from an env file stops being rotatable even if signet minted
 an earlier one. The provenance follows the *value*, not the secret.
+
+`signet expire --secret p/NAME (--on YYYY-MM-DD | --clear)` sets or clears the
+expiry of a secret already in the vault, for when it was stored without
+`--expires` and `set`/`rotate` would make you supply a value again. It never
+reads stdin, decrypts or prints the value, and writes no new version. It is the
+same function as the API's `set-expiry` and records the same `secret.set-expiry`
+entry, with outcome `updated` or `unchanged` (the date was already that).
+`--on` with `--clear`, a date that is not `YYYY-MM-DD`, or an unknown secret
+exits non-zero and changes nothing.
 
 A write that does not push — `set`, `generate` — warns when the secret (or a
 derived secret built on it) has GitHub destinations still holding the previous

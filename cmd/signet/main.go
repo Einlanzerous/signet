@@ -91,6 +91,8 @@ func main() {
 		err = runRotate(args)
 	case "derive":
 		err = runDerive(args)
+	case "expire":
+		err = runExpire(args)
 	case "exec":
 		err = runExec(args)
 	case "sync":
@@ -136,7 +138,7 @@ func main() {
 }
 
 func usage(w io.Writer) {
-	fmt.Fprintln(w, "commands: init, import, set, generate, rotate, derive, exec, reveal, render, target, sync, status, audit, serve, version")
+	fmt.Fprintln(w, "commands: init, import, set, generate, rotate, derive, expire, exec, reveal, render, target, sync, status, audit, serve, version")
 }
 
 func isFlag(s string) bool { return len(s) > 0 && s[0] == '-' }
@@ -329,13 +331,9 @@ func runGenerate(args []string) error {
 // "leave the expiry alone", and an explicit --expires "" means "clear it",
 // matching the API's set-expiry.
 func parseExpiry(fs *flag.FlagSet, expires string) (string, bool, error) {
-	expiresAt := ""
-	if expires != "" {
-		t, err := time.Parse("2006-01-02", expires)
-		if err != nil {
-			return "", false, fmt.Errorf("--expires: %w", err)
-		}
-		expiresAt = t.UTC().Format(time.RFC3339)
+	expiresAt, err := ops.ParseExpiry(expires)
+	if err != nil {
+		return "", false, fmt.Errorf("--expires: %w", err)
 	}
 	given := false
 	fs.Visit(func(f *flag.Flag) {
@@ -344,6 +342,73 @@ func parseExpiry(fs *flag.FlagSet, expires string) (string, bool, error) {
 		}
 	})
 	return expiresAt, given, nil
+}
+
+// runExpire sets or clears the expiry of a stored secret without touching its
+// value: no stdin, no decrypt, no new version. It exists because `--expires` on
+// `set` and `rotate` both demand a new value, so dating a credential already in
+// the vault meant pasting it again.
+//
+// The mutation and its `secret.set-expiry` record are ops.SetExpiry, the same
+// function the API's set-expiry runs.
+func runExpire(args []string) error {
+	fs := flag.NewFlagSet("expire", flag.ContinueOnError)
+	ref := fs.String("secret", "", "secret ref project/NAME (required)")
+	on := fs.String("on", "", "expiry date YYYY-MM-DD")
+	clear := fs.Bool("clear", false, "remove the expiry")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	const usage = "usage: signet expire --secret <project/NAME> (--on YYYY-MM-DD | --clear)"
+	onGiven := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "on" {
+			onGiven = true
+		}
+	})
+	// An explicit empty --on is refused rather than read as "clear": clearing is
+	// its own flag so a script that interpolates an empty variable fails instead
+	// of silently dropping a credential's expiry.
+	switch {
+	case *ref == "":
+		return errors.New(usage)
+	case onGiven && *clear:
+		return fmt.Errorf("--on and --clear are exclusive; %s", usage)
+	case !onGiven && !*clear:
+		return errors.New(usage)
+	case onGiven && *on == "":
+		return fmt.Errorf("--on needs a date YYYY-MM-DD (use --clear to remove the expiry)")
+	}
+	project, name, err := parseSecretRef(*ref)
+	if err != nil {
+		return err
+	}
+	expiresAt, err := ops.ParseExpiry(*on)
+	if err != nil {
+		return fmt.Errorf("--on: %w", err)
+	}
+	a, err := setup()
+	if err != nil {
+		return err
+	}
+	defer a.close()
+
+	outcome, err := ops.SetExpiry(a.st, project, name, expiresAt, cliActor(), cliRole())
+	if errors.Is(err, ops.ErrNoSecret) {
+		return fmt.Errorf("no secret %s/%s", project, name)
+	}
+	if err != nil {
+		return err
+	}
+	state := "expiry set to " + *on
+	if expiresAt == "" {
+		state = "expiry cleared"
+	}
+	if outcome == store.OutcomeUnchanged {
+		state += " (unchanged)"
+	}
+	fmt.Printf("%s/%s: %s\n", project, name, state)
+	return nil
 }
 
 func runSet(args []string) error {
