@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.11.0](https://github.com/Einlanzerous/signet/compare/v1.10.0...v1.11.0) (2026-11-27)
+
+
+### Features
+
+* **cli:** set or clear a secret's expiry without its value (SGNT-53) ([#59](https://github.com/Einlanzerous/signet/issues/59)) ([74197f4](https://github.com/Einlanzerous/signet/commit/74197f434498f6e293b60591d4048e94dff23123))
+
+
+### Maintenance
+
+* **docs:** cut CLAUDE.md to the rules an agent cannot see from the code (SERV-317) ([#57](https://github.com/Einlanzerous/signet/issues/57)) ([009ca3c](https://github.com/Einlanzerous/signet/commit/009ca3cb90f5f00258c752a0383437e580ab2b15))
+
 ## [1.10.0](https://github.com/Einlanzerous/signet/compare/v1.9.3...v1.10.0) (2026-10-16)
 
 
