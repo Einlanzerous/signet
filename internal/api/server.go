@@ -916,47 +916,20 @@ func (s *Server) handleCommandSetExpiry(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusBadRequest, `body must be {"project": ..., "name": ..., "expires_at": "YYYY-MM-DD" (empty to clear)}`)
 		return
 	}
-	expiresAt := ""
-	if req.ExpiresAt != "" {
-		d, err := time.Parse("2006-01-02", req.ExpiresAt)
-		if err != nil {
-			writeErr(w, http.StatusBadRequest, "expires_at must be YYYY-MM-DD: %v", err)
+	if _, err := ops.SetExpiry(s.st, req.Project, req.Name, req.ExpiresAt, s.actor(r), role); err != nil {
+		if errors.Is(err, ops.ErrBadDate) {
+			writeErr(w, http.StatusBadRequest, "expires_at %v", err)
 			return
 		}
-		expiresAt = d.UTC().Format(time.RFC3339)
-	}
-	sec, err := s.st.GetSecret(req.Project, req.Name)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "%v", err)
-		return
-	}
-	if sec == nil {
-		writeErr(w, http.StatusNotFound, "no secret %s/%s", req.Project, req.Name)
-		return
-	}
-	detail := req.Project + "/" + req.Name + ": cleared expiry"
-	if expiresAt != "" {
-		detail = fmt.Sprintf("%s/%s: expiry set to %s", req.Project, req.Name, req.ExpiresAt)
-	}
-	// The old value is in hand, so report what actually changed: re-sending the
-	// expiry a secret already has is a no-op, not an update.
-	outcome := store.OutcomeUpdated
-	if expiresAt == sec.ExpiresAt {
-		outcome = store.OutcomeUnchanged
-	}
-	if _, err := s.st.Mutate(func(m *store.Mutation) (store.AuditRecord, error) {
-		if err := m.SetExpiry(sec.ID, expiresAt); err != nil {
-			return store.AuditRecord{}, err
+		if errors.Is(err, ops.ErrNoSecret) {
+			writeErr(w, http.StatusNotFound, "no secret %s/%s", req.Project, req.Name)
+			return
 		}
-		return store.AuditRecord{
-			Actor: s.actor(r), Action: "secret.set-expiry", SecretID: sec.ID, Details: detail,
-			EventKind: store.KindPolicyChange, ActorRole: role,
-			Status: &store.AuditStatus{Outcome: outcome},
-		}, nil
-	}); err != nil {
 		writeErr(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
+	// SetExpiry accepted the date, so this parse cannot fail.
+	expiresAt, _ := ops.ParseExpiry(req.ExpiresAt)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"project": req.Project, "name": req.Name, "expires_at": expiresAt,
 	})
