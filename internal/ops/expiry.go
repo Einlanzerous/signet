@@ -31,7 +31,10 @@ func ParseExpiry(date string) (string, error) {
 	return t.UTC().Format(time.RFC3339), nil
 }
 
-// SetExpiry sets a secret's expiry (RFC3339 from ParseExpiry, or "" to clear)
+// ErrBadDate is what SetExpiry returns for a date ParseExpiry rejects.
+var ErrBadDate = errors.New("must be YYYY-MM-DD")
+
+// SetExpiry sets a secret's expiry (date is YYYY-MM-DD, or "" to clear)
 // without reading or writing its value, and records `secret.set-expiry` in the
 // same transaction.
 //
@@ -40,7 +43,14 @@ func ParseExpiry(date string) (string, error) {
 // the row re-read inside the transaction, not a snapshot from before it: a
 // concurrent writer would otherwise make "unchanged" a claim about a state that
 // is gone. The returned outcome is what the ledger recorded.
-func SetExpiry(st *store.Store, project, name, expiresAt, actor string, role store.ActorRole) (store.Outcome, error) {
+//
+// It takes the date, not the stored form, and parses it itself: a caller that
+// had to normalise first could forget to.
+func SetExpiry(st *store.Store, project, name, date, actor string, role store.ActorRole) (store.Outcome, error) {
+	expiresAt, err := ParseExpiry(date)
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", ErrBadDate, err)
+	}
 	sec, err := st.GetSecret(project, name)
 	if err != nil {
 		return "", err
@@ -66,7 +76,7 @@ func SetExpiry(st *store.Store, project, name, expiresAt, actor string, role sto
 		}
 		detail := project + "/" + name + ": cleared expiry"
 		if expiresAt != "" {
-			detail = fmt.Sprintf("%s/%s: expiry set to %s", project, name, expiresAt[:10])
+			detail = fmt.Sprintf("%s/%s: expiry set to %s", project, name, date)
 		}
 		return store.AuditRecord{
 			Actor: actor, Action: ActionSetExpiry, SecretID: sec.ID, Details: detail,

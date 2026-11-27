@@ -916,12 +916,11 @@ func (s *Server) handleCommandSetExpiry(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusBadRequest, `body must be {"project": ..., "name": ..., "expires_at": "YYYY-MM-DD" (empty to clear)}`)
 		return
 	}
-	expiresAt, err := ops.ParseExpiry(req.ExpiresAt)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "expires_at must be YYYY-MM-DD: %v", err)
-		return
-	}
-	if _, err := ops.SetExpiry(s.st, req.Project, req.Name, expiresAt, s.actor(r), role); err != nil {
+	if _, err := ops.SetExpiry(s.st, req.Project, req.Name, req.ExpiresAt, s.actor(r), role); err != nil {
+		if errors.Is(err, ops.ErrBadDate) {
+			writeErr(w, http.StatusBadRequest, "expires_at %v", err)
+			return
+		}
 		if errors.Is(err, ops.ErrNoSecret) {
 			writeErr(w, http.StatusNotFound, "no secret %s/%s", req.Project, req.Name)
 			return
@@ -929,6 +928,8 @@ func (s *Server) handleCommandSetExpiry(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
+	// SetExpiry accepted the date, so this parse cannot fail.
+	expiresAt, _ := ops.ParseExpiry(req.ExpiresAt)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"project": req.Project, "name": req.Name, "expires_at": expiresAt,
 	})

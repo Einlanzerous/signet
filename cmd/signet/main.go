@@ -357,6 +357,10 @@ func runExpire(args []string) error {
 	on := fs.String("on", "", "expiry date YYYY-MM-DD")
 	clear := fs.Bool("clear", false, "remove the expiry")
 	if err := fs.Parse(args); err != nil {
+		// -h is a request, not a failure; every other verb exits 0 on it.
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
 		return err
 	}
 	const usage = "usage: signet expire --secret <project/NAME> (--on YYYY-MM-DD | --clear)"
@@ -383,6 +387,8 @@ func runExpire(args []string) error {
 	if err != nil {
 		return err
 	}
+	// Checked before the vault is opened so a typo fails without touching it;
+	// SetExpiry parses again, which is the rule the API relies on.
 	expiresAt, err := ops.ParseExpiry(*on)
 	if err != nil {
 		return fmt.Errorf("--on: %w", err)
@@ -393,7 +399,7 @@ func runExpire(args []string) error {
 	}
 	defer a.close()
 
-	outcome, err := ops.SetExpiry(a.st, project, name, expiresAt, cliActor(), cliRole())
+	outcome, err := ops.SetExpiry(a.st, project, name, *on, cliActor(), cliRole())
 	if errors.Is(err, ops.ErrNoSecret) {
 		return fmt.Errorf("no secret %s/%s", project, name)
 	}

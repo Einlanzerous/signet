@@ -209,3 +209,12 @@ func flagSetWith(name, val string) *flag.FlagSet {
 	_ = fs.Parse([]string{"--" + name, val})
 	return fs
 }
+
+func TestExpireHelpIsNotAFailure(t *testing.T) {
+	seedExpireSecret(t)
+	var err error
+	captureStderr(t, func() { err = runExpire([]string{"-h"}) })
+	if err != nil {
+		t.Fatalf("-h returned %v, want nil", err)
+	}
+}
